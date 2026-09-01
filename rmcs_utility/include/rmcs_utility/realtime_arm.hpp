@@ -261,7 +261,19 @@ private:
 class RealtimeArm {
 public:
     /**
-     * 按依赖顺序武装：线程属性 → timer slack → malloc → mlock → 踩栈 → 踩堆 → C-state。
+     * 武装顺序：绑核/命名 → timer slack → malloc → mlock → 踩栈 → 踩堆 → **升优先级** → C-state。
+     *
+     * 升优先级放在内存武装之后，不是风格问题，是实测出来的：
+     * `mlockall(MCL_CURRENT)` 要把整个 ROS 进程的页走一遍并锁住，本机实测 **35 ms**。
+     * 如果先升到 SCHED_FIFO 90 再做（改造前的顺序），这 35 ms 就是在隔离核上以最高优先级
+     * 独占——而 `sched_rt_runtime_us` 已经被调优服务设成 -1，没有任何东西能打断它。
+     * 对照实测：一条 FIFO 80 的线程先在同一个核上跑着，executor 启动时它被饿住
+     *   mlock=on            → 36.4 ms
+     *   mlock=off（只预热）  → 1.5 ms
+     *   武装完之后才起       → 11 us
+     * 接上集成层之后传输线程是先起的，这 35 ms 会实实在在落在它头上。
+     *
+     * 绑核仍然排在最前：踩栈踩堆要踩在这条线程真正会跑的那个核上。
      *
      * @throws std::runtime_error 任何一步失败（消息里带 strerror(errno)）。
      */
@@ -272,12 +284,14 @@ public:
         // 把它写进摘要，是为了让"为什么 max 有 1 ms"这个问题一眼有答案，
         // 而不是每次都重新去查一遍机器。
         append_summary(has_realtime_kernel() ? "kernel=preempt_rt" : "kernel=NOT_rt");
-        arm_thread_config(thread_config);
+        arm_thread_identity(thread_config);
         arm_timer_slack();
         arm_malloc();
         arm_memory_lock();
         arm_prefault_stack();
         arm_prefault_heap();
+        // 封盘之后才升优先级：上面每一步都是重活，不该以 RT 优先级做。
+        arm_thread_scheduling(thread_config);
         // 放最后：只有这一步会留下需要析构的资源，而构造抛异常时析构不会跑，
         // 所以它自己的失败路径负责关掉半开的 fd。
         arm_cpu_dma_latency();
@@ -361,8 +375,8 @@ private:
         return result.empty() ? std::string{"none"} : result;
     }
 
-    void arm_thread_config(const ThreadConfig& thread_config) {
-        if (const auto applied = thread_config.apply_to_current_thread(); !applied)
+    void arm_thread_identity(const ThreadConfig& thread_config) {
+        if (const auto applied = thread_config.apply_identity_to_current_thread(); !applied)
             throw_failure(applied.error());
 
         std::string fields;
@@ -385,6 +399,12 @@ private:
         const std::string_view shown =
             fields.empty() ? std::string_view{"unchanged"} : std::string_view{fields};
         append_summary(std::format("thread[{}]", shown));
+    }
+
+    /// 只做调度策略那一半。摘要已经在 arm_thread_identity 里打全了。
+    void arm_thread_scheduling(const ThreadConfig& thread_config) {
+        if (const auto applied = thread_config.apply_scheduling_to_current_thread(); !applied)
+            throw_failure(applied.error());
     }
 
     void arm_timer_slack() {

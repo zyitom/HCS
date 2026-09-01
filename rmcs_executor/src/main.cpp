@@ -1,7 +1,10 @@
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <execinfo.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <regex>
@@ -32,8 +35,41 @@ void segmentation_fault_handler(int) {
     exit(1);
 }
 
+/// 进程级的"纯用户态核隔离"，必须在 rclcpp::init() 之前做。
+///
+/// 为什么不能用 ROS 参数：参数要先建节点才读得到，而建节点就会建 DDS participant，
+/// 十几条 rmw/DDS 线程在那一刻就已经生出去了 —— 事后改主线程的亲和追不上它们。
+/// 实测一个跑着的 executor 有 17 条线程，spin_thread_config 只管得住其中 1 条。
+/// 这里设的是**进程**的亲和，之后创建的每一条线程都继承它，控制线程再单独绑回 RT 核。
+///
+/// 装了 isolcpus 的机器（TL101 是 isolcpus=7）不需要这个：内核已经把隔离核从默认掩码里
+/// 摘走了，所有线程天生就不在上面。这条是给没有 isolcpus 的机器用的。
+///
+/// 用法：RMCS_NON_RT_CPUS="0-2,4-19" rmcs_executor ...
+static void apply_process_affinity_from_environment() {
+    const char* spec = std::getenv("RMCS_NON_RT_CPUS");
+    if (spec == nullptr || *spec == '\0')
+        return;
+
+    try {
+        // 借 ThreadConfig 的 cpus= 解析器，语法和 thread_config 完全一致。
+        const auto config = rmcs_utility::ThreadConfig{std::string{"cpus="} + spec};
+        if (!config.cpus())
+            return;
+        if (sched_setaffinity(0, sizeof(cpu_set_t), &*config.cpus()) != 0)
+            fprintf(
+                stderr, "[warn] RMCS_NON_RT_CPUS=%s: sched_setaffinity failed: %s\n", spec,
+                std::strerror(errno));
+    } catch (const std::exception& exception) {
+        fprintf(stderr, "[warn] RMCS_NON_RT_CPUS=%s is invalid: %s\n", spec, exception.what());
+    }
+}
+
 int main(int argc, char** argv) {
     std::signal(SIGSEGV, segmentation_fault_handler);
+
+    // 在 init 之前 —— 见上面那段注释。
+    apply_process_affinity_from_environment();
 
     rclcpp::init(argc, argv);
 
@@ -73,7 +109,8 @@ int main(int argc, char** argv) {
 
     executor->start();
 
-    // 纯用户态的核隔离：把 spin 线程按 "除 RT 核以外的全部核" 绑一遍，不用 isolcpus。
+    // spin 线程自己的亲和/优先级。注意它**只管这一条线程** —— DDS 那十几条早在建节点时
+    // 就生出去了，管它们的是上面 RMCS_NON_RT_CPUS 那一步（或者内核的 isolcpus）。
     // 这是尽力域 —— 绑不上只警告，不该因此把整机拉下来。
     std::string spin_thread_config_spec;
     executor->get_parameter_or<std::string>("spin_thread_config", spin_thread_config_spec, "");

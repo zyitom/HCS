@@ -68,6 +68,10 @@ public:
     /**
      * Apply the stored configuration to the calling thread.
      *
+     * Identity (name, affinity) is applied before scheduling (policy, priority, nice), so the
+     * thread is already on its target CPU by the time it becomes realtime. The reverse order
+     * lets an already-realtime thread run briefly on whatever CPU it happened to start on.
+     *
      * This operation is not atomic. If a later step fails, earlier changes may already have been
      * applied to the current thread.
      *
@@ -75,26 +79,22 @@ public:
      * failing runtime step.
      */
     auto apply_to_current_thread() const -> std::expected<void, std::string> {
+        if (auto applied = apply_identity_to_current_thread(); !applied)
+            return applied;
+        return apply_scheduling_to_current_thread();
+    }
+
+    /**
+     * Apply only the cheap, non-privileged half: thread name and CPU affinity.
+     *
+     * Split out for RealtimeArm, which must do its memory arming (mlockall, prefault) *before*
+     * raising priority: mlockall on a large process takes tens of milliseconds, and at
+     * SCHED_FIFO 90 on an isolated core that starves every other realtime thread there for
+     * exactly that long. Pinning first is still worth doing, so the prefaulted stack pages and
+     * the arena are warmed on the CPU the thread will actually run on.
+     */
+    auto apply_identity_to_current_thread() const -> std::expected<void, std::string> {
         const auto current_thread = pthread_self();
-
-        if (policy_) {
-            sched_param param{};
-            param.sched_priority = priority_.value_or(0);
-            const int error_code = pthread_setschedparam(current_thread, *policy_, &param);
-            if (error_code != 0) {
-                return std::unexpected(
-                    std::format(
-                        "Failed to set thread scheduling policy: {}", std::strerror(error_code)));
-            }
-        }
-
-        if (nice_) {
-            errno = 0;
-            const auto tid = static_cast<id_t>(syscall(SYS_gettid));
-            if (setpriority(PRIO_PROCESS, tid, *nice_) != 0)
-                return std::unexpected(
-                    std::format("Failed to set thread nice value: {}", std::strerror(errno)));
-        }
 
         if (cpus_) {
             const int error_code =
@@ -109,6 +109,30 @@ public:
             if (error_code != 0)
                 return std::unexpected(
                     std::format("Failed to set thread name: {}", std::strerror(error_code)));
+        }
+
+        return {};
+    }
+
+    /// The other half: scheduling policy, realtime priority, nice. See above for why it is last.
+    auto apply_scheduling_to_current_thread() const -> std::expected<void, std::string> {
+        if (policy_) {
+            sched_param param{};
+            param.sched_priority = priority_.value_or(0);
+            const int error_code = pthread_setschedparam(pthread_self(), *policy_, &param);
+            if (error_code != 0) {
+                return std::unexpected(
+                    std::format(
+                        "Failed to set thread scheduling policy: {}", std::strerror(error_code)));
+            }
+        }
+
+        if (nice_) {
+            errno = 0;
+            const auto tid = static_cast<id_t>(syscall(SYS_gettid));
+            if (setpriority(PRIO_PROCESS, tid, *nice_) != 0)
+                return std::unexpected(
+                    std::format("Failed to set thread nice value: {}", std::strerror(errno)));
         }
 
         return {};
@@ -273,11 +297,29 @@ private:
         return cpus;
     }
 
+    /// CPUs this kernel is configured for. Deliberately *not* sched_getaffinity: on a machine
+    /// with `isolcpus`, the isolated CPUs are absent from the default mask, and pinning to one
+    /// of them is exactly what we want to allow.
+    static int configured_cpu_count() {
+        const long count = ::sysconf(_SC_NPROCESSORS_CONF);
+        return count > 0 ? static_cast<int>(count) : 0;
+    }
+
     static void set_cpu_range(cpu_set_t& cpus, int first_cpu, int last_cpu, std::string_view spec) {
         if (first_cpu < 0 || last_cpu < 0 || first_cpu > last_cpu)
             throw_invalid_spec("invalid cpu range", spec);
         if (last_cpu >= CPU_SETSIZE)
             throw_invalid_spec("cpu index exceeds CPU_SETSIZE", spec);
+
+        // A mask naming CPUs this machine does not have used to pass silently: as long as one
+        // listed CPU exists, pthread_setaffinity_np succeeds and the kernel drops the rest.
+        // That is how a config written for a 20-CPU machine kept "working" on an 8-CPU one
+        // while quietly meaning something else.
+        if (const int configured = configured_cpu_count(); configured > 0 && last_cpu >= configured)
+            throw_invalid_spec(
+                std::format(
+                    "cpu index {} is beyond this machine's {} CPUs", last_cpu, configured),
+                spec);
 
         for (int cpu = first_cpu; cpu <= last_cpu; ++cpu)
             CPU_SET(cpu, &cpus);
