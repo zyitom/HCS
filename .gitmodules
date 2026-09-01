@@ -1,0 +1,3 @@
+[submodule "rmcs_demo/src/librmcs"]
+	path = rmcs_demo/src/librmcs
+	url = git@github.com:zyitom/test_slave_bridge.git

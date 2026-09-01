@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# 一台「机器人」= 一个 yaml，和真实工程里 omni-infantry.yaml / sentry.yaml 同构。
+#
+# components 的写法是   插件类全名 -> 实例名
+# 实例名同时是这个组件的 ROS 节点名，下面各段参数按实例名匹配。
+#
+# 列表顺序不影响执行顺序 —— 真正的顺序由 Executor 按接口依赖拓扑排序算出来，
+# 启动日志里会打印成一棵缩进树。
+# ---------------------------------------------------------------------------
+rmcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+
+    # ── 实时化（默认全关，开之前先跑 cyclictest 定基线）────────────────────
+    # 语法一律是 key=value;key=value —— 少一个 = 解析器就 throw std::invalid_argument。
+    #
+    # 控制线程：SCHED_FIFO 90 + 绑到一个 P 核。本机是 i9-13900H，
+    # CPU 0-11 是 P 核、12-19 是 E 核；绑到 E 核会让抖动直接翻倍，别绑。
+    # 需要 rtprio 权限：见 /etc/security/limits.conf 或用 root 跑
+    # thread_config: "name=rmcs-ctrl;policy=fifo;priority=90;cpus=3"
+    #
+    # 武装项，语法同上。时长后缀 ns/us/ms/s，字节后缀 K/M
+    #   mlock / malloc / timer_slack / prefault_stack / prefault_heap
+    #   cpu_dma_latency（需 root）/ spin_guard（只在独占核上开）
+    # realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M"
+    #
+    # 报告线程与 ROS spin 线程：排除 RT 核（纯用户态的核隔离，不用 isolcpus）
+    # reporter_thread_config: "name=rmcs-report;policy=other;nice=5;cpus=0-2,4-19"
+    # spin_thread_config:     "name=rmcs-spin;policy=other;nice=5;cpus=0-2,4-19"
+    #
+    # report_period_seconds: 5.0
+    # component_timing_stride: 16
+    #
+    # 注意：除内核 cmdline 外，上面这些主机侧设置全部不持久化 ——
+    # 重启后归零，别指望改过一次就一直生效。
+
+    components:
+      - rmcs_demo::hardware::DemoBoard -> demo_hardware
+      # demo_hardware_command 由 create_partner_component 自动创建，不写在这里
+
+      - rmcs_demo::controller::pid::PidController -> velocity_pid_controller
+
+demo_hardware:
+  ros__parameters:
+    motor_max_torque: 3.0
+    motor_inertia: 0.01
+    motor_damping: 0.02
+    setpoint_frequency: 0.2
+    setpoint_amplitude: 30.0
+
+velocity_pid_controller:
+  ros__parameters:
+    measurement: "/demo/motor/velocity"
+    setpoint: "/demo/motor/velocity_setpoint"
+    control: "/demo/motor/control_torque"
+    kp: 0.05
+    ki: 0.0008
+    kd: 0.0
+    integral_min: -2000.0
+    integral_max: 2000.0
+    output_min: -3.0
+    output_max: 3.0
