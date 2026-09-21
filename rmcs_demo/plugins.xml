@@ -1,4 +1,0 @@
-<library path="rmcs_demo">
-  <class type="rmcs_demo::hardware::DemoBoard"             base_class_type="rmcs_executor::Component" />
-  <class type="rmcs_demo::controller::pid::PidController"  base_class_type="rmcs_executor::Component" />
-</library>

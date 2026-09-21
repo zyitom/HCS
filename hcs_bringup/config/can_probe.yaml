@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# 底层测试专用：单独跑 CanRttProbe，别的组件都不接，方便干净地看拍/CAN/UART 时序。
+#
+#   ros2 launch hcs_bringup hcs.launch.py robot:=can_probe
+#
+# 硬件：HPM5321 板卡（USB 接这台机器），CAN1（外壳丝印）挂电机（id 0x145），
+# UART0 接外部串口 IMU（921600bps，HI91 协议，波特率在组件里写死配置给板卡，
+# 不用在这改）。serial_filter 留空表示自动接第一块识别到的 HPM5321；
+# 插了不止一块时填板卡 USB 序列号的子串加以区分。
+# ---------------------------------------------------------------------------
+hcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    thread_config: "name=hcs-ctrl"
+    reporter_thread_config: "name=hcs-report;policy=other;nice=5"
+    spin_thread_config: "name=hcs-spin;policy=other;nice=5"
+
+    components:
+      - hcs_demo::hardware::CanRttProbe -> can_rtt_probe
+
+can_rtt_probe:
+  ros__parameters:
+    serial_filter: "AF-90A7" # 台架上接电机/IMU 的那块(3-6);若 miss=100% 换 AF-958F
+    can_id: 325 # 0x145
+    response_can_id: 325 # 0x145；电机回帧用别的 id 就改这个
+    report_stride: 1000 # 每多少拍汇总打印一次（1000 拍 = 1000 Hz 下约 1 秒）
+    tx_thread_config: "name=can-rtt-tx" # policy=fifo 需要 rtprio 权限，没有就用默认调度
+    dangerously_skip_version_checks: true # 开发构建的固件和 SDK 版本号不可比，先跳过版本门禁

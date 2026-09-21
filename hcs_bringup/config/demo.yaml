@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# 一台「机器人」= 一个 yaml，和真实工程里 omni-infantry.yaml / sentry.yaml 同构。
+#
+# components 的写法是   插件类全名 -> 实例名
+# 实例名同时是这个组件的 ROS 节点名，下面各段参数按实例名匹配。
+#
+# 列表顺序不影响执行顺序 —— 真正的顺序由 Executor 按接口依赖拓扑排序算出来，
+# 启动日志里会打印成一棵缩进树。
+# ---------------------------------------------------------------------------
+hcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+
+    # ── 实时化 ────────────────────────────────────────────────────────────
+    # 语法一律是 key=value;key=value —— 少一个 = 解析器就 throw std::invalid_argument。
+    #
+    # 下面这几行是给 **TL101（i7-1165G7，4 核 8 线程，PREEMPT_RT，
+    # cmdline 带 isolcpus=7 nohz_full=7 rcu_nocbs=7）** 写的。
+    # 换机器必须重配 —— 核号是机器事实，抄错了比不配还差。本机实测（1 kHz，start_late）：
+    #
+    #   thread_config              p50     p99     max      跳拍
+    #   （空）                      37 us   50 us   459 us   0/20021
+    #   cpus=3                      5 us  208 us  3559 us   27/15017   <- 绑到普通核，最差
+    #   cpus=7（隔离核）             4 us   11 us    18 us   0/25028
+    #   fifo:90 + mlock + pmqos     2 us    6 us    13 us   0/30027
+    #   cyclictest 基线（满负载）     2 us    -      21 us            <- 机器地板
+    #
+    # 也就是说：绑核那一下值 441 us，其余全部旋钮加起来值 5 us。先绑核。
+    thread_config: "name=hcs-ctrl;cpus=7"
+    #
+    # 上面是不需要任何权限的形态。要拿满（p99 6 us / max 13 us）就用下面这组，
+    # 但 policy=fifo 需要 rtprio、cpu_dma_latency 需要 CAP_SYS_ADMIN：
+    #   sudo tee /etc/security/limits.d/30-hcs.conf <<'EOF'
+    #   <你的用户名>  -  rtprio   95
+    #   <你的用户名>  -  memlock  unlimited
+    #   EOF
+    # thread_config:   "name=hcs-ctrl;policy=fifo;priority=90;cpus=7"
+    # realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M;cpu_dma_latency=on"
+    #
+    # 武装项，语法同上。时长后缀 ns/us/ms/s，字节后缀 K/M
+    #   mlock / malloc / timer_slack / prefault_stack / prefault_heap
+    #   cpu_dma_latency（需 root）/ spin_guard（只在独占核上开）
+    #
+    # 报告线程与 ROS spin 线程：排除 RT 核。本机 8 个核，RT 核是 7。
+    reporter_thread_config: "name=hcs-report;policy=other;nice=5;cpus=0-6"
+    spin_thread_config:     "name=hcs-spin;policy=other;nice=5;cpus=0-6"
+    #
+    # 注意 spin_thread_config 只管 spin 这一条线程 —— DDS 那十几条在建节点时就已经
+    # 生出去了。要一次管住整个进程，用环境变量（必须在 rclcpp::init 之前生效）：
+    #   HCS_NON_RT_CPUS=0-6 ros2 launch hcs_bringup hcs.launch.py robot:=demo
+    # 本机装了 isolcpus=7，内核已经把 7 从默认掩码里摘走，所以这一条在这台机器上可以不设。
+    #
+    # report_period_seconds: 5.0
+    # component_timing_stride: 16
+    #
+    # 注意：除内核 cmdline 外，上面这些主机侧设置全部不持久化 ——
+    # 重启后归零，别指望改过一次就一直生效。
+
+    components:
+      - hcs_demo::hardware::DemoBoard -> demo_hardware
+      # demo_hardware_command 由 create_partner_component 自动创建，不写在这里
+
+      - hcs_demo::controller::pid::PidController -> velocity_pid_controller
+
+demo_hardware:
+  ros__parameters:
+    motor_max_torque: 3.0
+    motor_inertia: 0.01
+    motor_damping: 0.02
+    setpoint_frequency: 0.2
+    setpoint_amplitude: 30.0
+
+velocity_pid_controller:
+  ros__parameters:
+    measurement: "/demo/motor/velocity"
+    setpoint: "/demo/motor/velocity_setpoint"
+    control: "/demo/motor/control_torque"
+    kp: 0.05
+    ki: 0.0008
+    kd: 0.0
+    integral_min: -2000.0
+    integral_max: 2000.0
+    output_min: -3.0
+    output_max: 3.0
