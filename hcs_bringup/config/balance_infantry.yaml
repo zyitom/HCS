@@ -1,0 +1,115 @@
+# ---------------------------------------------------------------------------
+# 平衡步兵（INF_4）：从 Helios_cpp_powerful_framework 的"云台 mc02 + 底盘 mc02"
+# 移植到一台上位机 + 3 块双 CAN HPM5321（PID 0x5322）。代码在 hcs_balance 包。
+#
+#   ros2 launch hcs_bringup hcs.launch.py robot:=balance_infantry
+#
+# 接线（丝印 CAN1/CAN2/UART0；电机 ID 与旧车完全一致，只动线不改电机配置）：
+#   gimbal  板  CAN1: LK yaw(0x145) + LK 拨盘(0x144)
+#               CAN2: 3508 摩擦轮 id1/id2 + DM pitch(CAN ID 0x04 / Master ID 0x03)
+#               UART0: 云台 CH040（921600）
+#   chassis 板  CAN1: 左关节 bl1(0x01/0x05)  bl0(0x02/0x06)
+#               CAN2: 右关节 br1(0x03/0x07)  br0(0x04/0x08)
+#               UART0: 底盘 CH040（921600）
+#   aux     板  CAN1: 3508 轮毂 左 id2 / 右 id1
+#               CAN2: 超级电容(0x061/0x052)
+#               UART0: 遥控接收机（VT03 直接接；DR16 需外加反相器）
+#   裁判系统：上位机 USB 转串口（5321 没有多余的 UART），见 referee.device
+#   视觉：本机 UDP，载荷与旧 USB CDC 协议逐字节相同，见 vision.*
+#
+# 板卡固件必须是经典 CAN（DJI/DM/LK 全是 CAN2.0）；FD 固件会在构造时直接报错。
+#
+# 执行顺序由接口依赖自动排出来（启动日志里有树，2026-09-17 无板冒烟实测）：
+#   balance_hardware, referee
+#     fsm → chassis_bridge → balance_chassis → balance_hardware_chassis_tx / _aux_tx
+#     fsm → vision → gimbal（还依赖 balance_chassis 的遥测）/ shoot → balance_hardware_gimbal_tx
+#   拍尾门铃 → tx-gimbal / tx-chassis / tx-aux 三条线程各发一个 USB 包
+#
+# 线程布局照 hcs_link.yaml 给 TL101（isolcpus=3,7）写的，换机器必须重配核号：
+#   CPU 3  hcs-ctrl FIFO 90；tx-gimbal/chassis/aux FIFO 85
+#   CPU 7  三块板的 libhcs IO 线程 FIFO 80（keepalive 自动 79）
+#   其余核  报告 / ROS spin / 裁判系统接收 / 视觉收发
+# ---------------------------------------------------------------------------
+hcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    thread_config: "name=hcs-ctrl;policy=fifo;priority=90;cpus=3"
+    realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M"
+    reporter_thread_config: "name=hcs-report;policy=other;nice=5;cpus=0-2,4-6"
+    spin_thread_config: "name=hcs-spin;policy=other;nice=5;cpus=0-2,4-6"
+
+    components:
+      - hcs_balance::hardware::BalanceInfantryHardware -> balance_hardware
+      # balance_hardware_gimbal_tx / _chassis_tx / _aux_tx 由 create_partner_component 自动创建
+      - hcs_balance::referee::RefereeSerial -> referee
+      - hcs_balance::controller::Fsm -> fsm
+      - hcs_balance::controller::Gimbal -> gimbal
+      - hcs_balance::controller::Shoot -> shoot
+      - hcs_balance::controller::ChassisBridge -> chassis_bridge
+      - hcs_balance::controller::BalanceChassis -> balance_chassis
+      - hcs_balance::vision::VisionBridge -> vision
+
+balance_hardware:
+  ros__parameters:
+    # 3 块同 PID 的板同时在线时 serial_filter 必须填（USB 序列号子串），否则 SDK 拒绝打开。
+    # 台架上只接一部分板子时，把没接的那块 enabled 改成 false，它上面的设备保持离线。
+    gimbal:
+      enabled: true
+      serial_filter: ""
+      io_thread_cpu: 7
+      io_thread_rt_priority: 80
+      tx_thread_config: "name=tx-gimbal;policy=fifo;priority=85;cpus=3"
+    chassis:
+      enabled: true
+      serial_filter: ""
+      io_thread_cpu: 7
+      io_thread_rt_priority: 80
+      tx_thread_config: "name=tx-chassis;policy=fifo;priority=85;cpus=3"
+    aux:
+      enabled: true
+      serial_filter: ""
+      io_thread_cpu: 7
+      io_thread_rt_priority: 80
+      tx_thread_config: "name=tx-aux;policy=fifo;priority=85;cpus=3"
+
+    rc_protocol: "vt03"      # vt03 | dr16
+    rc_vt03_check_crc: true
+    # [yaw, pitch, roll] 方向，同旧 CH100::getInstance(&huart7, dir_yaw, dir_pitch, dir_roll)
+    gimbal_imu_dir: [-1, -1, 1]
+    chassis_imu_dir: [1, 1, 1]
+    # USB 设备消失（kFaulted 不可恢复）时退出进程，由 launch 的 respawn 重建（退出前给 DM 发失能）
+    exit_on_board_fault: true
+    dangerously_skip_version_checks: true # 开发构建的固件和 SDK 版本号不可比
+
+referee:
+  ros__parameters:
+    device: ""               # 例如 "/dev/ttyUSB0"；留空 = 不接裁判系统，/referee 全零
+    thread_config: "name=referee-rx;policy=other;cpus=0-2,4-6"
+
+fsm:
+  ros__parameters:
+    shoot_frq_set: 40
+    # 旧框架：power_management_chassis_output == 0 时底盘强制无力。不接裁判系统时它恒为 0，
+    # 台架上想让底盘动起来就改成 false；上场必须是 true。
+    referee_gates_chassis: true
+
+gimbal:
+  ros__parameters:
+    dir_yaw: -1              # 旧 new app::GIMBAL(..., -1, -1)
+    dir_pitch: -1
+    pitch_up: 0.45           # 旧 PITCH_UP
+    pitch_down: -0.32        # 旧 PITCH_DN
+    yaw_chassis_align_ecd: 0.0
+
+shoot:
+  ros__parameters:
+    shoot_set_speed: 560     # 旧全局 shoot_set_speed 的初值（弹速超 24.5 m/s 时运行中会往下调）
+
+vision:
+  ros__parameters:
+    bind_address: "127.0.0.1"
+    bind_port: 5005
+    peer_address: ""         # 留空 = 回给最近一次发来数据的地址
+    peer_port: 0
+    rx_thread_config: "name=vision-rx;policy=other;cpus=0-2,4-6"
+    tx_thread_config: "name=vision-tx;policy=other;cpus=0-2,4-6"

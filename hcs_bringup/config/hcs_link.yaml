@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# 链路探针：按真实硬件形态（两块 HPM5321 DualCan + 一块低速 mc02），在真实
+# hcs_executor 里量主机侧每一段耗时。量什么、怎么读，见
+# hcs_demo/src/hardware/hcs_link_probe.cpp 开头的注释。
+#
+#   ros2 launch hcs_bringup hcs.launch.py robot:=hcs_link
+#
+# 每块板 CAN1 接 CAN2 回环。serial_filter 是 USB 序列号的子串：插着多块同 PID 的设备
+# （包括停在 DFU bootloader 的 5321）时必须填，否则 SDK 认为有多个候选，拒绝打开。
+#
+# 线程布局是给 TL101（i7-1165G7，cmdline 带 isolcpus=3,7；3 和 7 是同一物理核的两个
+# 超线程）写的，换机器必须重配核号。三板全形态的完整拓扑（无下位机：主机就是控制器）：
+#
+#   CPU 3（隔离核，控制输出侧）
+#     hcs-ctrl     FIFO 90   拍循环：latch -> 各组件 update() -> 拍尾门铃 -> 睡到下一拍
+#     tx-5321-a/b  FIFO 85   两块的发送线程，被拍尾门铃叫醒后做 libusb submit
+#     tx-mc02      FIFO 80   100 Hz，排在两块 5321 之后
+#   CPU 7（隔离核，USB 事件侧）
+#     IO-5321-a/b  FIFO 80   xHCI 中断（CPU 4）给回包后经 IPI 唤醒；实测唤醒->上核 1 us
+#     keepalive x2 FIFO 79   libhcs 会话保活，自动跟事件线程同核、低一级
+#     IO-mc02      FIFO 78   mc02 的状态流 ~4 kHz，排最后：最慢的板，容忍最大尾延迟
+#     keepalive-mc02 FIFO 77
+#
+# 优先级阶梯的含义：控制输出（deadline 在本拍）> 5321 的 1 kHz 反馈 > 保活 > mc02。
+# 同优先级的线程都是"跑几微秒就睡"的事件线程，不触发 AdvancedOptions 文档里警告的
+# equal-prio FIFO 饿死问题（那说的是 busy 线程）。
+#
+# 实测依据（2026-09-12，trace-cmd -C mono 对齐）：
+#   - IO 线程绑隔离核 + FIFO：giveback -> 回调 < 15 us；free-running 时同样的唤醒
+#     在桌面负载下实测到 26.7 ms（mc02，SCHED_OTHER 被远程桌面压）。
+#   - 主机侧各段：start_late p50 3 us；cmd p50 15 us；giveback -> 回调 ~15 us；
+#     内核侧 URB 往返 p50 113 us 由板端决定，主机不可压缩。
+#   - 总线上有停在 DFU bootloader 的板子时，xHCI 路径会出现按 microframe 量化的
+#     300 us -> 1.4 ms 递增簇（已用 authorized=0 A/B 验证）——别把 bootloader 板留在总线上。
+#
+# policy=fifo 需要 rtprio 权限；mlock=on 需要 memlock 上限够大（limits.conf）。
+# cpu_dma_latency 不在这里开（它禁的是全机 C-state，需要 root 且 fd 要活进程持有）。
+# 注意它管的两颗核不是一回事：IPI 唤醒 1 us 是事件线程那侧（隔离核 7），而实测
+# 20 us 级的代价在 xHCI 中断线程所在核的 C1E 上（HOST_TUNING 10.9.4：EP0 p50
+# -22 us、生产 p99 -4~18 us、生产 p50 不动）。后者现在由 hcs_rt_tune.service 在
+# 开机用 per-core C1 disable 落地（比全机 PM QoS 更准也更省），应用无需持 root。
+#
+# slow_rtt_threshold_us：rtt 超过它的回包逐条记进无锁环、由报告线程打印
+# （到达时刻 = CLOCK_MONOTONIC ns，可和 `trace-cmd record -C mono` 的 trace 对齐），
+# 只影响记录，不影响统计。默认 500 us，这里写出来是为了方便临时调低。
+# ---------------------------------------------------------------------------
+hcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    thread_config: "name=hcs-ctrl;policy=fifo;priority=90;cpus=3"
+    realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M"
+    reporter_thread_config: "name=hcs-report;policy=other;nice=5;cpus=0-2,4-6"
+    spin_thread_config: "name=hcs-spin;policy=other;nice=5;cpus=0-2,4-6"
+
+    components:
+      - hcs_demo::hardware::HcsLinkProbe -> link_5321_a
+      # 第二块 5321 已刷好应用固件（AF-958F，2026-09-12），接好回环之后打开
+      # - hcs_demo::hardware::HcsLinkProbe -> link_5321_b  # 临时：板上只剩一块 5321
+      - hcs_demo::hardware::HcsLinkProbe -> link_mc02
+
+link_5321_a:
+  ros__parameters:
+    board: hpm5321
+    serial_filter: "AF-958F"  # 2026-09-12 临时：AF-90A7 不在总线上（用户拔线），AF-958F 挪到了 3-1 口
+    can_id: 1366 # 0x556
+    fdcan: true
+    send_every: 1
+    io_thread_cpu: 7
+    io_thread_rt_priority: 80
+    tx_thread_config: "name=tx-5321-a;policy=fifo;priority=85;cpus=3"
+    report_period_ms: 5000
+    slow_rtt_threshold_us: 500
+    dangerously_skip_version_checks: true
+
+link_5321_b:
+  ros__parameters:
+    board: hpm5321
+    serial_filter: "AF-958F"
+    can_id: 1367 # 0x557
+    fdcan: true
+    send_every: 1
+    io_thread_cpu: 7
+    io_thread_rt_priority: 80
+    tx_thread_config: "name=tx-5321-b;policy=fifo;priority=85;cpus=3"
+    report_period_ms: 5000
+    slow_rtt_threshold_us: 500
+    dangerously_skip_version_checks: true
+
+link_mc02:
+  ros__parameters:
+    board: mc02
+    serial_filter: "D4-46A1"
+    can_id: 1365 # 0x555
+    # 2026-09-12 起 fdcan 只是交叉校验：帧型由固件定、经 EP0 上报，板子说了算。
+    # 新 mc02 固件把 CAN1 带成了 FD（启动时的 WARN 抓到过不一致，已按板子改这里）。
+    fdcan: true
+    send_every: 10 # 低速板：100 Hz
+    # IO 线程跟两块 5321 一起放隔离核 CPU 7、FIFO 78（两块 5321 的 IO 是 80、保活 79）：
+    # mc02 的事件线程要处理 ~4 kHz 状态流，free-running（SCHED_OTHER）时被桌面
+    # CFS 压出过 26.7 ms 的 rtt 尾（2026-09-12 实测）。它排在整个优先级阶梯的最后。
+    io_thread_cpu: 7
+    io_thread_rt_priority: 78
+    tx_thread_config: "name=tx-mc02;policy=fifo;priority=80;cpus=3"
+    report_period_ms: 5000
+    slow_rtt_threshold_us: 500
+    dangerously_skip_version_checks: true

@@ -1,0 +1,17 @@
+# HCS 开机实时调优。安装：
+#   sudo cp hcs_rt_tune.sh /usr/local/sbin/
+#   sudo cp hcs_rt_tune.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hcs_rt_tune.service
+# 查看结果：journalctl -u hcs_rt_tune.service
+
+[Unit]
+Description=HCS real-time tuning for the USB control machine (xHCI IRQ FIFO/C1, governor, RT throttling)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hcs_rt_tune.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
