@@ -2,5 +2,14 @@
   <class type="hcs_demo::hardware::DemoBoard"             base_class_type="hcs_executor::Component" />
   <class type="hcs_demo::hardware::CanRttProbe"           base_class_type="hcs_executor::Component" />
   <class type="hcs_demo::hardware::HcsLinkProbe"          base_class_type="hcs_executor::Component" />
-  <class type="hcs_demo::controller::pid::PidController"  base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::BalanceInfantry"       base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::chassis::balance::BalanceChassisController" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::chassis::balance::BalanceStateEstimator" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::chassis::balance::BalanceModeManager" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::chassis::balance::BalanceLqrController" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::chassis::balance::LegForceController" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::chassis::balance::LegJointController" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::gimbal::SimpleGimbalController" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::pid::PidController"  base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::pid::ErrorPidController" base_class_type="hcs_executor::Component" />
 </library>

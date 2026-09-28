@@ -60,7 +60,7 @@ hcs_executor:
       - hcs_demo::hardware::DemoBoard -> demo_hardware
       # demo_hardware_command 由 create_partner_component 自动创建，不写在这里
 
-      - hcs_demo::controller::pid::PidController -> velocity_pid_controller
+      - hcs_core::controller::pid::PidController -> velocity_pid_controller
 
 demo_hardware:
   ros__parameters:

@@ -14,6 +14,9 @@
   <depend>hcs_executor</depend>
   <depend>hcs_sync</depend>
   <depend>hcs_utility</depend>
+  <depend>hcs_msgs</depend>
+  <depend>hcs_description</depend>
+  <depend>fast_tf</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -6,7 +6,7 @@
 
 #include "controller/pid/pid_calculator.hpp"
 
-namespace hcs_demo::controller::pid {
+namespace hcs_core::controller::pid {
 
 // 三个接口名全部来自参数，所以同一个类可以在 yaml 里实例化任意多份；
 // 串级 PID 只是把上一级的 control 名字填进下一级的 setpoint，
@@ -58,8 +58,8 @@ private:
     OutputInterface<double> control_;
 };
 
-} // namespace hcs_demo::controller::pid
+} // namespace hcs_core::controller::pid
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(hcs_demo::controller::pid::PidController, hcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::controller::pid::PidController, hcs_executor::Component)

@@ -5,9 +5,9 @@
 #include <cmath>
 #include <string>
 
-#include <rmcs_executor/component.hpp>
+#include <hcs_executor/component.hpp>
 
-namespace rmcs_demo::hardware::device {
+namespace hcs_demo::hardware::device {
 
 // 设备类的标准写法，对应真实工程里的 device::DjiMotor / device::LkMotor：
 // 设备本身不是 Component，构造时同时向 status 组件注册 output、
@@ -25,8 +25,8 @@ public:
     };
 
     FakeMotor(
-        rmcs_executor::Component& status_component,
-        rmcs_executor::Component& command_component, const std::string& name_prefix) {
+        hcs_executor::Component& status_component,
+        hcs_executor::Component& command_component, const std::string& name_prefix) {
 
         status_component.register_output(name_prefix + "/angle", angle_output_, 0.0);
         status_component.register_output(name_prefix + "/velocity", velocity_output_, 0.0);
@@ -84,11 +84,11 @@ private:
     // std::atomic 出现在控制律或设备类里是一个信号（说明你正在跨域），不是一个解法。
     std::atomic<double> latched_torque_{0.0};
 
-    rmcs_executor::Component::OutputInterface<double> angle_output_;
-    rmcs_executor::Component::OutputInterface<double> velocity_output_;
-    rmcs_executor::Component::OutputInterface<double> max_torque_output_;
+    hcs_executor::Component::OutputInterface<double> angle_output_;
+    hcs_executor::Component::OutputInterface<double> velocity_output_;
+    hcs_executor::Component::OutputInterface<double> max_torque_output_;
 
-    rmcs_executor::Component::InputInterface<double> control_torque_;
+    hcs_executor::Component::InputInterface<double> control_torque_;
 };
 
-} // namespace rmcs_demo::hardware::device
+} // namespace hcs_demo::hardware::device

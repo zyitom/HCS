@@ -1,0 +1,131 @@
+# 图构建测试（test_balance_graph）的组件参数，取值与 balance-infantry.yaml
+# 的同名组件段一致；节点名 = 测试里 NameScope 给的实例名。
+balance_chassis_controller:
+  ros__parameters:
+    max_velocity: 2.0
+    spin_rate: 8.0
+    velocity_td_r: 25.0
+    velocity_td_h0: 0.01
+    spin_td_r: 22.5
+    spin_td_h0: 0.01
+
+balance_state_estimator:
+  ros__parameters:
+    leg_link1: 0.21
+    leg_link2: 0.25
+    leg_link5: 0.0
+    leg_angle_offset: 1.163
+    wheel_radius: 0.06
+    wheel_reduction_ratio: 13.94
+    wheel_half_track: 0.2296
+    left_angle_sign: -1.0
+    right_angle_sign: 1.0
+    velocity_sign: -1.0
+    # ROS 标准（REP-103）FLU 正装 = 恒等映射；Helios 的 CH100 是软件重映射轴
+    # （swap + 镜像 + 0.0112/0.0065 偏置），只在其安装被复刻时才启用。
+    imu_euler_swap: false
+    imu_pitch_sign: 1.0
+    imu_roll_sign: 1.0
+    imu_pitch_offset: 0.0    # 水平校准偏置，上车实测后填
+    imu_roll_offset: 0.0
+    imu_acceleration_swap: false
+    imu_acceleration_x_sign: 1.0
+    imu_acceleration_y_sign: 1.0
+    imu_acceleration_z_sign: 1.0
+    velocity_kf_q: 1.3
+    velocity_kf_r_base: 400.0
+    velocity_kf_r_max: 1500.0
+    ground_detection_enabled: false
+    ground_pressure_air_threshold: 80.0
+    ground_pressure_recover_threshold: 60.0
+    ground_length_threshold: 0.20
+    ddphi0_filter_alpha: 0.1
+
+balance_mode_manager:
+  ros__parameters:
+    disaster_pitch_roll_threshold: 1.2
+    fatal_roll_threshold: 0.90
+    fatal_pitch_threshold: 0.82
+    fatal_error_duration: 0.05
+    fallen_self_heal_delay: 2.0
+    crash_pitch_threshold: 0.45
+    crash_pitch_threshold_up_stair: 0.65
+    crash_phi0_difference_threshold: 0.69
+    crash_duration: 0.10
+    normal_init_lock: 3.0
+    leg_change_lock: 0.5
+    slow_start_stable_duration: 0.2
+    slow_start_timeout: 0.5
+    jump_pressure_confirm: 0.08
+    jump_pressure_timeout: 0.45
+    jump_takeoff_confirm: 0.012
+    jump_takeoff_min_push: 0.018
+    jump_takeoff_timeout: 0.18
+    jump_touchdown_confirm: 0.01
+    jump_flying_timeout: 1.2
+    jump_landing_confirm: 0.05
+    jump_landing_timeout: 0.7
+    take_off_length_high: 0.35
+    fly_enter_confirm: 0.003
+    fly_touchdown_confirm: 0.01
+    fly_minimum_duration: 0.1
+    fly_timeout: 1.0
+    impact_acceleration_threshold: 6.3
+    impact_lock_time: 0.1
+    up_stair_fold_angle: 1.23
+    up_stair_unfold_angle: 1.32
+    up_stair_count_gain: 3.0
+    up_stair_count_threshold: 0.08
+    up_stair_timer_threshold: 0.1
+    heal_stall_flip_duration: 0.8
+    heal_flip_cooldown: 1.5
+    heal_stall_motion_threshold: 0.003
+    heal_flip_allow_pitch: 1.05
+    leg_length_low: 0.17
+    leg_length_mid: 0.25
+    leg_length_high: 0.36
+
+balance_lqr_controller:
+  ros__parameters:
+    max_wheel_torque: 5.0
+    max_leg_torque: 40.0
+    lqr_fallback_improve: 0.1
+    gimbal_yaw_angle_sign: -1.0
+    swing_kp: 250.0
+    swing_ki: 0.0
+    swing_kd: 7.0
+    swing_output_max: 30.0
+
+leg_force_controller:
+  ros__parameters:
+    length_kp: 2800.0
+    length_ki: 0.0
+    length_kd: 60.0
+    length_output_max: 600.0
+    body_mass: 18.0
+    leg_mass: 2.6
+    wheel_mass: 0.25867
+    takeoff_acceleration: 20.0
+    takeoff_kp: 5.6
+    takeoff_kd: 0.4
+    roll_inertia: 0.35
+    roll_force_arm: 0.20
+    roll_force_limit: 80.0
+
+left_leg_joint_controller:
+  ros__parameters:
+    leg_prefix: /chassis/left_leg
+    front_joint_prefix: /chassis/left_front_joint
+    back_joint_prefix: /chassis/left_back_joint
+    leg_link1: 0.21
+    side_sign: 1.0
+    max_torque: 40.0
+
+right_leg_joint_controller:
+  ros__parameters:
+    leg_prefix: /chassis/right_leg
+    front_joint_prefix: /chassis/right_front_joint
+    back_joint_prefix: /chassis/right_back_joint
+    leg_link1: 0.21
+    side_sign: -1.0
+    max_torque: 40.0

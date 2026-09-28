@@ -13,14 +13,14 @@
 #include <eigen3/Eigen/Dense>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/keyboard.hpp>
-#include <rmcs_msgs/mouse.hpp>
-#include <rmcs_msgs/switch.hpp>
-#include <rmcs_utility/crc/dji_crc.hpp>
-#include <rmcs_utility/ring_buffer.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/keyboard.hpp>
+#include <hcs_msgs/mouse.hpp>
+#include <hcs_msgs/switch.hpp>
+#include <hcs_utility/crc/dji_crc.hpp>
+#include <hcs_utility/ring_buffer.hpp>
 
-namespace rmcs_core::hardware::device {
+namespace hcs_core::hardware::device {
 
 class Vt13 {
 public:
@@ -54,8 +54,9 @@ public:
         }
     }
 
-    void update_status() {
-        const auto now = Clock::now();
+    /// @param now 有效性计时的时间源。周期域调用方传 tick.scheduled（同一
+    /// steady_clock 时基），把 Clock::now() 这个系统调用从 RT 拍内挪出去。
+    void update_status(std::chrono::steady_clock::time_point now) {
         auto readable = data_buffer_.readable();
         peak_readable_ = std::max(peak_readable_, readable);
 
@@ -66,14 +67,11 @@ public:
             if (front == std::byte{0xa9})
                 result = read_remote_control_data(readable, now);
             else if (front == std::byte(0xa5))
-                result = read_referee_style_data(readable, now);
+                result = read_referee_style_data(readable);
             else {
+                // 周期域禁日志（-Wfunction-effects）：失败只计数，
+                // 统计由硬件组件的尽力域定时器读 counters 呈现。
                 unknown_prefix_count_++;
-                if (should_log_verification_failure(now)) {
-                    RCLCPP_WARN(
-                        logger_, "VT13 unknown prefix: front=0x%02x readable=%zu",
-                        std::to_integer<unsigned int>(front), readable);
-                }
             }
 
             if (std::holds_alternative<Incomplete>(result)) {
@@ -85,8 +83,10 @@ public:
                 readable--;
                 continue;
             }
-            if (std::holds_alternative<Success>(result)) {
-                readable -= std::get<Success>(result).read;
+            // get_if 而不是 get：get 会抛 bad_variant_access，clang 的
+            // -Wfunction-effects 据此拒绝把这条路径推断为 nonblocking。
+            if (const auto* success = std::get_if<Success>(&result)) {
+                readable -= success->read;
                 continue;
             }
         }
@@ -105,8 +105,8 @@ public:
     const Eigen::Vector2d& mouse_velocity() const noexcept { return mouse_velocity_; }
     double mouse_wheel() const noexcept { return mouse_wheel_; }
 
-    rmcs_msgs::Mouse mouse() const noexcept { return mouse_; }
-    rmcs_msgs::Keyboard keyboard() const noexcept { return keyboard_; }
+    hcs_msgs::Mouse mouse() const noexcept { return mouse_; }
+    hcs_msgs::Keyboard keyboard() const noexcept { return keyboard_; }
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -176,17 +176,10 @@ private:
 
         if (data.header != RemoteControlData::kHeaderMagic) {
             remote_bad_header_count_++;
-            if (should_log_verification_failure(now)) {
-                RCLCPP_WARN(
-                    logger_, "VT13 remote control header invalid: header=0x%04x readable=%zu",
-                    data.header, readable);
-            }
             return VerificationFailed{};
         }
-        if (!rmcs_utility::dji_crc::verify_crc16(data)) {
+        if (!hcs_utility::dji_crc::verify_crc16(data)) {
             remote_bad_crc_count_++;
-            if (should_log_verification_failure(now))
-                RCLCPP_WARN(logger_, "VT13 remote control crc16 invalid: readable=%zu", readable);
             return VerificationFailed{};
         }
 
@@ -221,10 +214,10 @@ private:
             .left = static_cast<bool>(data.mouse_left),
             .right = static_cast<bool>(data.mouse_right),
         };
-        keyboard_ = std::bit_cast<rmcs_msgs::Keyboard>(data.keyboard);
+        keyboard_ = std::bit_cast<hcs_msgs::Keyboard>(data.keyboard);
     }
 
-    ReadResult read_referee_style_data(const std::size_t readable, const TimePoint now) {
+    ReadResult read_referee_style_data(const std::size_t readable) {
         if (readable < sizeof(RefereeFrameHeader))
             return Incomplete{};
 
@@ -235,10 +228,8 @@ private:
             },
             sizeof(RefereeFrameHeader));
 
-        if (!rmcs_utility::dji_crc::verify_crc8(header)) {
+        if (!hcs_utility::dji_crc::verify_crc8(header)) {
             referee_bad_crc8_count_++;
-            if (should_log_verification_failure(now))
-                RCLCPP_WARN(logger_, "VT13 referee header crc8 invalid: readable=%zu", readable);
             return VerificationFailed{};
         }
 
@@ -246,11 +237,6 @@ private:
             sizeof(RefereeFrameHeader) + 2 + header.data_length + 2;
         if (total_frame_size > kRefereeFrameMaxSize) {
             referee_oversize_count_++;
-            if (should_log_verification_failure(now)) {
-                RCLCPP_WARN(
-                    logger_, "VT13 referee frame oversized: data_length=%u total=%zu readable=%zu",
-                    header.data_length, total_frame_size, readable);
-            }
             return VerificationFailed{};
         }
         if (readable < total_frame_size)
@@ -293,8 +279,8 @@ private:
         joystick_right_ = Eigen::Vector2d::Zero();
         mouse_velocity_ = Eigen::Vector2d::Zero();
         mouse_wheel_ = 0;
-        mouse_ = rmcs_msgs::Mouse::zero();
-        keyboard_ = rmcs_msgs::Keyboard::zero();
+        mouse_ = hcs_msgs::Mouse::zero();
+        keyboard_ = hcs_msgs::Keyboard::zero();
     }
 
     static double channel_to_double(int32_t value) {
@@ -305,7 +291,7 @@ private:
     }
 
     rclcpp::Logger logger_ = rclcpp::get_logger("vt13");
-    rmcs_utility::RingBuffer<std::byte> data_buffer_{1024};
+    hcs_utility::RingBuffer<std::byte> data_buffer_{1024};
 
     std::atomic<uint64_t> store_calls_{0};
     std::atomic<uint64_t> received_bytes_{0};
@@ -337,8 +323,8 @@ private:
     Eigen::Vector2d mouse_velocity_ = Eigen::Vector2d::Zero();
     double mouse_wheel_ = 0;
 
-    rmcs_msgs::Mouse mouse_ = rmcs_msgs::Mouse::zero();
-    rmcs_msgs::Keyboard keyboard_ = rmcs_msgs::Keyboard::zero();
+    hcs_msgs::Mouse mouse_ = hcs_msgs::Mouse::zero();
+    hcs_msgs::Keyboard keyboard_ = hcs_msgs::Keyboard::zero();
 };
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device

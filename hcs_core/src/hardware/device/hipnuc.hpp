@@ -14,13 +14,13 @@
 
 #include <eigen3/Eigen/Dense>
 
-#include <rmcs_executor/component.hpp>
-#include <rmcs_utility/double_buffer.hpp>
-#include <rmcs_utility/endian_promise.hpp>
-#include <rmcs_utility/package_receive.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_utility/double_buffer.hpp>
+#include <hcs_utility/endian_promise.hpp>
+#include <hcs_utility/package_receive.hpp>
 
-namespace rmcs_core::hardware::device {
-using rmcs_executor::Component;
+namespace hcs_core::hardware::device {
+using hcs_executor::Component;
 
 /// @brief HiPNUC IMU of the CH0x0 series, HI91 binary frame
 ///
@@ -115,16 +115,16 @@ public:
 
     /// For sources that hand out bytes through a read() of their own instead of a span. Consumes
     /// at most one frame worth of bytes per call.
-    template <rmcs_utility::is_byte ByteT>
-    bool store_status(rmcs_utility::is_readable_stream<ByteT> auto& stream) {
-        const auto result = rmcs_utility::receive_package<sizeof(Package::header), ByteT>(
+    template <hcs_utility::is_byte ByteT>
+    bool store_status(hcs_utility::is_readable_stream<ByteT> auto& stream) {
+        const auto result = hcs_utility::receive_package<sizeof(Package::header), ByteT>(
             stream, package_, cache_size_,
             [](const Package& package) {
                 return package.header[0] == 0x5A && package.header[1] == 0xA5;
             },
             [this](const Package& package) { return verify(package); });
 
-        if (result != rmcs_utility::ReceiveResult::SUCCESS)
+        if (result != hcs_utility::ReceiveResult::SUCCESS)
             return false;
 
         cache_size_ = 0;
@@ -219,22 +219,22 @@ private:
     /// is needed, the sizeof assertion below is what proves the layout has no padding.
     struct Hi91Payload {
         uint8_t tag;
-        rmcs_utility::le_uint16_t main_status;
+        hcs_utility::le_uint16_t main_status;
         int8_t temperature;                             // celsius
-        rmcs_utility::le_float32_t air_pressure;        // Pa
-        rmcs_utility::le_uint32_t system_time;          // ms
-        rmcs_utility::le_float32_t acceleration[3];     // G, XYZ
-        rmcs_utility::le_float32_t angular_velocity[3]; // deg/s, XYZ
-        rmcs_utility::le_float32_t magnetic_field[3];   // uT, XYZ
-        rmcs_utility::le_float32_t euler_angles[3];     // deg, roll pitch yaw
-        rmcs_utility::le_float32_t quaternion[4];       // WXYZ
+        hcs_utility::le_float32_t air_pressure;        // Pa
+        hcs_utility::le_uint32_t system_time;          // ms
+        hcs_utility::le_float32_t acceleration[3];     // G, XYZ
+        hcs_utility::le_float32_t angular_velocity[3]; // deg/s, XYZ
+        hcs_utility::le_float32_t magnetic_field[3];   // uT, XYZ
+        hcs_utility::le_float32_t euler_angles[3];     // deg, roll pitch yaw
+        hcs_utility::le_float32_t quaternion[4];       // WXYZ
     };
     static_assert(sizeof(Hi91Payload) == 76);
 
     struct Package {
         uint8_t header[2];                // 5A A5
-        rmcs_utility::le_uint16_t length; // sizeof(Hi91Payload) for HI91
-        rmcs_utility::le_uint16_t crc;    // checksum of every field except the crc itself
+        hcs_utility::le_uint16_t length; // sizeof(Hi91Payload) for HI91
+        hcs_utility::le_uint16_t crc;    // checksum of every field except the crc itself
         Hi91Payload payload;
     };
     static_assert(sizeof(Package) == 82);
@@ -307,7 +307,10 @@ private:
         // The checksum this function relies on is pinned to the manual at build time.
         static_assert(crc16_matches_manual_example());
 
-        if (package.length != sizeof(Hi91Payload) || package.payload.tag != kHi91Tag)
+        // static_cast：EndianContainer 自带的模板 operator!= 和经隐式转换的内置
+        // != 在 clang 下二义（gcc 能选出来），显式转一侧，语义不变。
+        if (static_cast<std::uint16_t>(package.length) != sizeof(Hi91Payload)
+            || package.payload.tag != kHi91Tag)
             return false;
 
         // bit_cast, not reinterpret_cast: the byte view is a copy of the object, which keeps the
@@ -318,7 +321,7 @@ private:
             std::span{bytes}.subspan(kPayloadOffset),
             crc16(std::span{bytes}.first(kCrcCoveredHeaderBytes)));
 
-        if (crc != package.crc) {
+        if (crc != static_cast<std::uint16_t>(package.crc)) {
             crc_error_count_.fetch_add(1, std::memory_order::relaxed);
             return false;
         }
@@ -348,7 +351,7 @@ private:
             quaternion_ = quaternion.normalized();
     }
 
-    static Eigen::Vector3d to_vector(const rmcs_utility::le_float32_t (&values)[3]) {
+    static Eigen::Vector3d to_vector(const hcs_utility::le_float32_t (&values)[3]) {
         // The casts are not decoration: EndianContainer has a template conversion operator,
         // and a braced initializer would let it deduce std::initializer_list instead of float.
         return Eigen::Vector3d{
@@ -361,7 +364,7 @@ private:
     size_t cache_size_ = 0;
     mutable std::atomic<uint32_t> crc_error_count_{0};
 
-    rmcs_utility::DoubleBuffer<Hi91Payload, true> payload_buffer_;
+    hcs_utility::DoubleBuffer<Hi91Payload, true> payload_buffer_;
     std::atomic<uint32_t> sequence_{0};
 
     // Component thread side
@@ -387,4 +390,4 @@ private:
     Component::OutputInterface<bool> online_output_;
 };
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device

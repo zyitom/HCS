@@ -61,8 +61,9 @@ include(CheckCXXCompilerFlag)
 # component.hpp 是 header-only 的，不一致会让同一个 inline 函数在两边生成不同的码。
 set(HCS_MARCH "x86-64-v3" CACHE STRING "-march value; empty disables")
 
+# -g：非停机调试要完整的类型信息（见 hcs_bringup/tools/hcs_gdbstub.py），不改变生成的代码。
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-O3 -Wall -Wextra -Wpedantic)
+  add_compile_options(-g -O3 -Wall -Wextra -Wpedantic)
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # 组件的 update() 才是 HCS_NONBLOCKING 真正要管的地方 —— 这个包比
@@ -93,7 +94,16 @@ set(PROJECT_SOURCE
   src/hardware/demo_board.cpp
   src/hardware/can_rtt_probe.cpp
   src/hardware/hcs_link_probe.cpp
+  src/hardware/balance_infantry.cpp
   src/controller/pid/pid_controller.cpp
+  src/controller/pid/error_pid_controller.cpp
+  src/controller/chassis/balance/balance_chassis_controller.cpp
+  src/controller/chassis/balance/balance_state_estimator.cpp
+  src/controller/chassis/balance/balance_mode_manager.cpp
+  src/controller/chassis/balance/balance_lqr_controller.cpp
+  src/controller/chassis/balance/leg_force_controller.cpp
+  src/controller/chassis/balance/leg_joint_controller.cpp
+  src/controller/gimbal/simple_gimbal_controller.cpp
 )
 
 # 库名必须和 plugins.xml 里的 <library path="..."> 一致，
@@ -101,9 +111,46 @@ set(PROJECT_SOURCE
 ament_auto_add_library(${PROJECT_NAME} SHARED ${PROJECT_SOURCE})
 target_link_libraries(${PROJECT_NAME} libhcs-sdk)
 
+# libhcs SDK 开了 INTERPROCEDURAL_OPTIMIZATION：gcc 产出 fat object， clang 产出
+# 纯 LLVM bitcode 归档，链接方必须带 -flto 驱动才会加载 LTO 插件，否则
+# "file format not recognized"。SDK 是子模块，这里在消费侧补。
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(${PROJECT_NAME} PRIVATE -flto)
+  target_link_options(${PROJECT_NAME} PRIVATE -flto)
+endif()
+
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
 pluginlib_export_plugin_description_file(hcs_executor plugins.xml)
+
+# ── 测试 ──────────────────────────────────────────────────────────────────
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+
+  # 发送工具的批次打包与安全批次决策（不需要真实板卡）。
+  ament_add_gtest(test_board_transmitter test/test_board_transmitter.cpp)
+  target_include_directories(test_board_transmitter PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(test_board_transmitter libhcs-sdk)
+  ament_target_dependencies(
+    test_board_transmitter
+    hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf)
+
+  # 数学函数与 Helios 原函数（测试内嵌 float 参考）的同输入对拍。
+  ament_add_gtest(test_balance_math test/test_balance_math.cpp)
+  target_include_directories(test_balance_math PRIVATE
+    ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/test)
+
+  # 平衡组件图：假硬件 + 全部平衡组件 link + 空跑，参数文件挂给 rclcpp::init。
+  ament_add_gtest(test_balance_graph test/test_balance_graph.cpp)
+  target_include_directories(test_balance_graph PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  target_compile_definitions(test_balance_graph PRIVATE
+    BALANCE_GRAPH_TEST_YAML="${CMAKE_CURRENT_SOURCE_DIR}/test/balance_graph_test.yaml")
+  ament_target_dependencies(
+    test_balance_graph
+    hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf rclcpp)
+endif()
 
 ament_auto_package()

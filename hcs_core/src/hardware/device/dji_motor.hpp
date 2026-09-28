@@ -12,12 +12,12 @@
 #include <string>
 #include <utility>
 
-#include <rmcs_executor/component.hpp>
-#include <rmcs_utility/endian_promise.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_utility/endian_promise.hpp>
 
 #include "hardware/device/can_packet.hpp"
 
-namespace rmcs_core::hardware::device {
+namespace hcs_core::hardware::device {
 
 class DjiMotor {
 public:
@@ -51,7 +51,7 @@ public:
     };
 
     DjiMotor(
-        rmcs_executor::Component& status_component, rmcs_executor::Component& command_component,
+        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
         const std::string& name_prefix)
         : angle_(0.0)
         , velocity_(0.0)
@@ -65,7 +65,7 @@ public:
     }
 
     DjiMotor(
-        rmcs_executor::Component& status_component, rmcs_executor::Component& command_component,
+        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
         const std::string& name_prefix, const Config& config)
         : DjiMotor(status_component, command_component, name_prefix) {
         configure(config);
@@ -224,7 +224,7 @@ public:
 
         control_torque = std::clamp(control_torque, -max_torque_, max_torque_);
         const double current = std::round(torque_to_raw_current_coefficient_ * control_torque);
-        const rmcs_utility::be_int16_t control_current = static_cast<int16_t>(current);
+        const hcs_utility::be_int16_t control_current = static_cast<int16_t>(current);
 
         return std::bit_cast<CanPacket8::Quarter>(control_current);
     }
@@ -245,9 +245,9 @@ public:
 
 private:
     struct alignas(uint64_t) DjiMotorFeedback {
-        rmcs_utility::be_int16_t angle;
-        rmcs_utility::be_int16_t velocity;
-        rmcs_utility::be_int16_t current;
+        hcs_utility::be_int16_t angle;
+        hcs_utility::be_int16_t velocity;
+        hcs_utility::be_int16_t current;
         uint8_t temperature;
         uint8_t unused;
     };
@@ -272,17 +272,17 @@ private:
     double max_torque_;
     double temperature_;
 
-    rmcs_executor::Component::OutputInterface<double> angle_output_;
-    rmcs_executor::Component::OutputInterface<double> velocity_output_;
-    rmcs_executor::Component::OutputInterface<double> torque_output_;
-    rmcs_executor::Component::OutputInterface<double> max_torque_output_;
+    hcs_executor::Component::OutputInterface<double> angle_output_;
+    hcs_executor::Component::OutputInterface<double> velocity_output_;
+    hcs_executor::Component::OutputInterface<double> torque_output_;
+    hcs_executor::Component::OutputInterface<double> max_torque_output_;
 
-    rmcs_executor::Component::InputInterface<double> control_torque_;
+    hcs_executor::Component::InputInterface<double> control_torque_;
 };
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device
 
-namespace rmcs_core::hardware::device {
+namespace hcs_core::hardware::device {
 
 inline auto operator<<(CanPacket8& packet, const DjiMotor& motor) -> CanPacket8& {
     if (motor.id() != 0)
@@ -290,4 +290,4 @@ inline auto operator<<(CanPacket8& packet, const DjiMotor& motor) -> CanPacket8&
     return packet;
 }
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device

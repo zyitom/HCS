@@ -14,8 +14,10 @@ set(HCS_MARCH "x86-64-v3" CACHE STRING "-march value; empty disables")
 option(HCS_ENABLE_RTSAN "Build with -fsanitize=realtime (clang 20+ only)" OFF)
 option(HCS_EXECUTOR_COMPONENT_TIMING "Per-component timing in the RT loop" OFF)
 
+# -g 而不是 -g1：非停机调试（hcs_bringup/tools/hcs_gdbstub.py）要完整的类型信息才能展开对象；
+# -g 不改变生成的代码，只增大文件。
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-g1 -rdynamic -O3 -Wall -Wextra -Wpedantic)
+  add_compile_options(-g -rdynamic -O3 -Wall -Wextra -Wpedantic)
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # HCS_NONBLOCKING 只有配上这个告警组才真的是抓手 —— 不开它，

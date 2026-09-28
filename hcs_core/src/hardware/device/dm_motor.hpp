@@ -12,11 +12,11 @@
 #include <string>
 #include <utility>
 
-#include <rmcs_executor/component.hpp>
+#include <hcs_executor/component.hpp>
 
 #include "hardware/device/can_packet.hpp"
 
-namespace rmcs_core::hardware::device {
+namespace hcs_core::hardware::device {
 
 class DmMotor {
 public:
@@ -114,7 +114,7 @@ public:
     };
 
     DmMotor(
-        rmcs_executor::Component& status_component, rmcs_executor::Component& command_component,
+        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
         const std::string& name_prefix) {
         status_component.register_output(name_prefix + "/angle", angle_output_, 0.0);
         status_component.register_output(name_prefix + "/raw_angle", raw_angle_output_, 0);
@@ -140,7 +140,7 @@ public:
     }
 
     DmMotor(
-        rmcs_executor::Component& status_component, rmcs_executor::Component& command_component,
+        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
         const std::string& name_prefix, const Config& config)
         : DmMotor(status_component, command_component, name_prefix) {
         configure(config);
@@ -553,21 +553,21 @@ private:
     double temperature_;
     double temperature_mos_;
 
-    rmcs_executor::Component::OutputInterface<double> angle_output_;
-    rmcs_executor::Component::OutputInterface<int64_t> raw_angle_output_;
-    rmcs_executor::Component::OutputInterface<double> velocity_output_;
-    rmcs_executor::Component::OutputInterface<double> torque_output_;
-    rmcs_executor::Component::OutputInterface<double> temperature_output_;
-    rmcs_executor::Component::OutputInterface<double> temperature_mos_output_;
-    rmcs_executor::Component::OutputInterface<double> max_torque_output_;
-    rmcs_executor::Component::OutputInterface<uint8_t> error_code_output_;
-    rmcs_executor::Component::OutputInterface<bool> online_output_;
+    hcs_executor::Component::OutputInterface<double> angle_output_;
+    hcs_executor::Component::OutputInterface<int64_t> raw_angle_output_;
+    hcs_executor::Component::OutputInterface<double> velocity_output_;
+    hcs_executor::Component::OutputInterface<double> torque_output_;
+    hcs_executor::Component::OutputInterface<double> temperature_output_;
+    hcs_executor::Component::OutputInterface<double> temperature_mos_output_;
+    hcs_executor::Component::OutputInterface<double> max_torque_output_;
+    hcs_executor::Component::OutputInterface<uint8_t> error_code_output_;
+    hcs_executor::Component::OutputInterface<bool> online_output_;
 
-    rmcs_executor::Component::InputInterface<double> control_angle_;
-    rmcs_executor::Component::InputInterface<double> control_velocity_;
-    rmcs_executor::Component::InputInterface<double> control_torque_;
-    rmcs_executor::Component::InputInterface<double> control_kp_;
-    rmcs_executor::Component::InputInterface<double> control_kd_;
+    hcs_executor::Component::InputInterface<double> control_angle_;
+    hcs_executor::Component::InputInterface<double> control_velocity_;
+    hcs_executor::Component::InputInterface<double> control_torque_;
+    hcs_executor::Component::InputInterface<double> control_kp_;
+    hcs_executor::Component::InputInterface<double> control_kd_;
 };
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device

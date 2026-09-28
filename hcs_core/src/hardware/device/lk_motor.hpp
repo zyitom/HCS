@@ -15,11 +15,11 @@
 
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
-#include <rmcs_executor/component.hpp>
+#include <hcs_executor/component.hpp>
 
 #include "hardware/device/can_packet.hpp"
 
-namespace rmcs_core::hardware::device {
+namespace hcs_core::hardware::device {
 
 class LkMotor {
 public:
@@ -47,7 +47,7 @@ public:
     };
 
     LkMotor(
-        rmcs_executor::Component& status_component, rmcs_executor::Component& command_component,
+        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
         const std::string& name_prefix) {
         status_component.register_output(name_prefix + "/angle", angle_output_, 0.0);
         status_component.register_output(name_prefix + "/raw_angle", raw_angle_output_, 0);
@@ -67,7 +67,7 @@ public:
     }
 
     LkMotor(
-        rmcs_executor::Component& status_component, rmcs_executor::Component& command_component,
+        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
         const std::string& name_prefix, const Config& config)
         : LkMotor(status_component, command_component, name_prefix) {
         configure(config);
@@ -410,19 +410,6 @@ public:
     }
 
     CanPacket8 generate_command() {
-        if (first_generate_auto_command_) [[unlikely]] {
-            first_generate_auto_command_ = false;
-
-            if (!control_angle_shift_.ready())
-                control_angle_shift_.bind_directly(kNan);
-            if (!control_angle_.ready())
-                control_angle_.bind_directly(kNan);
-            if (!control_velocity_.ready())
-                control_velocity_.bind_directly(kNan);
-            if (!control_torque_.ready())
-                control_torque_.bind_directly(kNan);
-        }
-
         if (!std::isnan(control_angle_shift()))
             return generate_angle_shift_command(control_angle_shift(), control_velocity());
         if (!std::isnan(control_angle()))
@@ -432,29 +419,33 @@ public:
         return generate_torque_command(control_torque());
     }
 
+    // has_provider(), not ready(): HCS 在接线时就把没人提供的可选输入绑到默认值 0.0，
+    // ready() 从此恒为真。若在这里读 ready()，一个没接控制器的电机会把 0.0 当成
+    // "角度 0 指令"发给电机；has_provider() 才能把"未接线"翻成 NaN → 失能帧。
+    // 与 DmMotor 的同名访问器同语义。
     double control_torque() const {
-        if (control_torque_.ready()) [[likely]]
+        if (control_torque_.has_provider()) [[likely]]
             return *control_torque_;
         else
             return std::numeric_limits<double>::quiet_NaN();
     }
 
     double control_velocity() const {
-        if (control_velocity_.ready()) [[likely]]
+        if (control_velocity_.has_provider()) [[likely]]
             return *control_velocity_;
         else
             return std::numeric_limits<double>::quiet_NaN();
     }
 
     double control_angle() const {
-        if (control_angle_.ready()) [[likely]]
+        if (control_angle_.has_provider()) [[likely]]
             return *control_angle_;
         else
             return std::numeric_limits<double>::quiet_NaN();
     }
 
     double control_angle_shift() const {
-        if (control_angle_shift_.ready()) [[likely]]
+        if (control_angle_shift_.has_provider()) [[likely]]
             return *control_angle_shift_;
         else
             return std::numeric_limits<double>::quiet_NaN();
@@ -547,19 +538,18 @@ private:
     double max_torque_;
     double temperature_;
 
-    rmcs_executor::Component::OutputInterface<double> angle_output_;
-    rmcs_executor::Component::OutputInterface<int64_t> raw_angle_output_;
-    rmcs_executor::Component::OutputInterface<double> velocity_output_;
-    rmcs_executor::Component::OutputInterface<double> torque_output_;
-    rmcs_executor::Component::OutputInterface<double> temperature_output_;
-    rmcs_executor::Component::OutputInterface<double> max_torque_output_;
+    hcs_executor::Component::OutputInterface<double> angle_output_;
+    hcs_executor::Component::OutputInterface<int64_t> raw_angle_output_;
+    hcs_executor::Component::OutputInterface<double> velocity_output_;
+    hcs_executor::Component::OutputInterface<double> torque_output_;
+    hcs_executor::Component::OutputInterface<double> temperature_output_;
+    hcs_executor::Component::OutputInterface<double> max_torque_output_;
 
-    rmcs_executor::Component::InputInterface<double> control_torque_;
-    rmcs_executor::Component::InputInterface<double> control_velocity_;
-    rmcs_executor::Component::InputInterface<double> control_angle_;
-    rmcs_executor::Component::InputInterface<double> control_angle_shift_;
+    hcs_executor::Component::InputInterface<double> control_torque_;
+    hcs_executor::Component::InputInterface<double> control_velocity_;
+    hcs_executor::Component::InputInterface<double> control_angle_;
+    hcs_executor::Component::InputInterface<double> control_angle_shift_;
 
-    bool first_generate_auto_command_ = true;
 };
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device
