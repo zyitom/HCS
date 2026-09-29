@@ -17,8 +17,9 @@
 #include <rclcpp/logging.hpp>
 
 #include "hcs_utility/rt_sampler.hpp"
-#include "hcs_utility/tdigest.hpp"
 #include "hcs_utility/thread_config.hpp"
+
+#include "tdigest.hpp"
 
 // 与 executor.hpp 同一个开关，取值而不是取"是否定义"：CMake 关掉时也可能定义成 0。
 #ifndef HCS_EXECUTOR_COMPONENT_TIMING
@@ -87,8 +88,8 @@ private:
     static constexpr auto drain_period_ = std::chrono::milliseconds{100};
 
     struct CumulativeStats {
-        hcs_utility::TDigest<double> start_lateness_ms{digest_size_};
-        hcs_utility::TDigest<double> update_duration_ms{digest_size_};
+        TDigest<double> start_lateness_ms{digest_size_};
+        TDigest<double> update_duration_ms{digest_size_};
         uint64_t update_count = 0;
         uint64_t skipped_count = 0;
         uint64_t start_lateness_sample_count = 0;
@@ -349,7 +350,7 @@ private:
     static std::string format_percent(double value) { return std::format("{:.1f}", value); }
 
     static std::optional<double> maybe_quantile(
-        const hcs_utility::TDigest<double>& digest, uint64_t sample_count, double quantile) {
+        const TDigest<double>& digest, uint64_t sample_count, double quantile) {
         if (sample_count == 0)
             return std::nullopt;
         return digest.quantile(quantile);

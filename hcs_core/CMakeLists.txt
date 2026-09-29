@@ -103,6 +103,7 @@ set(PROJECT_SOURCE
   src/controller/chassis/balance/leg_force_controller.cpp
   src/controller/chassis/balance/leg_joint_controller.cpp
   src/controller/gimbal/simple_gimbal_controller.cpp
+  src/controller/auto_aim/auto_aim_link.cpp
   src/broadcaster/tf_broadcaster.cpp
   src/broadcaster/value_broadcaster.cpp
   src/referee/status.cpp
@@ -200,6 +201,19 @@ if(BUILD_TESTING)
   ament_target_dependencies(
     test_balance_bench
     hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf rclcpp)
+  # 自瞄跟随逻辑：新命令就跟、陈旧就停、坏命令不跟、开火只在窗内、换会话清旧命令。
+  ament_add_gtest(test_aim_follower test/test_aim_follower.cpp)
+  target_include_directories(test_aim_follower PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_aim_follower hcs_link hcs_utility)
+
+  # AutoAimLink 端到端：真组件 + 真 socket + 真 memfd 通道，视觉由测试线程扮演。
+  ament_add_gtest(test_auto_aim_link test/test_auto_aim_link.cpp TIMEOUT 60)
+  target_include_directories(test_auto_aim_link PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(
+    test_auto_aim_link
+    hcs_executor hcs_sync hcs_utility hcs_description fast_tf hcs_link rclcpp pluginlib)
 endif()
 
 ament_auto_package()

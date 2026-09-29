@@ -1,135 +1,177 @@
-# 自瞄跨进程通道 · 设计定稿（v2，未实现）
+# 自瞄跨进程通道 · v4（已实现）
 
-> 状态：设计完成，待实现。v1 定稿于 2026-09-29，同日审查后改为 v2。
-> 前提：视觉进程独立（崩溃隔离），**不用任何 ROS**；相机由视觉进程独占采集，
-> **图像永远不进控制进程**——跨进程载荷只有姿态（64 B/条）、上下文（64 B）和目标（128 B）。
-> 带"已实测"的结论是在本机（GCC 14.2 / clang 20 / Linux 7.0）上验证过的，其余来自读代码和文档。
+> 状态：代码和单测已完成，未上车。v1–v3 于 2026-09-29 反复审查后收敛成下面这个简单版本（§8 说明删掉了什么）。
+> 代码：`hcs_link/`（纯头文件，只依赖标准库和 POSIX，C++23）、`hcs_core/src/controller/auto_aim/`。
+> 前提：视觉是独立进程、不用任何 ROS；图像永远不进控制进程；两个进程同机、同 time/network namespace。
+> 带"实测"的数字在本机（i7-1165G7，Linux 6.8.1-rt，`isolcpus=3,7`，GCC 14.2 / clang 20）上测得。
 
-## 0. v1 → v2 改了什么
+## 1. 设计：一个原语，两个方向各用一次
 
-| v1 | v2 | 原因 |
-|---|---|---|
-| 姿态走 SPSC FIFO（ByteTunnel 形状） | 覆盖式历史环，按时间查 | FIFO 写满时丢的是**新**数据；控制侧要读视觉写的游标；视觉要的是"某一刻的姿态"而不是"下一条" |
-| 按帧号配对 | 按 CLOCK_MONOTONIC 时间戳配对 | 控制进程不知道相机帧号；没有硬触发（libhcs 的 `send_pulse_schedule` 只用于测试） |
-| 一个双方都可写的 POSIX shm 段 | 两个 memfd，按写者分段，加 seal | 共写一段就挡不住野写；对端 `ftruncate` 缩段会让控制进程 SIGBUS；memfd 没有 `/dev/shm` 残段 |
-| 心跳 + `kill(pid,0)` | socket EOF + 按自己的拍数判陈旧 | PID 会复用、跨 PID namespace 对不上；对端写的时间戳不可信 |
-| 固定段名 + 死段接管 | abstract unix socket 握手，SCM_RIGHTS 递 fd | 没有文件系统残留；握手失败能回一条带双方版本的错误 |
-| 手动 `layout_version` | 编译期布局哈希 + 金值测试 + 语义版本号 | 手动递增迟早会忘（kSetEndpointMode 的教训） |
-| memcpy 版 seqlock | 每 8 字节一次 `std::atomic_ref` | 形式上无数据竞争；TSan 能跑；编译器不能对不可信内存二次读取 |
-| AttitudeTap + AutoAimBridge 两个组件 | 一个组件 AutoAimLink | 两半共享同一对段和会话状态，拆开只多一层管道 |
-| 载荷 48 B / 64 B | 姿态 64 B，目标 128 B，另加上下文 64 B | 补会话号、帧号、robot_center（UI 在用）、控制→视觉的颜色/弹速 |
-
-保留不变的判断：视觉独立进程；不用 ROS/DDS；不引 iceoryx2 等第三方库；小载荷不做零拷贝 loan；
-v1 不用 futex（双方都按自己的节拍读，没有人需要睡着等对方）；目标只保留最新值。
-
-## 1. 范围与前提
-
-- **图像只属于视觉进程**。相机 SDK、检测、跟踪、预测、弹道补偿都在视觉进程里；控制进程只收目标。
-- **1:1**：同一时刻只接受一个视觉进程。第二个连接直接拒绝。
-- **同机、同内核、同一个 time namespace 和 network namespace**。abstract unix socket 挂在
-  network namespace 上，CLOCK_MONOTONIC 挂在 time namespace 上（视觉进容器时的要求见 §9）。
-- **平台**：Linux ≥ 5.1（`F_SEAL_FUTURE_WRITE`），x86-64 或 aarch64，小端。
-- **视觉侧只要 C++20**：共享头文件只依赖标准库，不依赖 ROS、Eigen 或 hcs 的其他包。
-- **威胁模型是"有 bug 的视觉"，不是攻击者**：同 uid 的任何进程都能连上 socket 冒充视觉，这一点不防。
-  要防的是视觉崩溃、挂起、野写、写出 NaN 或离谱值、版本不匹配。
-
-## 2. 架构
+**通道 `Channel<T>`**：一个写者、任意多个只读读者的广播环，放在一段 memfd 里。
+**谁写谁建**：写者建段、写满一遍、自己加 seal，再把 fd 交出去；另一方只能拿到只读视图。
 
 ```
-控制进程（hcs_executor）                                      视觉进程（C++20，无 ROS）
-┌ hcs-ctrl（FIFO 90，CPU 3）──────────────────┐
-│ AutoAimLink::update(tick)                    │   att 段：控制写，视觉只读（内核 seal 保证）
-│  ① IMU 有新帧 → 写姿态环 ──────────────────────▶ 姿态环 256 × 64 B ──▶ 推理完成后按曝光时刻二分 + slerp
-│  ② 上下文有变 → 写上下文槽 ────────────────────▶ 上下文槽 64 B     ──▶ 敌方颜色、弹速、自瞄模式
-│  ③ 读目标槽 → 校验 → 外推到本拍 → 写图边 ◀────── aim 段：视觉写，控制只读 ◀── 每帧发布一次（无目标也发）
-└──────────────────────────────────────────────┘
-┌ hcs-autoaim-ipc（SCHED_OTHER，非隔离核）──────┐
-│ accept → 握手 → SCM_RIGHTS 递两个 fd          │◀── abstract unix socket "@hcs/autoaim" ──▶ connect，断线重连
-│ poll 到 EOF → session = 0                     │
-└──────────────────────────────────────────────┘
+hcs_executor（hcs-ctrl，每拍）                         视觉进程（任意框架）
+  Writer<GimbalState>.publish(姿态)   ── 通道 ──▶  Reader<GimbalState>：latest() / 游标逐条读
+  Reader<AimCommand>.latest()         ◀── 通道 ──  Writer<AimCommand>.publish(命令)
+                    ↑
+  hcs-autoaim 线程：abstract socket 上互换一次 fd，之后 socket 只用来察觉对端退出
 ```
 
-- 控制进程里**只有 hcs-ctrl 线程碰共享内存**：写 att 段、读 aim 段。
-- IPC 线程只递 fd、只写一个进程内的 `std::atomic<uint32_t> session`，从不碰段的内容。
-- 所以两个段各自都是严格的单写者，不需要任何跨进程锁。
+- 周期域只做通道的读写：不分配、不加锁、不进内核、不等任何人（clang `-Wfunction-effects` 核实）。
+- 读者从不写共享内存，写者从不等读者，所以读者再多、再慢也影响不到写者。
+- 视觉以后改成控制进程里的线程时，用 `Writer::open_reader()` 拿同一种只读视图，代码不变。
 
-## 3. 会话与段
+## 2. 通道（`hcs_link/channel.hpp`）
 
-### 3.1 一个会话 = 一对全新的段
+### 2.1 布局
 
-每次视觉连上来，控制侧都新建一对 memfd，会话结束就作废，**绝不跨会话复用**。
-这样每个段在整个生命周期里只有一个写者进程，这条不变量是后面所有保证的地基：
+| 偏移 | 内容 |
+|---|---|
+| 0 | 段头 64 B：魔数 `HCSLINK1`、协议版本、载荷名字哈希 / 版本 / 大小、槽大小、容量。建段时写一次 |
+| 64 | `published`：已发布条数，独占一行 |
+| 128 | 槽 × 容量。每槽 = `sequence` + 载荷的 64 位字，按 64 B 对齐 |
 
-- 上一个视觉进程哪怕没死透、还在往旧段里写，也写不进新会话；
-- 不存在"接手半写的 seqlock"这种特殊情况，每个段的序号都从 0 开始。
+### 2.2 一致性：带代号的 seqlock
 
-| 段 | 大小 | 写者 | 读者 | 控制侧映射 | 视觉侧映射 | seal |
-|---|---|---|---|---|---|---|
-| att | 20 KiB | 控制 hcs-ctrl | 视觉 | RW | **只读**（内核强制） | SHRINK、GROW、FUTURE_WRITE、SEAL |
-| aim | 4 KiB | 视觉 | 控制 hcs-ctrl | **只读** | RW + `MADV_DONTFORK` | SHRINK、GROW、SEAL |
+第 k 条写进槽 `k % 容量`；写的过程中槽的 `sequence = 2k+1`，写完 `= 2k+2`。
+读者问的是"第 k 条"：`sequence` 小于 `2k+2` 是还没写到，大于是已被覆盖，读完再比一次不等也是被覆盖。
 
-建段顺序（IPC 线程，非 RT）：
+- 数据逐个 64 位字用 `std::atomic_ref` 做 release 写 / acquire 读，不用独立 fence：
+  GCC 14 对 `atomic_thread_fence` 报 `-Wtsan`（实测）。x86-64 上仍是普通 `mov`。
+- 读侧先把整条拷进局部再校验、再使用，不对共享内存做第二次读。
+- 只读映射上只用 8 字节原子：16 字节原子读在部分实现里会写内存，只读映射上直接 SIGSEGV。
 
+### 2.3 无损
+
+- 每个读者自己的 `Cursor` 逐条往后读，一圈之内一条不漏。
+- 落后超过一圈时跳到还能安全读的最老一条，跳过的条数精确计入 `lost()`。不会悄悄丢，但写者也绝不等读者。
+
+### 2.4 为什么读对端写的内存也安全（实测）
+
+写者建段后加 `SHRINK | GROW | FUTURE_WRITE | SEAL`。之后**包括写者自己**：
+
+| 动作 | 结果 |
+|---|---|
+| `ftruncate` 缩 / 扩 | EPERM |
+| `fallocate(PUNCH_HOLE)`、对自己可写映射做 `MADV_REMOVE` | EPERM |
+| 新建可写映射、只读映射改可写、`write(fd)` | EPERM / EACCES |
+| 对自己映射做 `MADV_DONTNEED`、`munmap`、进程退出 | 允许，但只影响写者自己，读者的页原样还在 |
+
+读者 `attach` 时先查这些 seal，再只读映射并 `mlock`。于是读者的页不会被任何进程回收，
+读它不会 SIGBUS、不会缺页——周期域线程可以直接读视觉写的命令通道。
+
+## 3. 会合（`hcs_link/rendezvous.hpp`）
+
+- abstract `SOCK_SEQPACKET`，名字默认 `@hcs/autoaim`：不落文件系统，崩溃不留残段。
+  同一 netns 里名字被占用时 `bind` 失败，顺带防止起两个控制进程。
+- 两端都用 `SO_PEERCRED` 核对 uid（abstract socket 没有文件权限）。
+- `exchange()` 对称：各发一条 `Hello{magic, protocol, fd_count}` 连同自己写的通道 fd，再收对端的。
+  收到的 fd 先全部装进 `UniqueFd` 再校验，任何一步失败都不漏 fd；发送带 `MSG_NOSIGNAL`。
+- 之后连接只用来察觉对端退出（`peer_closed()`）。
+
+## 4. HCS 侧：`AutoAimLink` 组件
+
+| | |
+|---|---|
+| 输入 | `/gimbal/imu/quaternion`、`/gimbal/imu/angular_velocity`、`/gimbal/imu/online` |
+| 输出 | `/auto_aim/should_control`、`/auto_aim/control_direction`、`/auto_aim/should_shoot`（`SimpleGimbalController` 早已注册为可选输入） |
+| 参数 | `endpoint`（默认 `hcs/autoaim`）、`stale_ticks`（50）、`max_extrapolation_ms`（60）、`state_capacity`（1024）、`lock_memory`（true） |
+
+每拍：写一条 `GimbalState` → 从命令通道取最新一条交给 `AimFollower` → 写三个输出。
+
+- `AimFollower`（纯逻辑）：新命令先校验（§6），不合法就作废；按本端拍数判陈旧（对端时间戳只用来外推）；
+  外推到本拍（钳在 0–60 ms）；开火只在命令给的时间窗内。
+- `hcs-autoaim` 线程：接连接、互换 fd、`attach` 命令通道，**新连接直接顶掉旧的**
+  （视觉 fork 过时旧连接的 EOF 可能永远不来）；对端退出就把命令通道撤下。
+- 会话切换用 `QuiescentCell`（QSBR）：换指针后等周期域走过一个静止点（拍末）再释放旧的；
+  周期域 200 ms 内没走过静止点（没在跑拍）就宁可泄漏也不释放。
+
+## 5. 视觉侧怎么用
+
+```cpp
+#include <hcs_link/autoaim.hpp>
+#include <hcs_link/rendezvous.hpp>
+
+using namespace hcs_link;
+auto socket   = connect(autoaim::kEndpoint);                        // 没连上就隔一会儿重试
+auto commands = Writer<autoaim::AimCommand>::create({.capacity = 64});
+auto received = exchange(socket->get(), std::array{commands->fd()}, std::chrono::seconds{1});
+auto state    = Reader<autoaim::GimbalState>::attach(std::move(received->fds[0]));
+
+auto cursor = state->cursor();                   // 逐拍读姿态，一条不漏；或者 state->latest()
+while (auto sample = cursor.next()) { /* sample->value.quaternion, tick_ns … */ }
+
+commands->publish(autoaim::AimCommand{/* t_ref_ns, 方位/俯仰及其导数, 开火窗, flags */});
+// 每处理完一帧发一条，没看到目标也发（flags 不带 kHasTarget），当心跳用。
+// publish 只许一个线程调用；读可以任意线程并发。
 ```
-memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING) → ftruncate(固定大小)
-→ mmap(MAP_SHARED | MAP_POPULATE | MAP_LOCKED)      // 先映射，RT 线程碰到时不会缺页
-→ 写段头（只写这一次）
-→ fcntl(F_ADD_SEALS, ...)                          // 必须在递 fd 之前
-→ 握手里用 SCM_RIGHTS 递 fd
-```
 
-- `F_SEAL_SHRINK | F_SEAL_GROW`：对端无法改段大小，控制进程不会因为对端 `ftruncate` 而 SIGBUS。
-- `F_SEAL_FUTURE_WRITE`：控制侧已有的 RW 映射不受影响，但之后任何人都拿不到可写映射、也不能 `write()`。
-  视觉进程只能只读映射 att 段，野写只会让它自己段错误。
-- `F_SEAL_SEAL`：封印本身不能再改。
-- aim 段控制侧以只读方式映射，视觉野写只能写坏自己的目标，由 §5.3 的校验兜住。
+## 6. 契约（`hcs_link/autoaim.hpp`）
 
-### 3.2 IPC 线程和 RT 线程之间的交接
+时间一律 CLOCK_MONOTONIC 纳秒（`steady_clock`）；角度一律在 OdomImu 世界系：方位绕 +z、自 +x 逆时针为正，俯仰向上为正。
 
-控制进程内，段的指针由 IPC 线程建好后交给 RT 线程。交接只用两个进程内 atomic：
+`GimbalState`（80 B，控制 → 视觉，每拍一条）：`tick_ns`、`tick_sequence`、`quaternion`（w x y z）、`angular_velocity`（rad/s，FLU）、`imu_online`。
 
-```
-active_ : atomic<u32>   IPC 写。0 = 无会话，否则 = 当前会话号
-ack_    : atomic<u32>   RT 写。RT 每拍结束时写回本拍看到的 active_
-bundle_ : {att*, aim*}  普通成员，只在 active_ == 0 且 ack_ == 0 时由 IPC 线程改写
-```
+`AimCommand`（88 B，视觉 → 控制）：`t_ref_ns`、`frame_id`、方位 / 俯仰及其角速度、角加速度、`fire_from_ns` / `fire_until_ns`、`flags`（`kHasTarget | kFire`）。
 
-- **开会话**：建段 → 握手成功 → 写 `bundle_` → `active_.store(s, release)`。
-- **RT 每拍**：`s = active_.load(acquire)`；`s != 0` 就用 `bundle_`；本拍结束 `ack_.store(s, release)`。
-- **关会话**（EOF、出错、控制进程退出）：`active_.store(0, release)` → 等 `ack_ == 0` → munmap、close。
-  - 等待上限 100 ms；超时说明 RT 线程没在跑拍，**宁可泄漏映射也不 munmap**。
-  - munmap 会给本进程跑过的所有核发一次 TLB shootdown IPI，CPU 3 也会被打断几 µs。只在重连时发生；
-    进程里 DDS 的大块 malloc/free 本来就在触发同样的 IPI，不是新增的风险类别。
-- RT 线程**从不** mmap/munmap，也从不等待 IPC 线程。
+控制侧拒收：未知 flag 或保留字段非零；任何非有限值；|俯仰| > π/2；角速度 > 50 rad/s；角加速度 > 1000 rad/s²；
+`t_ref` 早于现在 200 ms 或晚于现在 50 ms；开火窗倒置或长于 200 ms。
 
-### 3.3 握手（abstract unix socket）
+载荷规则：可平凡复制、标准布局、大小是 8 的倍数（`Payload` 概念检查）；不用 `bool` / `enum` / 指针；
+每个载荷带 `kName` / `kVersion`，两端对不上就拒绝接上；改布局必须升 `kVersion`（紧跟一条 `sizeof` 断言）。
 
-- **socket**：`AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC`，abstract 名 `"\0hcs/autoaim"`（组件参数可改）。
-  SEQPACKET 保留消息边界，对端关闭时是明确的 EOF，不用自己分帧。
-- **身份**：`SO_PEERCRED` 取对端 uid/pid。uid 必须等于本进程 uid（abstract socket 没有文件权限，
-  同 netns 的任何用户都能连）；pid 只写日志。
-- **1:1**：已有会话时再来的连接，回 `Reject{kBusy}` 后关闭。
-- **消息**（全部是 §6 规则下的平凡结构体，SEQPACKET 一条消息一个结构体）：
+## 7. 测试与实测
 
-```
-视觉 → 控制   Hello   { magic, protocol_version, layout_hash, pid }
-控制 → 视觉   Welcome { magic, protocol_version, layout_hash, session, att_bytes, aim_bytes }
-                + SCM_RIGHTS [att_fd, aim_fd]
-          或  Reject  { magic, reason, protocol_version, layout_hash }   // 带控制侧的版本，便于排查
-```
+单测（2026-09-29 全部通过：GCC 14.2 与 clang 20 各一遍，`hcs_link` + `hcs_demo` 共 104 项；
+`hcs_link` 另在 clang + TSan 下通过；端到端用例连跑 10 次 10 次通过；新文件在 clang `-Wfunction-effects` 下 0 告警）：
 
-- `Hello` 1 s 内没到就断开。magic 或版本任何一项不一致都回 `Reject`，**不存在兼容区间**：
-  两边用同一个协议头文件编译，不一致就是该重编了。
-- 控制侧所有 `send` 都带 `MSG_NOSIGNAL`（对端握手中途退出时，SIGPIPE 的默认动作会直接杀掉控制进程）。
-- 视觉侧 `recvmsg` 带 `MSG_CMSG_CLOEXEC`，校验收到恰好两个 fd、`fstat` 大小与 Welcome 一致、
-  `F_GET_SEALS` 包含预期的 seal，再映射，再逐字段校验段头。
-- **会话号**：控制进程内从 1 递增的 u32，写进 Welcome；视觉写进每一条目标，控制侧只接受当前会话号的目标。
-- **断线**：IPC 线程 `poll` 连接 fd，读到 EOF/ERR/HUP 就关会话（§3.2）。
-  视觉侧读到 EOF（控制进程重启）就丢掉映射、每 200 ms 重连一次。
+| 文件 | 钉住什么 |
+|---|---|
+| `hcs_link/test/test_channel.cpp` | 序号语义、游标无损与丢失计数、载荷 / seal / 段头校验、seal 挡住截断打洞（含写者自己）、多线程和跨进程（200 万条）不撕裂 |
+| `hcs_link/test/test_rendezvous.cpp` | 两进程互换 fd 互读、对端退出可察觉、名字占用、畸形 Hello 拒收且不漏 fd、超时 |
+| `hcs_link/test/test_quiescent_cell.cpp` | 周期域在用的对象绝不被释放；周期域不跑拍时宁漏不放 |
+| `hcs_link/test/test_autoaim.cpp` | 布局偏移、拒收规则、外推与开火窗 |
+| `hcs_core/test/test_aim_follower.cpp` | 跟随、陈旧、心跳、坏命令、开火窗、换会话 |
+| `hcs_core/test/test_auto_aim_link.cpp` | 端到端：真组件 + 真 socket + 真通道，模拟视觉连上、发命令、读姿态、退出、重连 |
 
-## 4. 时间对齐（精度的主要来源）
+本机实测（写者 CPU 3、FIFO 90、1 kHz，读者在另一进程）：
 
-### 4.1 唯一的公共时钟
+| 项目 | p50 | p99 | 最大 |
+|---|---|---|---|
+| RT 写一条 64 B | 16 ns | 18 ns | 10.6 µs（CPU 3 被中断打断） |
+| 另一进程看到这一条（读者自旋） | 87 ns | 0.75 µs | 11 µs |
+| 跨进程读 512 万次 | 放过坏数据 0 次 | | |
+
+对比过、没用的通知方式：`FUTEX_WAKE` 推送让 RT 每拍多 1.4 µs，读者被叫醒的 p99 反而是 407 µs；所以读者一律自己拉。
+
+## 8. 相对 v1–v3 删掉了什么
+
+| 删掉的 | 为什么 |
+|---|---|
+| 泵线程、`EventQueue → 泵 → 环`、目标走 socket 消息 | 写者自封的 seal 已经让读对端通道没有缺页风险（§2.4），周期域可以直接读写两条通道 |
+| 过程映像、字段表、按名字取字段 | 太重。两个定长载荷加版本号足够；以后要导出别的，再加一种载荷 |
+| 布局哈希和金值表 | 载荷名字 + 版本 + 大小校验，加每个载荷的 `sizeof` 断言，足够抓住两端不一致 |
+| 角色、kBusy、挤占规则 | 新连接直接顶掉旧的 |
+| v2 的 `active_ / ack_` 关会话协议 | 有第一拍竞态且是 Dekker 形状；改成 `QuiescentCell`（全部 seq_cst，按拍末静止点等宽限期） |
+
+## 9. 待定
+
+1. 上车后测：视觉满载时控制拍的耗时分布；`/gimbal/imu/*` 的 `frame_count` 与原始时间戳要不要进 `GimbalState`（见附录 A）。
+2. 裁判系统移植后，控制 → 视觉的上下文（敌方颜色、弹速、模式）作为第三种载荷加进来。
+3. 已修：提交 58df7c7 清理 `hcs_utility` 时删掉了 `tdigest.hpp`，但它的唯一使用者 `hcs_executor` 的 RtReporter
+   还在包含它。现在原样放回到使用者旁边（`hcs_executor/src/tdigest.hpp`，命名空间改为 `hcs_executor`），
+   `hcs_utility` 保持清理后的样子。全工作区 GCC / clang 从零构建各 197 项测试通过。
+
+---
+
+## 附录 A. 时间对齐（原 §4，搁置到硬件接上）
+
+> 未复审。待查：`hipnuc.hpp` 已定义 `kSyncOutPulse`（HI91 MAIN_STATUS bit12），CH040 数据手册给出了 SYNC_OUT / SOUT_DIV 引脚；
+> 如果相机由 IMU 硬触发，下面"按 monotonic 时间戳配对"的做法要重写。
+> v4 的 `GimbalState` 目前每拍一条、只带 `tick_ns`；定下配对方式后按需加 IMU 原始时间和状态字段并升 `kVersion`。
+
+### A.1 唯一的公共时钟
 
 - **CLOCK_MONOTONIC 的纳秒数**，存为 `int64_t`。就是 `hcs_sync::Clock`（`steady_clock`），
   libstdc++ 在 Linux 上用的就是它，两个进程天然共享，不需要任何同步。
@@ -138,7 +180,7 @@ bundle_ : {att*, aim*}  普通成员，只在 active_ == 0 且 ack_ == 0 时由 
 - 不用 CLOCK_REALTIME（NTP 会跳）；不用 CLOCK_MONOTONIC_RAW（`steady_clock` 不是它，
   两进程各用一种就对不上）；不用 CLOCK_BOOTTIME（整车不休眠，用不上）。
 
-### 4.2 姿态的时间戳 = IMU 的采样时刻
+### A.2 姿态的时间戳 = IMU 的采样时刻
 
 **不能用 `tick.scheduled`**。姿态是 hcs-ctrl 在拍里写的，但它描述的是 IMU 采样的那一刻：
 
@@ -155,13 +197,13 @@ IMU 采样 ─→ UART 传输 ─→ 板卡 ─→ USB ─→ IO 线程 store_st
 | B | 固件在 UART 收到帧头时打 microframe 戳，host 用 `libhcs::Timeline` 换算成 monotonic | libhcs 固件 + 协议 | Timeline 拟合相位误差约 10 µs + 模块内部固定延迟 |
 | C | 同 B，另外标定 IMU 模块内部的滤波延迟 | 标定台架 | 上限由模块决定 |
 
-- 档 A 的 `imu_latency` 用 §10 的"摆云台"标定来定。
+- 档 A 的 `imu_latency` 用"摆云台"标定来定。
 - **IMU 输出率要提上去**：CH040 默认 HI91 输出 100 Hz（`hipnuc.hpp:73`），也就是姿态历史只有 10 ms 一个点，
   云台快速转动时插值误差远大于上面这些。上车前把模块配到 ≥ 400 Hz（921600 波特下 82 B 帧最多约 1100 Hz）。
 - 环里**每个 IMU 帧写一条**，靠 `frame_count()` 变化来判断，不是每拍写一条：
   否则 100 Hz 输出、1 kHz 控制时会写 10 条重复姿态，把历史窗口压缩到 1/10。
 
-### 4.3 坐标系：两边都用 OdomImu
+### A.3 坐标系：两边都用 OdomImu
 
 - 环里只写云台 CH040 的原始四元数：机体 FLU 相对模块世界系，也就是 `hcs_description::OdomImu`
   的那个旋转。控制侧不做任何变换——出问题时可以直接对照原始日志。
@@ -170,14 +212,14 @@ IMU 采样 ─→ UART 传输 ─→ 板卡 ─→ USB ─→ IO 线程 store_st
 - 视觉发回的瞄准方向也表达在同一个 IMU 世界系里，正好是 `SetControlDirection` 要的
   `OdomImu::DirectionVector`。IMU 的 yaw 漂移对两边是同一个漂移，互相抵消。
 
-### 4.4 相机侧（视觉进程的责任，这里只定约束）
+### A.4 相机侧（视觉进程的责任，这里只定约束）
 
 - 每帧的 `exposure_mid_ns` = 曝光中点的 monotonic 时刻。
   - 优先：相机设备时间戳 → monotonic 的在线线性拟合（与 libhcs `Timeline` 同一个方法，窗口约 1 分钟）；
   - 保底：SDK 回调时刻 − 标定过的常数延迟 − 曝光时间 / 2。
 - 用 `exposure_mid_ns` 去姿态环里查；目标里也写这个时刻，控制侧外推用它。
 
-### 4.5 误差预算
+### A.5 误差预算
 
 | 来源 | 量级 | 在 5 m 处 |
 |---|---|---|
@@ -187,4 +229,4 @@ IMU 采样 ─→ UART 传输 ─→ 板卡 ─→ USB ─→ IO 线程 store_st
 | 相机戳（保底方案） | 1–2 ms × 3 rad/s ≈ 3–6 mrad | 15–30 mm |
 | 小装甲板半宽 | — | 67 mm |
 
-结论：v2 要把 IMU 输出率和相机戳做对，通道本身的纳秒级成本不是问题。
+结论：要把 IMU 输出率和相机戳做对，通道本身的纳秒级成本不是问题。
