@@ -23,6 +23,21 @@ class DjiMotor {
 public:
     enum class Type : uint8_t { kGM6020, kGM6020Voltage, kM3508, kM2006 };
 
+    /// Feedback DATA[7]. Older ESC firmware documents this byte as null and sends 0, which
+    /// decodes as kNone, so reading it is safe on either firmware. When several conditions hold
+    /// at once the ESC reports the most severe one, i.e. the smallest nonzero code. Codes the
+    /// manual does not list (6, 9 and up) are kept as is rather than folded into a known one.
+    enum class Error : uint8_t {
+        kNone                 = 0,
+        kStorageUnreachable   = 1, // power-on self test only
+        kSupplyOverVoltage    = 2, // power-on self test only
+        kPhaseDisconnected    = 3,
+        kPositionSensorLost   = 4,
+        kMotorOverTemperature = 5, // >= 180 C
+        kCalibrationFailed    = 7,
+        kMotorOverheat        = 8, // >= 125 C
+    };
+
     struct Config {
         explicit Config(Type motor_type, std::uint8_t id = 0)
             : motor_type(motor_type)
@@ -41,6 +56,7 @@ public:
         Config& set_reduction_ratio(double value) { return reduction_ratio = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
+        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
 
         Type motor_type;
         std::uint8_t id;
@@ -48,6 +64,10 @@ public:
         double reduction_ratio;
         bool reversed;
         bool multi_turn_angle_enabled;
+        /// Update cycles without a feedback frame before the motor is considered offline. The
+        /// ESC reports on its own at 1 kHz whatever the host sends, so this watches the feedback
+        /// path only: an ESC that no longer receives commands still reads online.
+        int offline_timeout = 100;
     };
 
     DjiMotor(
@@ -60,6 +80,8 @@ public:
         status_component.register_output(name_prefix + "/velocity", velocity_output_, 0.0);
         status_component.register_output(name_prefix + "/torque", torque_output_, 0.0);
         status_component.register_output(name_prefix + "/max_torque", max_torque_output_, 0.0);
+        status_component.register_output(name_prefix + "/error_code", error_code_output_, uint8_t{0});
+        status_component.register_output(name_prefix + "/online", online_output_, false);
 
         command_component.register_input(name_prefix + "/control_torque", control_torque_, false);
     }
@@ -129,6 +151,21 @@ public:
         last_raw_angle_ = 0;
         multi_turn_angle_enabled_ = config.multi_turn_angle_enabled;
         angle_multi_turn_ = 0;
+        error_ = Error::kNone;
+
+        // The zero initialized packet decodes as angle 0, which in multi turn mode would seed the
+        // turn count from a position the motor never reported. Never decode before the first
+        // feedback frame has actually arrived.
+        received_ = false;
+        online_ = false;
+        offline_count_ = 0;
+        offline_timeout_ = config.offline_timeout;
+        last_sequence_ = sequence_.load(std::memory_order::relaxed);
+
+        angle_ = 0.0;
+        velocity_ = 0.0;
+        torque_ = 0.0;
+        temperature_ = 0.0;
 
         *max_torque_output_ = max_torque();
     }
@@ -136,7 +173,12 @@ public:
     void store_status(std::span<const std::byte> can_data) {
         if (can_data.size() != 8) [[unlikely]]
             return;
-        can_data_.store(CanPacket8{can_data}, std::memory_order_relaxed);
+
+        // The fixed extent overload is noexcept; the dynamic one throws. This runs on the
+        // transport thread, where nothing may throw. Release pairs with the acquire in
+        // update_status(): a new sequence must never be seen ahead of the packet it counts.
+        can_data_.store(CanPacket8{can_data.first<8>()}, std::memory_order::relaxed);
+        sequence_.fetch_add(1, std::memory_order::release);
     }
 
     static constexpr auto recv_id(Type type, std::uint8_t index) -> std::uint32_t {
@@ -170,42 +212,27 @@ public:
         return true;
     }
 
+    /// Must be called once per control cycle: the offline watchdog is counted in calls. The ESC
+    /// and the control loop both run at about 1 kHz on unrelated clocks, so a cycle with no new
+    /// frame (or with two) is normal; only a run of offline_timeout empty cycles is not.
     void update_status() {
-        const auto feedback =
-            std::bit_cast<DjiMotorFeedback>(can_data_.load(std::memory_order::relaxed));
+        const auto sequence = sequence_.load(std::memory_order::acquire);
+        if (sequence != last_sequence_) {
+            last_sequence_ = sequence;
+            received_ = true;
+            offline_count_ = offline_timeout_;
+        } else if (offline_count_ > 0)
+            --offline_count_;
+        online_ = offline_count_ > 0;
 
-        // Temperature unit: celsius
-        temperature_ = static_cast<double>(feedback.temperature);
-
-        // Angle unit: rad
-        const int raw_angle = feedback.angle;
-        int calibrated_raw_angle = raw_angle - encoder_zero_point_;
-        if (calibrated_raw_angle < 0)
-            calibrated_raw_angle += kRawAngleMax;
-        if (!multi_turn_angle_enabled_) {
-            angle_ = raw_angle_to_angle_coefficient_ * static_cast<double>(calibrated_raw_angle);
-            if (angle_ < 0)
-                angle_ += 2 * std::numbers::pi;
-        } else {
-            auto diff = (calibrated_raw_angle - angle_multi_turn_) % kRawAngleMax;
-            if (diff <= -kRawAngleMax / 2)
-                diff += kRawAngleMax;
-            else if (diff > kRawAngleMax / 2)
-                diff -= kRawAngleMax;
-            angle_multi_turn_ += diff;
-            angle_ = raw_angle_to_angle_coefficient_ * static_cast<double>(angle_multi_turn_);
-        }
-        last_raw_angle_ = raw_angle;
-
-        // Velocity unit: rad/s
-        velocity_ = raw_velocity_to_velocity_coefficient_ * static_cast<double>(feedback.velocity);
-
-        // Torque unit: N*m
-        torque_ = raw_current_to_torque_coefficient_ * static_cast<double>(feedback.current);
+        if (received_) [[likely]]
+            decode(std::bit_cast<DjiMotorFeedback>(can_data_.load(std::memory_order::relaxed)));
 
         *angle_output_ = angle();
         *velocity_output_ = velocity();
         *torque_output_ = torque();
+        *error_code_output_ = static_cast<uint8_t>(error());
+        *online_output_ = online();
     }
 
     double control_torque() const {
@@ -242,19 +269,69 @@ public:
     double torque() const { return torque_; }
     double max_torque() const { return max_torque_; }
     double temperature() const { return temperature_; }
+    Error error() const { return error_; }
+    bool online() const { return online_; }
+    /// True once any feedback frame has been decoded.
+    bool received() const { return received_; }
+
+    /// Whether error() is a fault rather than a warning. kMotorOverheat (>= 125 C) is the one
+    /// code the manual ranks below the rest; every other nonzero code, unlisted ones included, is
+    /// treated as a fault. The ESC clears the code by itself once the condition is gone.
+    bool faulted() const { return error_ != Error::kNone && error_ != Error::kMotorOverheat; }
 
 private:
+    void decode(const auto& feedback) {
+        // Temperature unit: celsius
+        temperature_ = static_cast<double>(feedback.temperature);
+
+        // The underlying type is fixed, so any byte is a valid Error value, listed or not.
+        error_ = static_cast<Error>(feedback.error);
+
+        // Angle unit: rad
+        const int raw_angle = feedback.angle;
+        int calibrated_raw_angle = raw_angle - encoder_zero_point_;
+        if (calibrated_raw_angle < 0)
+            calibrated_raw_angle += kRawAngleMax;
+        if (!multi_turn_angle_enabled_) {
+            angle_ = raw_angle_to_angle_coefficient_ * static_cast<double>(calibrated_raw_angle);
+            if (angle_ < 0)
+                angle_ += 2 * std::numbers::pi;
+        } else {
+            auto diff = (calibrated_raw_angle - angle_multi_turn_) % kRawAngleMax;
+            if (diff <= -kRawAngleMax / 2)
+                diff += kRawAngleMax;
+            else if (diff > kRawAngleMax / 2)
+                diff -= kRawAngleMax;
+            angle_multi_turn_ += diff;
+            angle_ = raw_angle_to_angle_coefficient_ * static_cast<double>(angle_multi_turn_);
+        }
+        last_raw_angle_ = raw_angle;
+
+        // Velocity unit: rad/s
+        velocity_ = raw_velocity_to_velocity_coefficient_ * static_cast<double>(feedback.velocity);
+
+        // Torque unit: N*m
+        torque_ = raw_current_to_torque_coefficient_ * static_cast<double>(feedback.current);
+    }
+
     struct alignas(uint64_t) DjiMotorFeedback {
         hcs_utility::be_int16_t angle;
         hcs_utility::be_int16_t velocity;
         hcs_utility::be_int16_t current;
         uint8_t temperature;
-        uint8_t unused;
+        uint8_t error; // Error code; null (0) on older firmware
     };
+    static_assert(sizeof(DjiMotorFeedback) == sizeof(CanPacket8));
 
     Type type_ = Type::kM3508;
     std::uint8_t id_ = 0;
     std::atomic<CanPacket8> can_data_;
+    std::atomic<std::uint32_t> sequence_ = 0;
+    std::uint32_t last_sequence_ = 0;
+
+    bool received_ = false;
+    bool online_ = false;
+    int offline_count_ = 0, offline_timeout_ = 0;
 
     static constexpr int kRawAngleMax = 8192;
     int encoder_zero_point_, last_raw_angle_;
@@ -271,11 +348,14 @@ private:
     double torque_;
     double max_torque_;
     double temperature_;
+    Error error_ = Error::kNone;
 
     hcs_executor::Component::OutputInterface<double> angle_output_;
     hcs_executor::Component::OutputInterface<double> velocity_output_;
     hcs_executor::Component::OutputInterface<double> torque_output_;
     hcs_executor::Component::OutputInterface<double> max_torque_output_;
+    hcs_executor::Component::OutputInterface<uint8_t> error_code_output_;
+    hcs_executor::Component::OutputInterface<bool> online_output_;
 
     hcs_executor::Component::InputInterface<double> control_torque_;
 };

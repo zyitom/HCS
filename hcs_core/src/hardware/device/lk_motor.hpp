@@ -19,6 +19,9 @@
 
 #include "hardware/device/can_packet.hpp"
 
+// LK 反馈/命令帧为原生类型 packed，双向依赖小端主机。
+static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
+
 namespace hcs_core::hardware::device {
 
 class LkMotor {
@@ -33,17 +36,24 @@ public:
     };
 
     struct Config {
-        explicit Config(Type type)
-            : motor_type(type) {}
+        explicit Config(Type type, std::uint32_t can_id = 0)
+            : motor_type(type)
+            , can_id(can_id) {}
 
         Config& set_encoder_zero_point(int value) { return encoder_zero_point = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
+        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
 
         Type motor_type;
+        std::uint32_t can_id; // 指令与反馈同 id（0x140+n）
+        /// Software offset on top of the zero the driver already subtracts: the encoder field of
+        /// a status frame is (raw - ROM offset), see protocol command 0x90.
         int encoder_zero_point = 0;
         bool reversed = false;
         bool multi_turn_angle_enabled = false;
+        /// Update cycles without a status frame before the motor is considered offline.
+        int offline_timeout = 100;
     };
 
     LkMotor(
@@ -55,6 +65,7 @@ public:
         status_component.register_output(name_prefix + "/torque", torque_output_, 0.0);
         status_component.register_output(name_prefix + "/temperature", temperature_output_, 0.0);
         status_component.register_output(name_prefix + "/max_torque", max_torque_output_, 0.0);
+        status_component.register_output(name_prefix + "/online", online_output_, false);
 
         command_component.register_input( //
             name_prefix + "/control_torque", control_torque_, false);
@@ -74,11 +85,30 @@ public:
     }
 
     void configure(const Config& config) {
+        can_id_ = config.can_id;
         multi_turn_encoder_count_ = 0;
         last_raw_angle_ = 0;
 
+        // The zero initialized packet decodes as encoder 0, which in multi turn mode would seed
+        // the turn count from a position the motor never reported. Never decode before the first
+        // status frame has actually arrived.
+        received_ = false;
+        online_ = false;
+        offline_count_ = 0;
+        offline_timeout_ = config.offline_timeout;
+        last_sequence_ = sequence_.load(std::memory_order::relaxed);
+
+        angle_ = 0.0;
+        velocity_ = 0.0;
+        torque_ = 0.0;
+        temperature_ = 0.0;
+
         double torque_constant;
         double reduction_ratio;
+
+        // Torque current full scale of the +-2048 field, both in commands and in the iq of a
+        // status frame: 33 A on MG, 16.5 A on MF and MH (protocol V2.36 commands 0x9C and 0xA1).
+        current_max_ = kMgCurrentMax;
 
         switch (config.motor_type) {
         case Type::kMG5010Ei10:
@@ -122,6 +152,7 @@ public:
             torque_constant = 0.51;
             reduction_ratio = 1.0;
             max_torque_ = 2.42;
+            current_max_ = kMfCurrentMax;
             break;
         default: std::unreachable();
         }
@@ -140,77 +171,102 @@ public:
         velocity_to_command_velocity_coefficient_ = sign * reduction_ratio * kRadToDeg * 100.0;
 
         status_current_to_torque_coefficient_ =
-            sign * (kProtocolCurrentMax / kRawCurrentMax) * torque_constant * reduction_ratio;
+            sign * (current_max_ / kRawCurrentMax) * torque_constant * reduction_ratio;
         torque_to_command_current_coefficient_ = 1 / status_current_to_torque_coefficient_;
 
         *max_torque_output_ = max_torque();
+    }
+
+    auto recv_id() const noexcept -> std::uint32_t { return can_id_; }
+    auto send_id() const noexcept -> std::uint32_t { return can_id_; }
+
+    bool match_then_store_status(std::uint32_t can_id, std::span<const std::byte> can_data) {
+        if (can_id != recv_id())
+            return false;
+        store_status(can_data);
+        return true;
     }
 
     void store_status(std::span<const std::byte> can_data) {
         if (can_data.size() != 8) [[unlikely]]
             return;
 
-        const CanPacket8 can_packet{can_data};
-        const struct [[gnu::packed]] {
-            uint8_t command;
-            uint8_t placeholder[7];
-        } feedback alignas(CanPacket8) = std::bit_cast<decltype(feedback)>(can_packet);
+        // The fixed extent overload is noexcept; the dynamic one throws. This runs on the
+        // transport thread, where nothing may throw.
+        const CanPacket8 can_packet{can_data.first<8>()};
+        if (!is_status_reply(std::to_integer<uint8_t>(can_data[0])))
+            return;
 
-        // Exclude non-motor status messages
-        if ((feedback.command & 0xF0) != 0x80)
-            can_packet_.store(can_packet, std::memory_order::relaxed);
+        can_packet_.store(can_packet, std::memory_order::relaxed);
+        sequence_.fetch_add(1, std::memory_order::release);
     }
 
+    /// Must be called once per control cycle: the offline watchdog is counted in calls.
     void update_status() {
-        const struct [[gnu::packed]] {
-            uint8_t command;
-            int8_t temperature;
-            int16_t current;
-            int16_t velocity;
-            uint16_t encoder;
-        } feedback alignas(CanPacket8) =
-            std::bit_cast<decltype(feedback)>(can_packet_.load(std::memory_order::relaxed));
+        const auto sequence = sequence_.load(std::memory_order::acquire);
+        if (sequence != last_sequence_) {
+            last_sequence_ = sequence;
+            received_ = true;
+            offline_count_ = offline_timeout_;
+        } else if (offline_count_ > 0)
+            --offline_count_;
+        online_ = offline_count_ > 0;
 
-        // Temperature unit: celsius
-        temperature_ = static_cast<double>(feedback.temperature);
+        if (received_) [[likely]] {
+            const struct [[gnu::packed]] {
+                uint8_t command;
+                int8_t temperature;
+                int16_t current;
+                int16_t velocity;
+                uint16_t encoder;
+            } feedback alignas(CanPacket8) =
+                std::bit_cast<decltype(feedback)>(can_packet_.load(std::memory_order::relaxed));
 
-        // Angle unit: rad
-        const auto raw_angle = feedback.encoder;
-        auto calibrated_raw_angle = feedback.encoder - encoder_zero_point_;
-        if (calibrated_raw_angle < 0)
-            calibrated_raw_angle += raw_angle_modulus_;
-        if (!multi_turn_angle_enabled_) {
-            angle_ = status_angle_to_angle_coefficient_ * static_cast<double>(calibrated_raw_angle);
-            if (angle_ < 0)
-                angle_ += 2 * std::numbers::pi;
-        } else {
-            // Calculates the minimal difference between two angles and normalizes it to the range
-            // (-raw_angle_modulus_/2, raw_angle_modulus_/2].
-            // This implementation leverages bitwise operations for efficiency, which is valid only
-            // when raw_angle_modulus_ is a power of 2.
-            auto diff =
-                (calibrated_raw_angle - multi_turn_encoder_count_) & (raw_angle_modulus_ - 1);
-            if (diff > (raw_angle_modulus_ >> 1))
-                diff -= raw_angle_modulus_;
+            // Temperature unit: celsius
+            temperature_ = static_cast<double>(feedback.temperature);
 
-            multi_turn_encoder_count_ += diff;
-            angle_ =
-                status_angle_to_angle_coefficient_ * static_cast<double>(multi_turn_encoder_count_);
+            // Angle unit: rad
+            const auto raw_angle = feedback.encoder;
+            auto calibrated_raw_angle = feedback.encoder - encoder_zero_point_;
+            if (calibrated_raw_angle < 0)
+                calibrated_raw_angle += raw_angle_modulus_;
+            if (!multi_turn_angle_enabled_) {
+                angle_ =
+                    status_angle_to_angle_coefficient_ * static_cast<double>(calibrated_raw_angle);
+                if (angle_ < 0)
+                    angle_ += 2 * std::numbers::pi;
+            } else {
+                // Calculates the minimal difference between two angles and normalizes it to the
+                // range (-raw_angle_modulus_/2, raw_angle_modulus_/2].
+                // This implementation leverages bitwise operations for efficiency, which is valid
+                // only when raw_angle_modulus_ is a power of 2.
+                auto diff =
+                    (calibrated_raw_angle - multi_turn_encoder_count_) & (raw_angle_modulus_ - 1);
+                if (diff > (raw_angle_modulus_ >> 1))
+                    diff -= raw_angle_modulus_;
+
+                multi_turn_encoder_count_ += diff;
+                angle_ = status_angle_to_angle_coefficient_
+                       * static_cast<double>(multi_turn_encoder_count_);
+            }
+            last_raw_angle_ = raw_angle;
+
+            // Velocity unit: rad/s. The wire unit is 1 dps, unlike the 0.01 dps of the 0xA2
+            // command.
+            velocity_ =
+                status_velocity_to_velocity_coefficient_ * static_cast<double>(feedback.velocity);
+
+            // Torque unit: N*m
+            torque_ =
+                status_current_to_torque_coefficient_ * static_cast<double>(feedback.current);
         }
-        last_raw_angle_ = raw_angle;
-
-        // Velocity unit: rad/s
-        velocity_ =
-            status_velocity_to_velocity_coefficient_ * static_cast<double>(feedback.velocity);
-
-        // Torque unit: N*m
-        torque_ = status_current_to_torque_coefficient_ * static_cast<double>(feedback.current);
 
         *angle_output_ = angle();
         *raw_angle_output_ = last_raw_angle();
         *velocity_output_ = velocity();
         *torque_output_ = torque();
         *temperature_output_ = temperature();
+        *online_output_ = online();
     }
 
     int64_t calibrate_zero_point() {
@@ -226,6 +282,11 @@ public:
     double torque() const { return torque_; }
     double max_torque() const { return max_torque_; }
     double temperature() const { return temperature_; }
+    bool online() const { return online_; }
+    /// True once any status frame has been decoded.
+    bool received() const { return received_; }
+    /// Status 2 carries no error field; faults need a 0x9A poll, which is not implemented.
+    constexpr bool faulted() const { return false; }
 
     /// @brief Switch the motor from the startup state (default state after power-on) to the
     /// shutdown state, clearing the motor's rotation count and previously received control
@@ -409,6 +470,12 @@ public:
         return generate_angle_shift_command(control_angle_shift());
     }
 
+    /// @brief Pick the command frame from whichever inputs have a provider, highest first:
+    /// angle shift > angle > velocity > torque.
+    /// @note Wiring /control_velocity makes this send 0xA2, which closes the velocity loop inside
+    /// the motor and demotes /control_torque to the current limit of that frame. A host side
+    /// cascade that writes both (angle loop -> velocity, velocity loop -> torque) must call
+    /// generate_torque_command() instead.
     CanPacket8 generate_command() {
         if (!std::isnan(control_angle_shift()))
             return generate_angle_shift_command(control_angle_shift(), control_velocity());
@@ -452,6 +519,14 @@ public:
     }
 
 private:
+    /// Replies laid out as "read motor status 2" (0x9C): temperature, iq, speed, encoder. The
+    /// control commands 0xA1~0xA8 all answer in this layout with their own command byte. Every
+    /// other reply (status 1 / 3, encoder, angles, parameters, zero setting ...) shares the id
+    /// but not the layout, and decoding one of them as status would jump the turn count.
+    static constexpr bool is_status_reply(uint8_t command) {
+        return command == 0x9C || (command >= 0xA1 && command <= 0xA8);
+    }
+
     int16_t to_command_current(double torque) const {
         double current = torque_to_command_current_coefficient_ * torque;
         current = std::round(std::clamp<double>(current, -kRawCurrentMax, kRawCurrentMax));
@@ -504,9 +579,12 @@ private:
     // Limits
     static constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
 
-    // LK protocol maps the raw current field range [-2048, 2048] to [-33A, 33A].
+    // LK protocol maps the raw current field range [-2048, 2048] to +-33 A on MG motors and to
+    // +-16.5 A on MF / MH motors.
     static constexpr int kRawCurrentMax = 2048;
-    static constexpr double kProtocolCurrentMax = 33.0;
+    static constexpr double kMgCurrentMax = 33.0;
+    static constexpr double kMfCurrentMax = 16.5;
+    double current_max_;
     int raw_angle_modulus_;
 
     // Constants
@@ -528,6 +606,12 @@ private:
 
     // Status
     std::atomic<CanPacket8> can_packet_;
+    std::atomic<std::uint32_t> sequence_ = 0;
+    std::uint32_t last_sequence_ = 0;
+
+    bool received_ = false;
+    bool online_ = false;
+    int offline_count_ = 0, offline_timeout_ = 0;
 
     int64_t multi_turn_encoder_count_ = 0;
     int last_raw_angle_ = 0;
@@ -538,12 +622,15 @@ private:
     double max_torque_;
     double temperature_;
 
+    std::uint32_t can_id_ = 0;
+
     hcs_executor::Component::OutputInterface<double> angle_output_;
     hcs_executor::Component::OutputInterface<int64_t> raw_angle_output_;
     hcs_executor::Component::OutputInterface<double> velocity_output_;
     hcs_executor::Component::OutputInterface<double> torque_output_;
     hcs_executor::Component::OutputInterface<double> temperature_output_;
     hcs_executor::Component::OutputInterface<double> max_torque_output_;
+    hcs_executor::Component::OutputInterface<bool> online_output_;
 
     hcs_executor::Component::InputInterface<double> control_torque_;
     hcs_executor::Component::InputInterface<double> control_velocity_;

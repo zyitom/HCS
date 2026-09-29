@@ -16,7 +16,6 @@ balance_state_estimator:
     leg_link5: 0.0
     leg_angle_offset: 1.163
     wheel_radius: 0.06
-    wheel_reduction_ratio: 13.94
     wheel_half_track: 0.2296
     left_angle_sign: -1.0
     right_angle_sign: 1.0

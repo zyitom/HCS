@@ -6,13 +6,13 @@
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
-#include <rmcs_description/tf_description.hpp>
-#include <rmcs_executor/component.hpp>
+#include <hcs_description/tf_description.hpp>
+#include <hcs_executor/component.hpp>
 
-namespace rmcs_core::broadcaster {
+namespace hcs_core::broadcaster {
 
 class TfBroadcaster
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     TfBroadcaster()
@@ -28,7 +28,7 @@ public:
 
     void before_updating() override { fast_tf::rcl::broadcast_all(*tf_); }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         using namespace std::chrono_literals;
         if (*update_count_ == 0)
             next_publish_timestamp_ = *timestamp_;
@@ -43,11 +43,11 @@ private:
     InputInterface<std::chrono::steady_clock::time_point> timestamp_;
     std::chrono::steady_clock::time_point next_publish_timestamp_;
 
-    InputInterface<rmcs_description::Tf> tf_;
+    InputInterface<hcs_description::Tf> tf_;
 };
 
-} // namespace rmcs_core::broadcaster
+} // namespace hcs_core::broadcaster
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::broadcaster::TfBroadcaster, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::broadcaster::TfBroadcaster, hcs_executor::Component)

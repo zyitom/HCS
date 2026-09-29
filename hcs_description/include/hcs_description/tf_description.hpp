@@ -14,8 +14,11 @@ namespace hcs_description {
 //               └─ PitchLink（绕 Y，pitch 电机反馈）
 //                    └─ OdomImu（云台 CH040 四元数，每拍由硬件组件写入）
 //
-// 方向矢量的 cast 不经过平移，云台回转中心的安装高度对云台解算无影响，
-// 需要位置级 tf（自瞄、弹道）时再补 MuzzleLink/CameraLink。
+// 方向矢量的 cast 不经过平移，云台回转中心的安装高度对云台解算无影响；
+// MuzzleLink 留到弹道解算时再补。
+//
+//   PitchLink
+//     └─ CameraLink（相机安装位姿，Isometry3d，自瞄 UI 反投影用）
 
 struct BaseLink : fast_tf::Link<BaseLink> {
     static constexpr char name[] = "base_link";
@@ -35,6 +38,10 @@ struct PitchLink : fast_tf::Link<PitchLink> {
 
 struct OdomImu : fast_tf::Link<OdomImu> {
     static constexpr char name[] = "odom_imu";
+};
+
+struct CameraLink : fast_tf::Link<CameraLink> {
+    static constexpr char name[] = "camera_link";
 };
 
 } // namespace hcs_description
@@ -73,8 +80,14 @@ struct fast_tf::Joint<hcs_description::OdomImu> : fast_tf::ModificationTrackable
     Eigen::Quaterniond transform = Eigen::Quaterniond::Identity();
 };
 
+template <>
+struct fast_tf::Joint<hcs_description::CameraLink> : fast_tf::ModificationTrackable {
+    using Parent = hcs_description::PitchLink;
+    Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+};
+
 namespace hcs_description {
 
-using Tf = fast_tf::JointCollection<GimbalCenterLink, YawLink, PitchLink, OdomImu>;
+using Tf = fast_tf::JointCollection<GimbalCenterLink, YawLink, PitchLink, OdomImu, CameraLink>;
 
 } // namespace hcs_description

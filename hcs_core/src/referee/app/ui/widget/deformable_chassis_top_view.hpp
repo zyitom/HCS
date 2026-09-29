@@ -8,7 +8,7 @@
 
 #include "referee/app/ui/shape/shape.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 
 class DeformableChassisLegArcs {
 public:
@@ -145,4 +145,4 @@ private:
     std::array<Arc, 4> legs_;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui

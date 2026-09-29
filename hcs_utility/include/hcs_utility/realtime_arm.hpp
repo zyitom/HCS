@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 
+#include "hcs_utility/detail/spec_parse.hpp"
 #include "hcs_utility/thread_config.hpp"
 
 namespace hcs_utility {
@@ -69,6 +70,10 @@ struct RealtimeArmOptions {
     /**
      * 解析武装选项。
      *
+     * 切分 / trim / 语法报错在 detail::for_each_kv_field 里；这里只剩每个键的
+     * 语义。重复键用 seen 位标记 —— 与 ThreadConfig 不同，这里的字段有默认值
+     * （不是 optional），字段本身记不住"用户写过没有"。
+     *
      * @param spec `key=value;key=value` 形式的选项串，空串表示全用默认值。
      * @throws std::invalid_argument 语法错误 / 未知 key / 重复 key / 值越界。
      */
@@ -77,28 +82,43 @@ struct RealtimeArmOptions {
         RealtimeArmOptions options;
         unsigned seen = 0;
 
-        auto remaining_spec = trim(spec);
-        while (true) {
-            const auto separator = remaining_spec.find(';');
-            const auto field = trim(remaining_spec.substr(0, separator));
+        detail::for_each_kv_field(
+            kSpecKind, original_spec, [&](std::string_view key, std::string_view value) {
+                const auto claim = [&](unsigned bit) {
+                    if (seen & bit)
+                        throw_invalid_spec(
+                            std::format("duplicate key '{}'", key), original_spec);
+                    seen |= bit;
+                };
 
-            if (!field.empty()) {
-                const auto equals = field.find('=');
-                if (equals == std::string_view::npos)
-                    throw_invalid_spec("missing '='", original_spec);
-
-                const auto key = trim(field.substr(0, equals));
-                const auto value = trim(field.substr(equals + 1));
-                if (key.empty() || value.empty())
-                    throw_invalid_spec("empty key or value", original_spec);
-
-                assign_field(options, seen, key, value, original_spec);
-            }
-
-            if (separator == std::string_view::npos)
-                break;
-            remaining_spec.remove_prefix(separator + 1);
-        }
+                if (key == "mlock") {
+                    claim(kSeenLockMemory);
+                    options.lock_memory = parse_bool(value, key, original_spec);
+                } else if (key == "malloc") {
+                    claim(kSeenTuneMalloc);
+                    options.tune_malloc = parse_bool(value, key, original_spec);
+                } else if (key == "timer_slack") {
+                    claim(kSeenTimerSlack);
+                    options.timer_slack =
+                        parse_duration(value, key, original_spec, kMaxTimerSlack);
+                } else if (key == "prefault_stack") {
+                    claim(kSeenPrefaultStack);
+                    options.prefault_stack =
+                        parse_bytes(value, key, original_spec, kMaxPrefaultStack);
+                } else if (key == "prefault_heap") {
+                    claim(kSeenPrefaultHeap);
+                    options.prefault_heap =
+                        parse_bytes(value, key, original_spec, kMaxPrefaultHeap);
+                } else if (key == "cpu_dma_latency") {
+                    claim(kSeenCpuDmaLatency);
+                    options.hold_cpu_dma_latency = parse_bool(value, key, original_spec);
+                } else if (key == "spin_guard") {
+                    claim(kSeenSpinGuard);
+                    options.spin_guard = parse_duration(value, key, original_spec, kMaxSpinGuard);
+                } else {
+                    throw_invalid_spec(std::format("unknown key '{}'", key), original_spec);
+                }
+            });
 
         return options;
     }
@@ -114,52 +134,10 @@ private:
         kSeenSpinGuard = 1u << 6,
     };
 
-    static std::string_view trim(std::string_view text) {
-        while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
-            text.remove_prefix(1);
-        while (!text.empty() && (text.back() == ' ' || text.back() == '\t'))
-            text.remove_suffix(1);
-        return text;
-    }
+    static constexpr std::string_view kSpecKind = "realtime config";
 
     [[noreturn]] static void throw_invalid_spec(std::string_view reason, std::string_view spec) {
-        throw std::invalid_argument(
-            std::format("Invalid realtime config spec ({}): \"{}\"", reason, spec));
-    }
-
-    static void assign_field(
-        RealtimeArmOptions& options, unsigned& seen, std::string_view key, std::string_view value,
-        std::string_view spec) {
-        const auto mark_seen = [&seen, key, spec](unsigned bit) {
-            if (seen & bit)
-                throw_invalid_spec(std::format("duplicate key '{}'", key), spec);
-            seen |= bit;
-        };
-
-        if (key == "mlock") {
-            mark_seen(kSeenLockMemory);
-            options.lock_memory = parse_bool(value, key, spec);
-        } else if (key == "malloc") {
-            mark_seen(kSeenTuneMalloc);
-            options.tune_malloc = parse_bool(value, key, spec);
-        } else if (key == "timer_slack") {
-            mark_seen(kSeenTimerSlack);
-            options.timer_slack = parse_duration(value, key, spec, kMaxTimerSlack);
-        } else if (key == "prefault_stack") {
-            mark_seen(kSeenPrefaultStack);
-            options.prefault_stack = parse_bytes(value, key, spec, kMaxPrefaultStack);
-        } else if (key == "prefault_heap") {
-            mark_seen(kSeenPrefaultHeap);
-            options.prefault_heap = parse_bytes(value, key, spec, kMaxPrefaultHeap);
-        } else if (key == "cpu_dma_latency") {
-            mark_seen(kSeenCpuDmaLatency);
-            options.hold_cpu_dma_latency = parse_bool(value, key, spec);
-        } else if (key == "spin_guard") {
-            mark_seen(kSeenSpinGuard);
-            options.spin_guard = parse_duration(value, key, spec, kMaxSpinGuard);
-        } else {
-            throw_invalid_spec(std::format("unknown key '{}'", key), spec);
-        }
+        detail::throw_invalid_spec(kSpecKind, reason, spec);
     }
 
     static bool parse_bool(std::string_view value, std::string_view key, std::string_view spec) {
@@ -186,16 +164,12 @@ private:
 
     static std::int64_t
         parse_count(std::string_view text, std::string_view key, std::string_view spec) {
-        text = trim(text);
-        std::int64_t result = 0;
-        const auto* begin = text.data();
-        const auto* end = text.data() + text.size();
-        const auto [ptr, error_code] = std::from_chars(begin, end, result);
-        if (error_code != std::errc{} || ptr != end)
+        const auto parsed = detail::parse_integer<std::int64_t>(detail::trim(text));
+        if (!parsed)
             throw_invalid_spec(std::format("invalid number for key '{}'", key), spec);
-        if (result < 0)
+        if (*parsed < 0)
             throw_invalid_spec(std::format("key '{}' must not be negative", key), spec);
-        return result;
+        return *parsed;
     }
 
     static std::chrono::nanoseconds parse_duration(
@@ -292,12 +266,14 @@ public:
         arm_prefault_heap();
         // 封盘之后才升优先级：上面每一步都是重活，不该以 RT 优先级做。
         arm_thread_scheduling(thread_config);
-        // 放最后：只有这一步会留下需要析构的资源，而构造抛异常时析构不会跑，
-        // 所以它自己的失败路径负责关掉半开的 fd。
-        arm_cpu_dma_latency();
         // spin_guard 不是这里执行的动作（由 sleep_until_precise 用），但它决定这条线程烧不烧核，
         // 属于"这条线程到底被配成了什么样"的一部分，所以照样进清单。
         append_summary(std::format("spin_guard={}ns", options_.spin_guard.count()));
+        // 放最后：只有这一步会留下需要析构的资源，而构造抛异常时析构不会跑，
+        // 所以它自己的失败路径负责关掉半开的 fd —— 它之后到构造函数结束之间
+        // **不允许再出现任何可抛操作**（哪怕一次 append_summary 的 bad_alloc），
+        // 否则 fd 就漏了。
+        arm_cpu_dma_latency();
     }
 
     ~RealtimeArm() {

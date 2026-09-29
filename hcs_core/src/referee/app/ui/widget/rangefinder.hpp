@@ -2,7 +2,7 @@
 
 #include "referee/app/ui/shape/shape.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 
 class Rangefinder {
 public:
@@ -182,4 +182,4 @@ private:
 
     Arc friction_wheel_velocity_;
 };
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui

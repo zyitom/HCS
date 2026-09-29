@@ -20,6 +20,9 @@
 #include <hcs_utility/crc/dji_crc.hpp>
 #include <hcs_utility/ring_buffer.hpp>
 
+// DJI 遥控帧为原生类型 packed，依赖小端主机。
+static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
+
 namespace hcs_core::hardware::device {
 
 class Vt13 {

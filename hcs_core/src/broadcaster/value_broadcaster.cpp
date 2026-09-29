@@ -1,13 +1,13 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/parameter_event_handler.hpp>
-#include <rmcs_executor/component.hpp>
+#include <hcs_executor/component.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/header.hpp>
 
-namespace rmcs_core::broadcaster {
+namespace hcs_core::broadcaster {
 
 class ValueBroadcaster
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     ValueBroadcaster()
@@ -20,10 +20,10 @@ public:
     }
 
     void before_pairing(const OutputInfoMap& output_map) override {
+        // hcs_executor 的 OutputInfoMap 只登记输出接口（无上游的 Event 类别），
+        // 这里直接按类型筛 double 输出即可。
         for (const auto& [name, output] : output_map) {
-            if (output.kind != rmcs_executor::InterfaceKind::Normal)
-                continue;
-            if (output.type.get() == typeid(double)) {
+            if (output.get() == typeid(double)) {
                 forward_units_.emplace(
                     name,
                     std::make_unique<ForwardUnit<double, std_msgs::msg::Float64>>(this, name));
@@ -34,7 +34,7 @@ public:
             update_forward_list(forward_list);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         for (auto& [name, unit] : forward_units_)
             unit->update();
     }
@@ -115,8 +115,8 @@ private:
     std::shared_ptr<rclcpp::ParameterCallbackHandle> parameter_callback_;
 };
 
-} // namespace rmcs_core::broadcaster
+} // namespace hcs_core::broadcaster
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::broadcaster::ValueBroadcaster, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::broadcaster::ValueBroadcaster, hcs_executor::Component)

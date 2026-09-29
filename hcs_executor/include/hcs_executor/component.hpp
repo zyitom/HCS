@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <hcs_sync/tick.hpp>
+#include <hcs_utility/raw_storage.hpp>
 #include <hcs_utility/rt_attributes.hpp>
 
 #include "hcs_executor/graph.hpp"
@@ -265,20 +266,17 @@ public:
     private:
         template <typename... Args>
         void* activate(Args&&... args) {
-            std::construct_at(raw_storage_pointer(), std::forward<Args>(args)...);
+            // placement new 走 raw():对象此刻还不存在于这块存储里,launder 是
+            // 给"已构造之后"的访问用的。这一对区别由 RawStorage 的两个访问器承载。
+            std::construct_at(storage_.raw(), std::forward<Args>(args)...);
             activated = true;
-            return data_;
+            return storage_.raw();
         }
 
-        [[nodiscard]] T* raw_storage_pointer() { return reinterpret_cast<T*>(data_); }
+        [[nodiscard]] T* storage_pointer() { return storage_.ptr(); }
+        [[nodiscard]] const T* storage_pointer() const { return storage_.ptr(); }
 
-        [[nodiscard]] T* storage_pointer() { return std::launder(raw_storage_pointer()); }
-
-        [[nodiscard]] const T* storage_pointer() const {
-            return std::launder(reinterpret_cast<const T*>(data_));
-        }
-
-        alignas(T) std::byte data_[sizeof(T)];
+        hcs_utility::RawStorage<T> storage_;
         bool activated = false;
     };
 

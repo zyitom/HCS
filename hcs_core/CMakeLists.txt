@@ -91,7 +91,6 @@ ament_auto_find_build_dependencies()
 # 新组件要在这里显式加一行。GLOB_RECURSE 会把以后放进 src/ 的子模块、缺外部依赖的文件
 # 一起抓进来，colcon build 直接失败。板卡组件只依赖上面链接的 libhcs host SDK。
 set(PROJECT_SOURCE
-  src/hardware/demo_board.cpp
   src/hardware/can_rtt_probe.cpp
   src/hardware/hcs_link_probe.cpp
   src/hardware/balance_infantry.cpp
@@ -104,6 +103,21 @@ set(PROJECT_SOURCE
   src/controller/chassis/balance/leg_force_controller.cpp
   src/controller/chassis/balance/leg_joint_controller.cpp
   src/controller/gimbal/simple_gimbal_controller.cpp
+  src/broadcaster/tf_broadcaster.cpp
+  src/broadcaster/value_broadcaster.cpp
+  src/referee/status.cpp
+  src/referee/command.cpp
+  src/referee/command/interaction.cpp
+  src/referee/command/interaction/communicate.cpp
+  src/referee/command/interaction/sentry_decision.cpp
+  src/referee/command/interaction/ui.cpp
+  src/referee/command/map_marker.cpp
+  src/referee/command/text_display.cpp
+  src/referee/app/ui/auto_aim.cpp
+  src/referee/app/ui/deformable_infantry_ui.cpp
+  src/referee/app/ui/flight.cpp
+  src/referee/app/ui/hero.cpp
+  src/referee/app/ui/infantry.cpp
 )
 
 # 库名必须和 plugins.xml 里的 <library path="..."> 一致，
@@ -142,6 +156,30 @@ if(BUILD_TESTING)
   target_include_directories(test_balance_math PRIVATE
     ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/test)
 
+  # LK 驱动反馈侧：回复过滤、首帧门控、离线看门狗、按系列的电流满量程（对照协议 V2.36）。
+  ament_add_gtest(test_lk_motor test/test_lk_motor.cpp)
+  target_include_directories(test_lk_motor PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_lk_motor hcs_executor hcs_sync hcs_utility rclcpp)
+
+  # DJI 驱动反馈 DATA[7] 错误码：新旧固件兼容、未列出的码原样保留。
+  ament_add_gtest(test_dji_motor test/test_dji_motor.cpp)
+  target_include_directories(test_dji_motor PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_dji_motor hcs_executor hcs_sync hcs_utility)
+
+  # DM 驱动：D[0] 电机 ID 校验（MST_ID 撞号）、首帧门控、离线、零点随 PMAX 换算。
+  ament_add_gtest(test_dm_motor test/test_dm_motor.cpp)
+  target_include_directories(test_dm_motor PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_dm_motor hcs_executor hcs_sync hcs_utility)
+
+  # 关键设备失效锁存：触发条件、不自动恢复、DOWN→离开 的复位手势。
+  ament_add_gtest(test_safety_latch test/test_safety_latch.cpp)
+  target_include_directories(test_safety_latch PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_safety_latch hcs_msgs)
+
   # 平衡组件图：假硬件 + 全部平衡组件 link + 空跑，参数文件挂给 rclcpp::init。
   ament_add_gtest(test_balance_graph test/test_balance_graph.cpp)
   target_include_directories(test_balance_graph PRIVATE
@@ -150,6 +188,17 @@ if(BUILD_TESTING)
     BALANCE_GRAPH_TEST_YAML="${CMAKE_CURRENT_SOURCE_DIR}/test/balance_graph_test.yaml")
   ament_target_dependencies(
     test_balance_graph
+    hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf rclcpp)
+
+  # 性能基准：同图 + 确定性激励，打印整拍/逐组件/NLMPC-LQR 求解耗时分位数。
+  # 无板环境只能测算力这一维；节奏质量上板后由 rt_sampler 测。
+  ament_add_gtest(test_balance_bench test/test_balance_bench.cpp)
+  target_include_directories(test_balance_bench PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  target_compile_definitions(test_balance_bench PRIVATE
+    BALANCE_GRAPH_TEST_YAML="${CMAKE_CURRENT_SOURCE_DIR}/test/balance_graph_test.yaml")
+  ament_target_dependencies(
+    test_balance_bench
     hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf rclcpp)
 endif()
 

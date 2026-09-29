@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <compare>
 #include <cstddef>
 #include <iterator>
@@ -12,6 +13,7 @@
 #include <utility>
 
 #include "hcs_utility/cache_line.hpp"
+#include "hcs_utility/raw_storage.hpp"
 
 namespace hcs_utility {
 
@@ -131,11 +133,7 @@ public:
             , origin_(origin)
             , offset_(offset) {}
 
-        pointer ptr() const {
-            return std::launder(
-                reinterpret_cast<pointer>(
-                    buffer_->storage_[(origin_ + offset_) & buffer_->mask_].data));
-        }
+        pointer ptr() const { return buffer_->storage_[(origin_ + offset_) & buffer_->mask_].ptr(); }
 
         Buffer* buffer_ = nullptr;
         size_t origin_ = 0;
@@ -174,8 +172,14 @@ public:
         [[nodiscard]] bool empty() const { return size_ == 0; }
         [[nodiscard]] size_type size() const { return size_; }
 
-        reference front() const { return *begin(); }
-        reference back() const { return *(end() - 1); }
+        reference front() const {
+            assert(!empty() && "RingBuffer ReadableView::front() on empty view");
+            return *begin();
+        }
+        reference back() const {
+            assert(!empty() && "RingBuffer ReadableView::back() on empty view");
+            return *(end() - 1);
+        }
         reference operator[](size_type index) const { return begin()[index]; }
 
     private:
@@ -206,7 +210,7 @@ public:
         else
             size = round_up_to_next_power_of_2(size);
         mask_ = size - 1;
-        storage_ = new Storage[size];
+        storage_ = new RawStorage<T>[size];
     }
 
     RingBuffer(const RingBuffer&) = delete;
@@ -294,7 +298,7 @@ public:
                 return nullptr;
         }
 
-        return std::launder(reinterpret_cast<T*>(storage_[out & mask_].data));
+        return storage_[out & mask_].ptr();
     }
 
     /*!
@@ -309,8 +313,12 @@ public:
      */
     template <typename F>
     requires requires(F& f, T& t) {
-        { f(t) } noexcept;
+        { f(t) };
     } size_t peek_front_n(F callback_functor, size_t count = std::numeric_limits<size_t>::max()) {
+        static_assert(
+            std::is_nothrow_invocable_v<F&, T&>,
+            "RingBuffer visit callback must be noexcept: a throw mid-iteration would abandon the "
+            "consumer on the RT path");
         const auto out = out_.load(std::memory_order::relaxed);
 
         // 缓存够 count 就不碰生产者那条 line；不够才 acquire 一次真值
@@ -325,14 +333,13 @@ public:
         const auto offset = out & mask_;
         const auto slice = std::min(count, max_size() - offset);
 
-        auto process = [&callback_functor](std::byte* storage) {
-            auto& element = *std::launder(reinterpret_cast<T*>(storage));
-            callback_functor(element);
+        auto process = [&callback_functor](RawStorage<T>& storage) {
+            callback_functor(*storage.ptr());
         };
         for (size_t i = 0; i < slice; i++)
-            process(storage_[offset + i].data);
+            process(storage_[offset + i]);
         for (size_t i = 0; i < count - slice; i++)
-            process(storage_[i].data);
+            process(storage_[i]);
 
         return count;
     }
@@ -349,7 +356,7 @@ public:
         if (in == out_.load(std::memory_order::relaxed))
             return nullptr;
 
-        return std::launder(reinterpret_cast<T*>(storage_[(in - 1) & mask_].data));
+        return storage_[(in - 1) & mask_].ptr();
     }
 
     /*!
@@ -362,9 +369,13 @@ public:
      */
     template <typename F>
     requires requires(F& f, std::byte* storage) {
-        { f(storage) } noexcept;
+        { f(storage) };
     }
     size_t emplace_back_n(F construct_functor, size_t count = std::numeric_limits<size_t>::max()) {
+        static_assert(
+            std::is_nothrow_invocable_v<F&, std::byte*>,
+            "RingBuffer construction functor must be noexcept: a throw would leave half-"
+            "constructed elements in the ring on the RT path (T must be nothrow-constructible)");
         const auto in = in_.load(std::memory_order::relaxed);
 
         // 缓存够 count 就不碰消费者那条 line；不够才 acquire 一次真值
@@ -382,9 +393,9 @@ public:
         const auto slice = std::min(count, max_size() - offset);
 
         for (size_t i = 0; i < slice; i++)
-            construct_functor(storage_[offset + i].data);
+            construct_functor(storage_[offset + i].bytes);
         for (size_t i = 0; i < count - slice; i++)
-            construct_functor(storage_[i].data);
+            construct_functor(storage_[i].bytes);
 
         in_.store(in + count, std::memory_order::release);
 
@@ -412,9 +423,13 @@ public:
      */
     template <typename F>
     requires requires(F& f) {
-        { f() } noexcept;
-        { T{f()} } noexcept;
+        { f() };
+        { T{f()} };
     } size_t push_back_n(F generator, size_t count = std::numeric_limits<size_t>::max()) {
+        static_assert(
+            noexcept(T{std::declval<F&>()()}),
+            "RingBuffer T must be nothrow-constructible from the generator's result: "
+            "a throw would leave half-constructed elements in the ring on the RT path");
         return emplace_back_n(
             [&](std::byte* storage) noexcept(noexcept(T{generator()})) {
                 new (storage) T{generator()};
@@ -451,8 +466,12 @@ public:
      */
     template <typename F>
     requires requires(F& f, T& t) {
-        { f(std::move(t)) } noexcept;
+        { f(std::move(t)) };
     } size_t pop_front_n(F callback_functor, size_t count = std::numeric_limits<size_t>::max()) {
+        static_assert(
+            std::is_nothrow_invocable_v<F&, T&&>,
+            "RingBuffer consume callback must be noexcept: a throw mid-pop would leave the "
+            "consumer cursor advanced past unconsumed elements on the RT path");
         const auto out = out_.load(std::memory_order::relaxed);
 
         // 同 peek_front_n：count 为默认的 max 时恒去读真值，语义与改前逐位一致
@@ -467,15 +486,15 @@ public:
         const auto offset = out & mask_;
         const auto slice = std::min(count, max_size() - offset);
 
-        auto process = [&callback_functor](std::byte* storage) {
-            auto& element = *std::launder(reinterpret_cast<T*>(storage));
+        auto process = [&callback_functor](RawStorage<T>& storage) {
+            T& element = *storage.ptr();
             callback_functor(std::move(element));
             std::destroy_at(&element);
         };
         for (size_t i = 0; i < slice; i++)
-            process(storage_[offset + i].data);
+            process(storage_[offset + i]);
         for (size_t i = 0; i < count - slice; i++)
-            process(storage_[i].data);
+            process(storage_[i]);
 
         out_.store(out + count, std::memory_order::release);
 
@@ -488,7 +507,7 @@ public:
      */
     template <typename F>
     requires requires(F& f, T& t) {
-        { f(std::move(t)) } noexcept;
+        { f(std::move(t)) };
     } bool pop_front(F&& callback_functor) {
         return pop_front_n(std::forward<F>(callback_functor), 1);
     }
@@ -540,9 +559,7 @@ private:
     }
 
     size_t mask_;
-    struct Storage {
-        alignas(T) std::byte data[sizeof(T)];
-    }* storage_;
+    RawStorage<T>* storage_;
 
     // 生产者只写 in_、消费者只写 out_；同一条 cache line 会让每次 push/pop 都把这条 line
     // 在两个核之间弹一次。各自独占一条 line，后面紧跟自己私有的对端游标缓存：

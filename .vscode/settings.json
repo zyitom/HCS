@@ -1,0 +1,14 @@
+{
+    "clangd.path": "/usr/bin/clangd-20",
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/../build",
+        "--background-index",
+        "--all-scopes-completion",
+        "--completion-style=detailed",
+        "--clang-tidy"
+        // "--query-driver=/usr/bin/arm-none-eabi-gcc"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled"
+    // CMakeLists 不在工作区根目录时才加：
+    // "cmake.sourceDirectory": "${workspaceFolder}/xxx"
+}

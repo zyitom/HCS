@@ -6,6 +6,8 @@
 namespace hcs_msgs {
 
 /// 16 个键盘按键位图，布局与 DJI 图传/DR16 键盘帧一致。
+// 位域依赖小端主机 + GCC/Clang LSB-first（W 落 bit0）。
+static_assert(std::endian::native == std::endian::little, "bitmap assumes a LE host");
 struct __attribute__((packed)) Keyboard {
     constexpr static inline Keyboard zero() {
         constexpr uint16_t zero = 0;

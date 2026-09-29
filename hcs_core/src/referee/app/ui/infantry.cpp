@@ -3,20 +3,20 @@
 #include <cstdint>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/chassis_mode.hpp>
-#include <rmcs_msgs/game_stage.hpp>
-#include <rmcs_msgs/mouse.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/chassis_mode.hpp>
+#include <hcs_msgs/game_stage.hpp>
+#include <hcs_msgs/mouse.hpp>
 
 #include "referee/app/ui/shape/shape.hpp"
 #include "referee/app/ui/widget/crosshair.hpp"
 #include "referee/app/ui/widget/status_ring.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 using namespace std::chrono_literals;
 
 class Infantry
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     Infantry()
@@ -74,7 +74,7 @@ public:
         // register_input("/auto_aim/ui_target", auto_aim_target_, false);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         update_chassis_direction_indicator();
 
         chassis_control_power_limit_indicator_.set_value(*chassis_control_power_limit_);
@@ -106,20 +106,20 @@ private:
                 std::round((2 * std::numbers::pi - angle) / std::numbers::pi * 180));
         };
         chassis_direction_indicator_.set_color(
-            chassis_mode == rmcs_msgs::ChassisMode::SPIN_FAST ? Shape::Color::GREEN
+            chassis_mode == hcs_msgs::ChassisMode::SPIN_FAST ? Shape::Color::GREEN
                                                               : Shape::Color::PINK);
         chassis_direction_indicator_.set_angle(to_referee_angle(*chassis_angle_), 30);
 
         bool chassis_control_direction_indicator_visible = false;
         if (!std::isnan(*chassis_control_angle_)) {
-            if (chassis_mode == rmcs_msgs::ChassisMode::STEP_DOWN) {
+            if (chassis_mode == hcs_msgs::ChassisMode::STEP_DOWN) {
                 chassis_control_direction_indicator_visible = true;
                 chassis_control_direction_indicator_.set_color(Shape::Color::CYAN);
                 chassis_control_direction_indicator_.set_width(8);
                 chassis_control_direction_indicator_.set_r(92);
                 chassis_control_direction_indicator_.set_angle(
                     to_referee_angle(*chassis_control_angle_), 30);
-            } else if (chassis_mode == rmcs_msgs::ChassisMode::LAUNCH_RAMP) {
+            } else if (chassis_mode == hcs_msgs::ChassisMode::LAUNCH_RAMP) {
                 chassis_control_direction_indicator_visible = true;
                 chassis_control_direction_indicator_.set_color(Shape::Color::CYAN);
                 chassis_control_direction_indicator_.set_width(28);
@@ -135,7 +135,7 @@ private:
     static constexpr uint16_t screen_width = 1920, screen_height = 1080;
     static constexpr uint16_t x_center = screen_width / 2, y_center = screen_height / 2;
 
-    InputInterface<rmcs_msgs::ChassisMode> chassis_mode_;
+    InputInterface<hcs_msgs::ChassisMode> chassis_mode_;
     InputInterface<double> chassis_angle_, chassis_control_angle_;
 
     InputInterface<double> supercap_voltage_;
@@ -155,9 +155,9 @@ private:
     InputInterface<double> left_friction_velocity_;
     InputInterface<double> right_friction_velocity_;
 
-    InputInterface<rmcs_msgs::Mouse> mouse_;
+    InputInterface<hcs_msgs::Mouse> mouse_;
 
-    InputInterface<rmcs_msgs::GameStage> game_stage_;
+    InputInterface<hcs_msgs::GameStage> game_stage_;
 
     // InputInterface<std::pair<uint16_t, uint16_t>> auto_aim_target_;
 
@@ -177,8 +177,8 @@ private:
     Integer time_reminder_;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::app::ui::Infantry, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::app::ui::Infantry, hcs_executor::Component)

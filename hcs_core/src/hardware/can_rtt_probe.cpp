@@ -85,9 +85,10 @@ public:
         // 析构逆序：sender_ 先停线程，然后 board_ 停传输，最后数据才消失。
         auto options = libhcs::board::AdvancedOptions{};
         options.dangerously_skip_version_checks = skip_version_checks_;
-        board_ = std::make_unique<libhcs::board::Hpm5321>(*this, serial_filter_, options);
-        // libhcs 的串口配置走 EP0 控制传输，不再混在数据流里。
-        board_->configure_uart0(kImuBaudrate);
+        // 波特率走构造期 Configuration：会话前 apply + 读回校验，重连自动重发（EP0）
+        libhcs::board::hcs::Configuration config;
+        config.uart_baudrate[0] = kImuBaudrate;
+        board_ = std::make_unique<libhcs::board::Hpm5321>(*this, serial_filter_, options, config);
 
         report_timer_ = create_wall_timer(std::chrono::seconds{1}, [this] { report(); });
 

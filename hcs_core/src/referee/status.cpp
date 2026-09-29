@@ -2,22 +2,22 @@
 #include <cstring>
 #include <eigen3/Eigen/Eigen>
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/game_stage.hpp>
-#include <rmcs_msgs/robot_id.hpp>
-#include <rmcs_msgs/serial_interface.hpp>
-#include <rmcs_utility/crc/dji_crc.hpp>
-#include <rmcs_utility/package_receive.hpp>
-#include <rmcs_utility/tick_timer.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/game_stage.hpp>
+#include <hcs_msgs/robot_id.hpp>
+#include <hcs_msgs/serial_interface.hpp>
+#include <hcs_utility/crc/dji_crc.hpp>
+#include <hcs_utility/package_receive.hpp>
+#include <hcs_utility/tick_timer.hpp>
 
 #include "referee/frame.hpp"
 #include "referee/status/field.hpp"
 
-namespace rmcs_core::referee {
+namespace hcs_core::referee {
 using namespace status;
 
 class Status
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     Status()
@@ -27,7 +27,7 @@ public:
         , logger_(get_logger()) {
         register_input("/referee/serial", serial_);
 
-        register_output("/referee/game/stage", game_stage_, rmcs_msgs::GameStage::UNKNOWN);
+        register_output("/referee/game/stage", game_stage_, hcs_msgs::GameStage::UNKNOWN);
         register_output("/referee/game/stage_remain_time", stage_remain_time_, 0);
         register_output("/referee/game/sync_timestamp", sync_timestamp_, uint64_t{0});
         register_output(
@@ -41,7 +41,7 @@ public:
         register_output(
             "/referee/dart/latest_hit_target_total_count", dart_latest_hit_target_total_count_, 0);
 
-        register_output("/referee/id", robot_id_, rmcs_msgs::RobotId::UNKNOWN);
+        register_output("/referee/id", robot_id_, hcs_msgs::RobotId::UNKNOWN);
         register_output("/referee/shooter/cooling", robot_shooter_cooling_, 0);
         register_output("/referee/shooter/heat_limit", robot_shooter_heat_limit_, 0);
         register_output("/referee/chassis/power_limit", robot_chassis_power_limit_, 0.0);
@@ -107,40 +107,51 @@ public:
         robot_status_watchdog_.reset(5'000);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         if (!serial_.active())
             return;
 
         if (cache_size_ >= sizeof(frame_.header)) {
             auto frame_size = sizeof(frame_.header) + sizeof(frame_.body.command_id)
                             + frame_.header.data_length + sizeof(uint16_t);
-            cache_size_ += serial_->read(
-                reinterpret_cast<std::byte*>(&frame_) + cache_size_, frame_size - cache_size_);
-
-            if (cache_size_ == frame_size) {
+            // data_length 来自线上,CRC8 只保完整性不保合法性:16 位的长度字段
+            // 最大 65535,而 frame_ 是定长的。不钳制,一个 CRC 恰好合法的超长帧
+            // 就会让 read 直接写出 frame_ 的边界。
+            if (frame_size > sizeof(frame_)) {
+                RCLCPP_WARN(
+                    logger_, "Frame data_length %u out of range, dropped",
+                    static_cast<unsigned>(frame_.header.data_length));
                 cache_size_ = 0;
-                if (rmcs_utility::dji_crc::verify_crc16(&frame_, frame_size)) {
-                    process_frame();
-                } else {
-                    RCLCPP_WARN(logger_, "Body crc16 invalid");
+            } else {
+                cache_size_ += serial_->read(
+                    reinterpret_cast<std::byte*>(&frame_) + cache_size_,
+                    frame_size - cache_size_);
+
+                if (cache_size_ == frame_size) {
+                    cache_size_ = 0;
+                    if (hcs_utility::dji_crc::verify_crc16(&frame_, frame_size)) {
+                        process_frame();
+                    } else {
+                        RCLCPP_WARN(logger_, "Body crc16 invalid");
+                    }
                 }
             }
         } else {
-            auto result = rmcs_utility::receive_package<std::byte>(
-                const_cast<rmcs_msgs::SerialInterface&>(*serial_), frame_.header, cache_size_,
+            auto result = hcs_utility::receive_package<std::byte>(
+                const_cast<hcs_msgs::SerialInterface&>(*serial_), frame_.header, cache_size_,
                 static_cast<uint8_t>(0xa5), [](const FrameHeader& header) {
-                    return rmcs_utility::dji_crc::verify_crc8(header);
+                    return hcs_utility::dji_crc::verify_crc8(header);
                 });
-            if (result == rmcs_utility::ReceiveResult::HEADER_INVALID) {
+            if (result == hcs_utility::ReceiveResult::HEADER_INVALID) {
                 RCLCPP_WARN(logger_, "Header start invalid");
-            } else if (result == rmcs_utility::ReceiveResult::VERIFY_INVALID) {
+            } else if (result == hcs_utility::ReceiveResult::VERIFY_INVALID) {
                 RCLCPP_WARN(logger_, "Header crc8 invalid");
             }
         }
 
         if (game_status_watchdog_.tick()) {
             RCLCPP_INFO(logger_, "Game status receiving timeout. Set stage to unknown.");
-            *game_stage_ = rmcs_msgs::GameStage::UNKNOWN;
+            *game_stage_ = hcs_msgs::GameStage::UNKNOWN;
         }
         if (robot_status_watchdog_.tick()) {
             RCLCPP_ERROR(logger_, "Robot status receiving timeout. Set to safe indicators.");
@@ -156,6 +167,13 @@ public:
     }
 
 private:
+    /// 帧体按具体消息类型取出。wire 结构对小端主机的依赖见 field.hpp 顶部;
+    /// 类型自身的长度由各 static_assert(sizeof) 钉死,帧长合法性由收帧路径保证。
+    template <typename T>
+    T& frame_body_as() {
+        return reinterpret_cast<T&>(frame_.body.data);
+    }
+
     void process_frame() {
         auto command_id = frame_.body.command_id;
         if (command_id == 0x0001)
@@ -185,20 +203,20 @@ private:
     }
 
     void update_game_status() {
-        auto& data = reinterpret_cast<GameStatus&>(frame_.body.data);
+        auto& data = frame_body_as<GameStatus>();
 
-        *game_stage_ = static_cast<rmcs_msgs::GameStage>(data.game_progress);
+        *game_stage_ = static_cast<hcs_msgs::GameStage>(data.game_progress);
         *stage_remain_time_ = data.stage_remain_time;
         *sync_timestamp_ = data.sync_timestamp;
 
-        if (*game_stage_ == rmcs_msgs::GameStage::STARTED)
+        if (*game_stage_ == hcs_msgs::GameStage::STARTED)
             game_status_watchdog_.reset(30'000);
         else
             game_status_watchdog_.reset(5'000);
     }
 
     void update_event_data() {
-        auto& data = reinterpret_cast<EventData&>(frame_.body.data);
+        auto& data = frame_body_as<EventData>();
 
         *ally_small_energy_activation_status_ = data.ally_small_energy_activation_status;
         *ally_big_energy_activation_status_ = data.ally_big_energy_activation_status;
@@ -206,13 +224,13 @@ private:
     }
 
     void update_dart_info() {
-        auto& data = reinterpret_cast<DartInfo&>(frame_.body.data);
+        auto& data = frame_body_as<DartInfo>();
 
         *dart_latest_hit_target_total_count_ = data.latest_hit_target_total_count;
     }
 
     void update_game_robot_hp() {
-        auto& data = reinterpret_cast<GameRobotHp&>(frame_.body.data);
+        auto& data = frame_body_as<GameRobotHp>();
         *robots_hp_ = data;
         *ally_hero_hp_ = data.ally_1_robot_hp;
         *ally_engineer_hp_ = data.ally_2_robot_hp;
@@ -226,15 +244,15 @@ private:
     }
 
     void update_robot_status() {
-        if (*game_stage_ == rmcs_msgs::GameStage::STARTED)
+        if (*game_stage_ == hcs_msgs::GameStage::STARTED)
             robot_status_watchdog_.reset(60'000);
         else
             robot_status_watchdog_.reset(5'000);
 
-        auto& data = reinterpret_cast<RobotStatus&>(frame_.body.data);
+        auto& data = frame_body_as<RobotStatus>();
 
         *robot_current_hp_ = data.current_hp;
-        *robot_id_ = static_cast<rmcs_msgs::RobotId>(data.robot_id);
+        *robot_id_ = static_cast<hcs_msgs::RobotId>(data.robot_id);
         *robot_shooter_cooling_ = data.shooter_barrel_cooling_value;
         *robot_shooter_heat_limit_ = static_cast<int64_t>(1000) * data.shooter_barrel_heat_limit;
 
@@ -249,12 +267,12 @@ private:
     void update_power_heat_data() {
         power_heat_data_watchdog_.reset(3'000);
 
-        auto& data = reinterpret_cast<PowerHeatData&>(frame_.body.data);
+        auto& data = frame_body_as<PowerHeatData>();
         *robot_buffer_energy_ = static_cast<double>(data.buffer_energy);
     }
 
     void update_robot_position() {
-        auto& data = reinterpret_cast<RobotPosition&>(frame_.body.data);
+        auto& data = frame_body_as<RobotPosition>();
         *robot_position_x_ = data.x;
         *robot_position_y_ = data.y;
         *robot_position_angle_ = data.angle;
@@ -263,7 +281,7 @@ private:
     void update_hurt_data() {}
 
     void update_shoot_data() {
-        auto& data = reinterpret_cast<ShootData&>(frame_.body.data);
+        auto& data = frame_body_as<ShootData>();
         *robot_initial_speed_ = data.initial_speed;
 
         const auto now = std::chrono::high_resolution_clock::now();
@@ -271,7 +289,7 @@ private:
     }
 
     void update_bullet_allowance() {
-        auto& data = reinterpret_cast<BulletAllowance&>(frame_.body.data);
+        auto& data = frame_body_as<BulletAllowance>();
         *robot_bullet_allowance_ = data.projectile_allowance_17mm;
         *robot_42mm_bullet_allowance_ = data.projectile_allowance_42mm;
         *remaining_gold_coin_ = data.remaining_gold_coin;
@@ -279,7 +297,7 @@ private:
     }
 
     void update_sentry_info() {
-        auto& data = reinterpret_cast<SentryInfo&>(frame_.body.data);
+        auto& data = frame_body_as<SentryInfo>();
 
         *sentry_posture_ = static_cast<uint8_t>(data.posture + (data.is_powered ? 3 : 0));
         *sentry_is_powered_ = data.is_powered;
@@ -336,12 +354,12 @@ private:
 
     rclcpp::Logger logger_;
 
-    InputInterface<rmcs_msgs::SerialInterface> serial_;
+    InputInterface<hcs_msgs::SerialInterface> serial_;
     Frame frame_;
     size_t cache_size_ = 0;
 
-    rmcs_utility::TickTimer game_status_watchdog_;
-    OutputInterface<rmcs_msgs::GameStage> game_stage_;
+    hcs_utility::TickTimer game_status_watchdog_;
+    OutputInterface<hcs_msgs::GameStage> game_stage_;
     OutputInterface<uint16_t> stage_remain_time_;
     OutputInterface<uint64_t> sync_timestamp_;
     OutputInterface<uint8_t> ally_big_energy_activation_status_;
@@ -349,8 +367,8 @@ private:
     OutputInterface<uint8_t> ally_fortress_occupation_status_;
     OutputInterface<uint8_t> dart_latest_hit_target_total_count_;
 
-    rmcs_utility::TickTimer robot_status_watchdog_;
-    OutputInterface<rmcs_msgs::RobotId> robot_id_;
+    hcs_utility::TickTimer robot_status_watchdog_;
+    OutputInterface<hcs_msgs::RobotId> robot_id_;
     OutputInterface<int64_t> robot_shooter_cooling_, robot_shooter_heat_limit_;
     OutputInterface<double> robot_chassis_power_limit_;
     OutputInterface<bool> chassis_output_status_;
@@ -362,7 +380,7 @@ private:
     OutputInterface<bool> sentry_can_rebirth_gold_;
     OutputInterface<uint16_t> sentry_rebirth_gold_cost_;
 
-    rmcs_utility::TickTimer power_heat_data_watchdog_;
+    hcs_utility::TickTimer power_heat_data_watchdog_;
     OutputInterface<double> robot_chassis_power_;
     OutputInterface<double> robot_buffer_energy_;
 
@@ -405,8 +423,8 @@ private:
     bool has_last_map_command_ = false;
 };
 
-} // namespace rmcs_core::referee
+} // namespace hcs_core::referee
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::Status, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::Status, hcs_executor::Component)

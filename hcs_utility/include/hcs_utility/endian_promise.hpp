@@ -74,7 +74,11 @@ requires(std::is_integral_v<T> || std::is_floating_point_v<T>) struct EndianCont
         : value_buffer(encode(T(value))) {}
 
     // Storage out
+    // 模板转换限定为算术类型:无约束的 operator U() 会让 EndianContainer 隐式
+    // 转成任何能从 T 构造的东西,在重载决议里到处捣乱(hipnuc 里 clang 的
+    // 运算符二义性就是这么来的)。
     template <typename U>
+    requires std::is_arithmetic_v<U>
     operator U() const noexcept { // NOLINT(google-explicit-constructor)
         return U(decode(value_buffer));
     }

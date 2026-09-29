@@ -1,8 +1,12 @@
 #pragma once
 
+#include <bit>
 #include <cstdint>
 
-namespace rmcs_core::referee::status {
+// 原生 u16/u64 packed 依赖小端主机；位域依赖 GCC/Clang LSB-first（game_type 落低半字节）。
+static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
+
+namespace hcs_core::referee::status {
 
 struct __attribute__((packed)) GameStatus {
     uint8_t game_type     : 4;
@@ -158,4 +162,4 @@ struct __attribute__((packed)) SentryInfo {
 };
 static_assert(sizeof(SentryInfo) == 14);
 
-} // namespace rmcs_core::referee::status
+} // namespace hcs_core::referee::status

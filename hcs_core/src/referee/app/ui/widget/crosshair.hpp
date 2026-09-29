@@ -2,7 +2,7 @@
 
 #include "referee/app/ui/shape/shape.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 
 class CrossHair {
 public:
@@ -27,4 +27,4 @@ private:
     Circle center_;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui

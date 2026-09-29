@@ -4,7 +4,7 @@
 #include <chrono>
 #include <cmath>
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 
 class AnimatedToggle {
 public:
@@ -72,4 +72,4 @@ private:
     bool target_ = false;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui

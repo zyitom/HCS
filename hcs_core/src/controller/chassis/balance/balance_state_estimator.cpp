@@ -140,7 +140,6 @@ private:
         geometry_.l5 = get_parameter("leg_link5").as_double();
         leg_angle_offset_ = get_parameter("leg_angle_offset").as_double();
         wheel_radius_ = get_parameter("wheel_radius").as_double();
-        wheel_reduction_ = get_parameter("wheel_reduction_ratio").as_double();
         wheel_half_track_ = get_parameter("wheel_half_track").as_double();
         side_sign_left_ = get_parameter("left_angle_sign").as_double();
         side_sign_right_ = get_parameter("right_angle_sign").as_double();
@@ -329,7 +328,6 @@ private:
         (void)lateral_acceleration_;
         (void)vertical_acceleration_;
         (void)wheel_radius_;
-        (void)wheel_reduction_;
         (void)wheel_half_track_;
     }
 
@@ -368,7 +366,6 @@ private:
     Geometry geometry_;
     double leg_angle_offset_ = 1.163;
     double wheel_radius_ = 0.06;
-    double wheel_reduction_ = 13.94;
     double wheel_half_track_ = 0.2296;
     double side_sign_left_ = -1.0;
     double side_sign_right_ = 1.0;

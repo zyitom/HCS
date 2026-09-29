@@ -1,21 +1,21 @@
 #include <algorithm>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/full_robot_id.hpp>
-#include <rmcs_msgs/game_stage.hpp>
-#include <rmcs_msgs/keyboard.hpp>
-#include <rmcs_msgs/robot_id.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/full_robot_id.hpp>
+#include <hcs_msgs/game_stage.hpp>
+#include <hcs_msgs/keyboard.hpp>
+#include <hcs_msgs/robot_id.hpp>
 
 #include "referee/app/ui/shape/cfs_scheduler.hpp"
 #include "referee/app/ui/shape/shape.hpp"
 #include "referee/command/interaction/header.hpp"
 
-namespace rmcs_core::referee::command::interaction {
+namespace hcs_core::referee::command::interaction {
 using namespace app::ui;
 
 class Ui
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     Ui()
@@ -30,16 +30,16 @@ public:
         register_output("/referee/command/interaction/ui", ui_field_);
     }
 
-    void update() override {
-        if (*robot_id_ == rmcs_msgs::RobotId::UNKNOWN) {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
+        if (*robot_id_ == hcs_msgs::RobotId::UNKNOWN) {
             *ui_field_ = Field{};
             return;
         }
 
-        if ((last_game_stage_ == rmcs_msgs::GameStage::UNKNOWN
-             && *game_stage_ != rmcs_msgs::GameStage::UNKNOWN)
-            || (last_game_stage_ != rmcs_msgs::GameStage::PREPARATION
-                && *game_stage_ == rmcs_msgs::GameStage::PREPARATION)
+        if ((last_game_stage_ == hcs_msgs::GameStage::UNKNOWN
+             && *game_stage_ != hcs_msgs::GameStage::UNKNOWN)
+            || (last_game_stage_ != hcs_msgs::GameStage::PREPARATION
+                && *game_stage_ == hcs_msgs::GameStage::PREPARATION)
             || (!last_keyboard_.r && keyboard_->r)) {
             RemoteShape<Shape>::force_revoke_all_id();
             resetting_ = 4;
@@ -69,7 +69,7 @@ private:
 
         auto& header = *new (buffer + written) Header{};
         header.command_id = 0x0100; // Clear shapes
-        auto full_robot_id = rmcs_msgs::FullRobotId{*robot_id_};
+        auto full_robot_id = hcs_msgs::FullRobotId{*robot_id_};
         header.sender_id = full_robot_id;
         header.receiver_id = full_robot_id.client();
         written += sizeof(Header);
@@ -90,7 +90,7 @@ private:
         size_t written = 0;
 
         auto& header = *new (buffer + written) Header{};
-        auto full_robot_id = rmcs_msgs::FullRobotId{*robot_id_};
+        auto full_robot_id = hcs_msgs::FullRobotId{*robot_id_};
         header.sender_id = full_robot_id;
         header.receiver_id = full_robot_id.client();
         written += sizeof(Header);
@@ -148,21 +148,21 @@ private:
         return written;
     }
 
-    InputInterface<rmcs_msgs::RobotId> robot_id_;
+    InputInterface<hcs_msgs::RobotId> robot_id_;
 
-    InputInterface<rmcs_msgs::GameStage> game_stage_;
-    rmcs_msgs::GameStage last_game_stage_ = rmcs_msgs::GameStage::UNKNOWN;
+    InputInterface<hcs_msgs::GameStage> game_stage_;
+    hcs_msgs::GameStage last_game_stage_ = hcs_msgs::GameStage::UNKNOWN;
 
-    InputInterface<rmcs_msgs::Keyboard> keyboard_;
-    rmcs_msgs::Keyboard last_keyboard_ = rmcs_msgs::Keyboard::zero();
+    InputInterface<hcs_msgs::Keyboard> keyboard_;
+    hcs_msgs::Keyboard last_keyboard_ = hcs_msgs::Keyboard::zero();
 
     int resetting_ = 0;
 
     OutputInterface<Field> ui_field_;
 };
 
-} // namespace rmcs_core::referee::command::interaction
+} // namespace hcs_core::referee::command::interaction
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::command::interaction::Ui, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::command::interaction::Ui, hcs_executor::Component)

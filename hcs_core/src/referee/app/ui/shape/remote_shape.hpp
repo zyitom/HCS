@@ -4,7 +4,7 @@
 
 #include "referee/app/ui/shape/red_black_tree.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 template <typename T>
 class RemoteShape {
 public:
@@ -123,4 +123,4 @@ private:
 
     static inline RedBlackTree<Descriptor> swapping_queue_;
 };
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui

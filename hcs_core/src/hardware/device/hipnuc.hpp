@@ -34,6 +34,14 @@ using hcs_executor::Component;
 /// four header bytes and then over the payload, i.e. the CRC field itself is skipped, not zeroed.
 ///
 /// Reference: HiPNUC IMU command and programming manual v1.7.2, sections 2.8 / 7.31 / 7.35.
+///
+/// Output frame contract: vectors (angular_velocity, acceleration, magnetic_field) and the
+/// quaternion body side are always FLU, x front / y left / z up, REP-103, no matter how the
+/// module's flash is configured. A module left at the factory CONFIG IMU COORD 0 (ENU) reports
+/// its body frame as RFU (x right / y front / z up); this class permutes such output to FLU once,
+/// here, so no consumer ever has to know the module config. Tell the constructor which convention
+/// the module uses through Config::module_frame — the driver cannot detect it, HI91 carries no
+/// coordinate system field, a wrong declaration silently swaps axes.
 class Hipnuc {
 public:
     /// Bits of the MAIN_STATUS word. The bits not listed here are reserved: the firmware writes
@@ -52,12 +60,21 @@ public:
     };
 
     struct Config {
+        /// Which convention the module's flash holds, i.e. what CONFIG IMU COORD was last saved
+        /// as. This selects the input permutation only: outputs are FLU either way.
+        /// - kEnu (default, matches the factory state): body RFU, permuted to FLU here.
+        /// - kNwu: body already FLU, passed through untouched.
+        enum class ModuleFrame : uint8_t { kEnu, kNwu };
+
         Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_module_frame(ModuleFrame value) { return module_frame = value, *this; }
 
         /// Update cycles without a new frame before the module is considered offline. Counted in
         /// update_status() calls: at a 1 kHz control loop and the default 100 Hz HI91 output one
         /// frame is expected every 10 cycles.
         int offline_timeout = 100;
+
+        ModuleFrame module_frame = ModuleFrame::kEnu;
     };
 
     Hipnuc(Component& status_component, const std::string& name_prefix) {
@@ -86,6 +103,7 @@ public:
 
     void configure(const Config& config) {
         offline_timeout_ = config.offline_timeout;
+        module_frame_    = config.module_frame;
 
         received_ = false;
         online_ = false;
@@ -162,22 +180,27 @@ public:
         *online_output_ = online();
     }
 
-    // Attitude of the sensor frame relative to the module world frame, ENU unless CONFIG IMU
-    // COORD says otherwise. Identity until the first frame is decoded.
+    // Attitude of the FLU body frame relative to the module world frame. World origin depends on
+    // the module config (ENU heading zero = east, NWU heading zero = north) and matters only to
+    // absolute heading consumers, which this robot does not have. Identity until first decode.
     const Eigen::Quaterniond& quaternion() const { return quaternion_; }
 
-    // Euler angle unit: rad, order roll pitch yaw. Yaw is the raw heading in +-pi, counterclockwise
-    // positive, and in 9 axis mode it references magnetic north, not true north.
+    // Euler angle unit: rad, fields roll pitch yaw, physical meanings identical in both module
+    // configs. What does differ: heading zero (east vs north, same as quaternion()) and the
+    // rotation order used to rebuild a rotation from the triple (312 under ENU, 321 under NWU,
+    // manual section 2.2) — do not reconstruct rotations from these without knowing the config.
+    // Yaw is the raw heading in +-pi, counterclockwise positive, and in 9 axis mode it references
+    // magnetic north, not true north.
     const Eigen::Vector3d& euler_angles() const { return euler_angles_; }
 
-    // Acceleration unit: m/s^2, sensor frame. The wire unit is G.
+    // Acceleration unit: m/s^2, FLU body frame. The wire unit is G.
     const Eigen::Vector3d& acceleration() const { return acceleration_; }
 
-    // Angular velocity unit: rad/s, sensor frame. The wire unit is deg/s, unlike the same field of
-    // an HI83 frame, which is already rad/s.
+    // Angular velocity unit: rad/s, FLU body frame. The wire unit is deg/s, unlike the same field
+    // of an HI83 frame, which is already rad/s.
     const Eigen::Vector3d& angular_velocity() const { return angular_velocity_; }
 
-    // Magnetic field unit: uT, sensor frame. Only as trustworthy as kMagneticDisturbance says.
+    // Magnetic field unit: uT, FLU body frame. Only as trustworthy as kMagneticDisturbance says.
     const Eigen::Vector3d& magnetic_field() const { return magnetic_field_; }
 
     // Air pressure unit: Pa
@@ -212,6 +235,7 @@ public:
 private:
     static constexpr uint8_t kHi91Tag = 0x91;
     static constexpr double kGravity = 9.80665; // m/s^2
+    static constexpr double kHalfSqrt2 = std::numbers::sqrt2 / 2; // Rz(+90 deg) quaternion W/Z
 
     /// Field table of manual section 7.31. Offsets are 0 tag, 1 main_status, 3 temperature,
     /// 4 air_pressure, 8 system_time, 12 acc, 24 gyr, 36 mag, 48 euler, 60 quat. Every member
@@ -340,15 +364,33 @@ private:
         magnetic_field_ = to_vector(payload.magnetic_field);
         euler_angles_ = to_vector(payload.euler_angles) * deg_to_rad;
 
+        // The euler triple is not permuted: roll / pitch / yaw keep their physical meanings in
+        // both module configs, only the decomposition order behind them changes (see accessor).
+
         // Order on the wire is WXYZ. The module already sends a unit quaternion, so renormalizing
         // only cleans up float error, and an all zero quaternion, which a module that is still
         // booting does send, must not be normalized into NaN.
-        const auto quaternion = Eigen::Quaterniond{
+        auto quaternion = Eigen::Quaterniond{
             static_cast<float>(payload.quaternion[0]), static_cast<float>(payload.quaternion[1]),
             static_cast<float>(payload.quaternion[2]),
             static_cast<float>(payload.quaternion[3])};
-        if (quaternion.coeffs().squaredNorm() > 1e-6)
+        if (quaternion.coeffs().squaredNorm() > 1e-6) {
+            if (module_frame_ == Config::ModuleFrame::kEnu) {
+                // ENU modules report the body frame as RFU. FLU = RFU rotated 90 deg about Z
+                // (front = old y, left = -old x), so R_world<-flu = R_world<-rfu * Rz(+90 deg)
+                // is a right multiplication. The permutation for vectors is the same rotation:
+                // x_flu = y_rfu, y_flu = -x_rfu, z_flu = z_rfu.
+                quaternion = quaternion * Eigen::Quaterniond{kHalfSqrt2, 0.0, 0.0, kHalfSqrt2};
+                acceleration_    = rfu_to_flu(acceleration_);
+                angular_velocity_ = rfu_to_flu(angular_velocity_);
+                magnetic_field_  = rfu_to_flu(magnetic_field_);
+            }
             quaternion_ = quaternion.normalized();
+        }
+    }
+
+    static Eigen::Vector3d rfu_to_flu(const Eigen::Vector3d& v) {
+        return {v.y(), -v.x(), v.z()};
     }
 
     static Eigen::Vector3d to_vector(const hcs_utility::le_float32_t (&values)[3]) {
@@ -370,6 +412,7 @@ private:
     // Component thread side
     uint32_t last_sequence_ = 0;
     int offline_timeout_ = 0;
+    Config::ModuleFrame module_frame_ = Config::ModuleFrame::kEnu;
     int offline_count_ = 0;
     bool received_ = false;
     bool online_ = false;

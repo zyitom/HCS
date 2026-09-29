@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -188,56 +189,53 @@ private:
         return result;
     }
 
-    /// 唤醒代价检查。代价的真正来源是 C1E（MSR_POWER_CTL 0x1FC bit1，进 C1 时降
+    /// 唤醒代价检查。代价的真正来源是 C1E(MSR_POWER_CTL 0x1FC bit1，进 C1 时降
     /// 压降频、退出爬坡，实测 15-20 us；HOST_TUNING 10.9.3），不是 C1 本身：
     /// 2026-09-15 实测全机关 C1E 后，"C1 正常睡眠"与"禁 C1 强制 POLL 空转"延迟
     /// 持平（EP0 p50 73.5 vs 72.7），而空转白烧一个核——正确形态是 C1E=0 且
-    /// C1 正常。C1E 只能经 /dev/cpu/N/msr 读（root），读不到就把结论降级为 info。
+    /// C1 正常。C1E 是 **per-core** MSR，所以读 xHCI 中断真正所在的那颗核
+    /// （调优工具通常全机统一设置，但"通常"不构成检查依据），读不到就降级为 info。
     static void check_idle_cost(std::vector<Finding>& findings, const std::string& core) {
-        int msr_fd = open("/dev/cpu/0/msr", O_RDONLY | O_CLOEXEC);
-        const bool msr_readable = msr_fd >= 0;
-        if (msr_fd >= 0)
-            close(msr_fd);
-
-        if (msr_readable) {
-            // root / 已放开权限：直接读 C1E 位，给出准确结论。
-            const int fd = open("/dev/cpu/0/msr", O_RDONLY | O_CLOEXEC);
-            uint64_t value = 0;
-            const bool read_ok =
-                fd >= 0 && pread(fd, &value, sizeof(value), 0x1FC) == sizeof(value);
-            if (fd >= 0)
-                close(fd);
-            if (!read_ok) {
-                add(findings, Level::kInfo, "MSR 0x1FC read failed; C1E state unknown");
-                return;
-            }
-            if ((value >> 1) & 1U)
+        const int fd = open(std::format("/dev/cpu/{}/msr", core).c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            // 无 root：C1 状态仍可读。C1 被禁是"用空转换延迟"的旧方案——有效但不省；
+            // C1 开着则无法区分"C1E 已关（好）"和"C1E 开着（+22 us）"。
+            const auto disabled = c1_disabled(core);
+            if (disabled && *disabled) {
                 add(
-                    findings, Level::kWarn,
+                    findings, Level::kInfo,
                     std::format(
-                        "C1E is ON (MSR 0x1FC bit1): C1 wake costs 15-20 us on every core, "
-                        "measured EP0 p50 +22 us (HOST_TUNING 10.9.3). Fix: sudo tools/c1e off"));
-            else
-                add(findings, Level::kOk, "C1E off machine-wide (cheap C1 wake)");
+                        "cpu{}: C1 disabled (POLL-spin trade, latency OK but the core never "
+                        "idles); prefer C1E off + C1 enabled (tools/c1e)", core));
+            } else {
+                add(
+                    findings, Level::kInfo,
+                    std::format(
+                        "cpu{}: C1 enabled; C1E state unverifiable without root -- verify with "
+                        "`sudo tools/c1e` (C1E=0 is the desired state, HOST_TUNING 10.9.3)",
+                        core));
+            }
             return;
         }
 
-        // 无 root：C1 状态仍可读。C1 被禁是"用空转换延迟"的旧方案——有效但不省；
-        // C1 开着则无法区分"C1E 已关（好）"和"C1E 开着（+22 us）"。
-        const auto disabled = c1_disabled(core);
-        if (disabled && *disabled) {
-            add(
-                findings, Level::kInfo,
-                std::format(
-                    "cpu{}: C1 disabled (POLL-spin trade, latency OK but the core never "
-                    "idles); prefer C1E off + C1 enabled (tools/c1e)", core));
-        } else {
-            add(
-                findings, Level::kInfo,
-                std::format(
-                    "cpu{}: C1 enabled; C1E state unverifiable without root -- verify with "
-                    "`sudo tools/c1e` (C1E=0 is the desired state, HOST_TUNING 10.9.3)", core));
+        uint64_t value = 0;
+        const bool read_ok = pread(fd, &value, sizeof(value), 0x1FC) == sizeof(value);
+        close(fd);
+        if (!read_ok) {
+            add(findings, Level::kInfo, "MSR 0x1FC read failed; C1E state unknown");
+            return;
         }
+        if ((value >> 1) & 1U)
+            add(
+                findings, Level::kWarn,
+                std::format(
+                    "C1E is ON (cpu{} MSR 0x1FC bit1): C1 wake costs 15-20 us, "
+                    "measured EP0 p50 +22 us (HOST_TUNING 10.9.3). Fix: sudo tools/c1e off",
+                    core));
+        else
+            add(
+                findings, Level::kOk,
+                std::format("C1E off on cpu{} (cheap C1 wake)", core));
     }
 
     /// xHCI 中断核上的硬中断邻居。硬中断不受 SCHED_FIFO 保护，会直接抢占中断线程；
@@ -503,7 +501,24 @@ private:
             }
             // CAPLENGTH 在 0x00，运行寄存器区偏移在 RTSOFF(0x18)，IMOD 在 RTS+0x24；
             // 映射 16KB 覆盖全部布局（tools/imod.c 同一算术）。
-            void* mapping = mmap(nullptr, 0x4000, PROT_READ, MAP_SHARED, fd, 0);
+            // 但 resource0 不是每个控制器都真有 16KB —— xHCI BAR0 有 4K/8K 的硬件，
+            // 而 mmap 超出文件末页后访问就是 SIGBUS，会把启动流程整个崩掉，
+            // 违反本类"检查自身失败一律降级为 kInfo"的契约。长度以文件实际大小为准。
+            struct stat device_stat;
+            if (fstat(fd, &device_stat) != 0 || device_stat.st_size <= 0) {
+                close(fd);
+                add(
+                    findings, Level::kInfo,
+                    std::format(
+                        "{}: resource0 size unknown ({}); IMOD unchecked", entry->d_name,
+                        std::strerror(errno)));
+                continue;
+            }
+            const auto map_length = static_cast<size_t>(device_stat.st_size) < 0x4000
+                                        ? static_cast<size_t>(device_stat.st_size)
+                                        : size_t{0x4000};
+
+            void* mapping = mmap(nullptr, map_length, PROT_READ, MAP_SHARED, fd, 0);
             close(fd);
             if (mapping == MAP_FAILED) {
                 add(
@@ -515,8 +530,8 @@ private:
             uint32_t rtsoff = 0;
             std::memcpy(&rtsoff, registers + 0x18, 4);
             const uint32_t rts = rtsoff & 0xFFFFFE0u;
-            if (rts == 0 || rts + 0x28 > 0x4000) {
-                munmap(mapping, 0x4000);
+            if (rts == 0 || rts + 0x28 > map_length) {
+                munmap(mapping, map_length);
                 add(
                     findings, Level::kInfo,
                     std::format(
@@ -525,7 +540,7 @@ private:
             }
             uint32_t imod = 0;
             std::memcpy(&imod, registers + rts + 0x24, 4);
-            munmap(mapping, 0x4000);
+            munmap(mapping, map_length);
             add(
                 findings, Level::kInfo,
                 std::format(

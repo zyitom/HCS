@@ -47,6 +47,9 @@ public:
 
     void register_vt13(Vt13* vt13) { vt13_ = vt13; }
 
+    /// Left switch after arbitration, i.e. exactly what /remote/switch/left carries this cycle.
+    hcs_msgs::Switch switch_left() const { return *switch_left_output_; }
+
     void update() {
         if (vt13_ && vt13_->valid()) {
             switch (vt13_->mode_switch()) {

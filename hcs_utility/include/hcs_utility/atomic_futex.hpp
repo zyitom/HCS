@@ -25,25 +25,25 @@ inline bool atomic_futex_wait_until_steady(
     if (atomic.load(order) != old_val)
         return true;
 
-    timespec abs_time;
-    clock_gettime(CLOCK_MONOTONIC, &abs_time);
+    // 只读一次表:绝对截止时刻与"是否已过期"从同一个"现在"推出来。
+    // 旧实现先 clock_gettime 再 steady_clock::now(),两次读表之间的间隙会让
+    // futex 的绝对超时比目标时刻早几十纳秒 —— wait_until 可能假超时。
+    // Linux 上 steady_clock 与 CLOCK_MONOTONIC 同源(precise_sleep 已 static_assert
+    // 过 tick 形状),deadline 的 epoch 直接就是 futex 想要的绝对时刻。
+    ::timespec now_ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    const std::int64_t now_ns =
+        static_cast<std::int64_t>(now_ts.tv_sec) * 1'000'000'000LL + now_ts.tv_nsec;
+    const auto deadline_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
+            .count();
 
-    const auto remaining =
-        std::chrono::ceil<std::chrono::nanoseconds>(deadline - std::chrono::steady_clock::now());
-
-    if (remaining <= std::chrono::nanoseconds::zero())
+    if (deadline_ns <= now_ns)
         return atomic.load(order) != old_val;
 
-    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(remaining);
-    const auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(remaining - secs);
-
-    abs_time.tv_sec += static_cast<time_t>(secs.count());
-    abs_time.tv_nsec += static_cast<long>(nsecs.count());
-
-    if (abs_time.tv_nsec >= 1'000'000'000) {
-        abs_time.tv_sec += 1;
-        abs_time.tv_nsec -= 1'000'000'000;
-    }
+    ::timespec abs_time{};
+    abs_time.tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000);
+    abs_time.tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000);
 
     auto* const ptr = atomic_futex_address(atomic);
 

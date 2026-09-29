@@ -8,7 +8,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace rmcs_core::referee::command {
+namespace hcs_core::referee::command {
 
 class Field {
 public:
@@ -58,8 +58,8 @@ inline size_t write_field(std::byte* buffer, const T& data, const Ts&... other_d
 }
 
 #define MAKE_FIELD(...)                                                        \
-    ::rmcs_core::referee::command::Field {                                     \
+    ::hcs_core::referee::command::Field {                                     \
         [this](std::byte* buffer) { return write_field(buffer, __VA_ARGS__); } \
     }
 
-} // namespace rmcs_core::referee::command
+} // namespace hcs_core::referee::command

@@ -2,16 +2,16 @@
 #include <cstdint>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/mouse.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/mouse.hpp>
 
 #include "referee/app/ui/shape/shape.hpp"
 #include "referee/app/ui/widget/crosshair_circle.hpp"
 #include "referee/app/ui/widget/status_ring.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 class Flight
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     static constexpr uint8_t kUiModeCombat = 0;
@@ -45,7 +45,7 @@ public:
         register_input("/remote/mouse", mouse_);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         status_ring_.update_bullet_allowance(*robot_bullet_allowance_);
         status_ring_.update_friction_wheel_speed(
             std::min(*left_friction_velocity_, *right_friction_velocity_),
@@ -78,7 +78,7 @@ private:
 
     InputInterface<uint8_t> auto_aim_mode_;
 
-    InputInterface<rmcs_msgs::Mouse> mouse_;
+    InputInterface<hcs_msgs::Mouse> mouse_;
 
     CrossHairCircle crosshair_circle_;
     StatusRing status_ring_;
@@ -89,8 +89,8 @@ private:
     Line mode_indicator_;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::app::ui::Flight, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::app::ui::Flight, hcs_executor::Component)

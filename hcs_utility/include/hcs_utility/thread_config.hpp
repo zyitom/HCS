@@ -9,12 +9,13 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <charconv>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+
+#include "hcs_utility/detail/spec_parse.hpp"
 
 namespace hcs_utility {
 
@@ -37,8 +38,11 @@ public:
      * @throws std::invalid_argument If the spec is malformed or contains invalid values.
      */
     explicit ThreadConfig(std::string_view spec) {
-        spec = trim(spec);
-        parse_fields(spec);
+        spec = detail::trim(spec);
+        detail::for_each_kv_field(
+            kSpecKind, spec, [this, spec](std::string_view key, std::string_view value) {
+                assign_field(key, value, spec);
+            });
         validate(spec);
     }
 
@@ -56,7 +60,7 @@ public:
             return;
         if (const auto invalid_reason = check_name(default_name))
             throw std::invalid_argument(std::string(*invalid_reason));
-        name_ = to_string(default_name);
+        name_ = std::string{default_name};
     }
 
     [[nodiscard]] auto name() const -> const std::optional<std::string>& { return name_; }
@@ -139,31 +143,18 @@ public:
     }
 
 private:
-    static auto trim(std::string_view text) -> std::string_view {
-        while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
-            text.remove_prefix(1);
-        while (!text.empty() && (text.back() == ' ' || text.back() == '\t'))
-            text.remove_suffix(1);
-        return text;
-    }
-
-    static auto to_string(std::string_view text) -> std::string { return std::string{text}; }
+    /// 报错里的规格类别名,顺便把 this 捕不进 static 的问题绕掉。
+    static constexpr std::string_view kSpecKind = "thread config";
 
     [[noreturn]] static void throw_invalid_spec(std::string_view reason, std::string_view spec) {
-        throw std::invalid_argument(
-            std::format("Invalid thread config spec ({}): \"{}\"", reason, spec));
+        detail::throw_invalid_spec(kSpecKind, reason, spec);
     }
 
-    static auto parse_int(std::string_view value, std::string_view key, std::string_view spec)
-        -> int {
-        int result = 0;
-        const auto* begin = value.data();
-        const auto* end = value.data() + value.size();
-        const auto [ptr, error_code] = std::from_chars(begin, end, result);
-        if (error_code != std::errc{} || ptr != end) {
+    static int parse_int(std::string_view value, std::string_view key, std::string_view spec) {
+        const auto parsed = detail::parse_integer<int>(value);
+        if (!parsed)
             throw_invalid_spec(std::format("invalid integer for key '{}'", key), spec);
-        }
-        return result;
+        return *parsed;
     }
 
     static auto check_name(std::string_view name) -> std::optional<std::string> {
@@ -174,79 +165,41 @@ private:
         return std::nullopt;
     }
 
-    void parse_fields(std::string_view spec) {
-        bool seen_name = false;
-        bool seen_cpus = false;
-        bool seen_policy = false;
-        bool seen_priority = false;
-        bool seen_nice = false;
-
-        auto remaining_spec = spec;
-        while (true) {
-            const auto separator = remaining_spec.find(';');
-            const auto field = trim(remaining_spec.substr(0, separator));
-
-            if (!field.empty()) {
-                const auto equals = field.find('=');
-                if (equals == std::string_view::npos)
-                    throw_invalid_spec("missing '='", spec);
-
-                const auto key = trim(field.substr(0, equals));
-                const auto value = trim(field.substr(equals + 1));
-                if (key.empty() || value.empty())
-                    throw_invalid_spec("empty key or value", spec);
-
-                assign_field(
-                    key, value, spec, seen_name, seen_cpus, seen_policy, seen_priority, seen_nice);
-            }
-
-            if (separator == std::string_view::npos)
-                break;
-            remaining_spec.remove_prefix(separator + 1);
-        }
-    }
-
-    void assign_field(
-        std::string_view key, std::string_view value, std::string_view spec, bool& seen_name,
-        bool& seen_cpus, bool& seen_policy, bool& seen_priority, bool& seen_nice) {
+    /// 字段既是值也是"见过没有"的记录(optional)—— 重复键检测不用另设标记位。
+    void assign_field(std::string_view key, std::string_view value, std::string_view spec) {
         if (key == "name") {
-            if (seen_name)
+            if (name_)
                 throw_invalid_spec("duplicate key 'name'", spec);
-            seen_name = true;
             if (const auto invalid_reason = check_name(value))
                 throw_invalid_spec(*invalid_reason, spec);
-            name_ = to_string(value);
+            name_ = std::string{value};
             return;
         }
         if (key == "cpus") {
-            if (seen_cpus)
+            if (cpus_)
                 throw_invalid_spec("duplicate key 'cpus'", spec);
-            seen_cpus = true;
             cpus_ = parse_cpu_list(value, spec);
             return;
         }
         if (key == "policy") {
-            if (seen_policy)
+            if (policy_)
                 throw_invalid_spec("duplicate key 'policy'", spec);
-            seen_policy = true;
             policy_ = parse_policy(value, spec);
             return;
         }
         if (key == "priority") {
-            if (seen_priority)
+            if (priority_)
                 throw_invalid_spec("duplicate key 'priority'", spec);
-            seen_priority = true;
             priority_ = parse_int(value, key, spec);
             return;
         }
         if (key == "nice") {
-            if (seen_nice)
+            if (nice_)
                 throw_invalid_spec("duplicate key 'nice'", spec);
-            seen_nice = true;
             nice_ = parse_int(value, key, spec);
             return;
         }
-        throw_invalid_spec("unknown key '" + to_string(key) + "'", spec);
+        throw_invalid_spec(std::format("unknown key '{}'", key), spec);
     }
 
     static auto parse_policy(std::string_view value, std::string_view spec) -> int {
@@ -270,7 +223,7 @@ private:
         bool has_any_cpu = false;
         while (true) {
             const auto separator = value.find(',');
-            const auto token = trim(value.substr(0, separator));
+            const auto token = detail::trim(value.substr(0, separator));
             if (token.empty())
                 throw_invalid_spec("empty cpu list token", spec);
 
@@ -281,8 +234,8 @@ private:
             } else {
                 if (token.find('-', dash + 1) != std::string_view::npos)
                     throw_invalid_spec("invalid cpu range token", spec);
-                const int first_cpu = parse_int(trim(token.substr(0, dash)), "cpus", spec);
-                const int last_cpu = parse_int(trim(token.substr(dash + 1)), "cpus", spec);
+                const int first_cpu = parse_int(detail::trim(token.substr(0, dash)), "cpus", spec);
+                const int last_cpu = parse_int(detail::trim(token.substr(dash + 1)), "cpus", spec);
                 set_cpu_range(cpus, first_cpu, last_cpu, spec);
             }
 

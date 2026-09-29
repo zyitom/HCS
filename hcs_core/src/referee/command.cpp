@@ -1,18 +1,18 @@
 #include <chrono>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/serial_interface.hpp>
-#include <rmcs_utility/crc/dji_crc.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/serial_interface.hpp>
+#include <hcs_utility/crc/dji_crc.hpp>
 
 #include "referee/command/field.hpp"
 #include "referee/frame.hpp"
 
-namespace rmcs_core::referee {
+namespace hcs_core::referee {
 using namespace command;
 
 class Command
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     Command()
@@ -40,13 +40,13 @@ public:
             text_display_field_.bind_directly(empty_field_);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         if (!serial_.ready())
             return;
 
         using namespace std::chrono_literals;
         auto now = std::chrono::steady_clock::now();
-        auto& serial = const_cast<rmcs_msgs::SerialInterface&>(*serial_);
+        auto& serial = const_cast<hcs_msgs::SerialInterface&>(*serial_);
 
         if (now < next_sent_)
             return;
@@ -74,18 +74,18 @@ public:
         frame_.header.sof = sof_value;
         frame_.header.data_length = data_length;
         frame_.header.sequence = 0;
-        rmcs_utility::dji_crc::append_crc8(frame_.header);
+        hcs_utility::dji_crc::append_crc8(frame_.header);
 
         auto frame_size =
             sizeof(frame_.header) + sizeof(frame_.body.command_id) + data_length + sizeof(uint16_t);
-        rmcs_utility::dji_crc::append_crc16(&frame_, frame_size);
+        hcs_utility::dji_crc::append_crc16(&frame_, frame_size);
 
         serial.write(reinterpret_cast<std::byte*>(&frame_), frame_size);
         next_sent_ = now + (one_second / 3720 * frame_size);
     }
 
 private:
-    InputInterface<rmcs_msgs::SerialInterface> serial_;
+    InputInterface<hcs_msgs::SerialInterface> serial_;
     Frame frame_;
 
     Field empty_field_;
@@ -101,8 +101,8 @@ private:
     std::chrono::steady_clock::time_point text_display_next_sent_;
 };
 
-} // namespace rmcs_core::referee
+} // namespace hcs_core::referee
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::Command, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::Command, hcs_executor::Component)

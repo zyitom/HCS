@@ -1,5 +1,6 @@
 #pragma once
 #include <format>
+#include <stdexcept>
 #include <rclcpp/node_options.hpp>
 
 namespace hcs_utility {
@@ -31,13 +32,15 @@ struct NodeMixin {
 
     template <typename T>
     auto param(this const auto& self, const std::string& name, T& dst) {
-        if (self.has_parameter(name)) {
-            dst = self.template get_parameter_or<T>(name, T{});
-            return;
+        if (!self.has_parameter(name)) {
+            self.error("param [ {} ] for {} is needed", name, self.get_name());
+            throw std::runtime_error{"lack of param"};
         }
 
-        self.error("param [ {} ] for {} is needed", name, self.get_name());
-        throw std::runtime_error{"lack of param"};
+        // 必须走 get_value<T>:参数存在但类型不符时它会抛出来。
+        // get_parameter_or 在类型不符时静默回退到传入的默认值 —— 配错类型的
+        // 参数会无声消失,而拿到的 T{} 看起来完全正常。
+        dst = self.get_parameter(name).get_value<T>();
     }
     template <typename T1, typename T2>
     auto param_or(this const auto& self, const std::string& name, T1& dst, const T2& fallback)

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -20,7 +21,7 @@ namespace hcs_core::hardware::device {
 
 class DmMotor {
 public:
-    enum class Type : uint8_t { kJ4310 };
+    enum class Type : uint8_t { kJ4310, kJ8009};
 
     /// Motor status, carried in the high nibble of feedback D[0].
     enum class Error : uint8_t {
@@ -53,6 +54,13 @@ public:
                 velocity_max = 30.0;
                 torque_max   = 10.0;
                 break;
+            case Type::kJ8009:
+                // Copied from the RMCS driver, not yet checked against a J8009 manual.
+                position_max = 12.5;
+                velocity_max = 45.0;
+                torque_max   = 54.0;
+                break;
+            default: std::unreachable();
             }
             this->reversed                 = false;
             this->multi_turn_angle_enabled = false;
@@ -65,6 +73,7 @@ public:
             return kp = kp_value, kd = kd_value, *this;
         }
         Config& set_encoder_zero_point(int value) { return encoder_zero_point = value, *this; }
+        Config& set_zero_angle(double value) { return zero_angle = value, *this; }
         Config& set_reduction_ratio(double value) { return reduction_ratio = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
@@ -94,6 +103,13 @@ public:
         /// Raw feedback value treated as zero angle. The default trusts the zero point stored
         /// in the driver itself, i.e. the result of the "save zero position" frame.
         int encoder_zero_point = kRawAngleZero;
+
+        /// Zero as an angle in the driver's own position frame (rad, as the feedback frame
+        /// decodes it: before reversed and reduction_ratio). Takes precedence over
+        /// encoder_zero_point. The raw position is scaled by position_max, so the same physical
+        /// zero is a different raw count under a different PMAX; giving it as an angle keeps it
+        /// valid when position_max is corrected to match a re-flashed register.
+        std::optional<double> zero_angle;
 
         /// External gearbox only. The 10:1 stage inside a J4310 is already accounted for by the
         /// driver, whose feedback is output shaft referred. Note that kp / kd are driver side
@@ -157,7 +173,14 @@ public:
         esc_id_    = config.esc_id;
         master_id_ = config.master_id;
 
-        encoder_zero_point_ = config.encoder_zero_point & (kRawAngleModulus - 1);
+        // Inverse of the DM decode angle = raw * 2PMAX / 65535 - PMAX, so the driver's own
+        // position zero_angle lands exactly on raw zero here.
+        const int encoder_zero_point =
+            config.zero_angle ? static_cast<int>(std::lround(
+                                    (*config.zero_angle + config.position_max) * kRawAngleMax
+                                    / (2 * config.position_max)))
+                              : config.encoder_zero_point;
+        encoder_zero_point_ = encoder_zero_point & (kRawAngleModulus - 1);
 
         multi_turn_angle_enabled_ = config.multi_turn_angle_enabled;
         multi_turn_encoder_count_ = 0;
@@ -214,9 +237,10 @@ public:
             return;
 
         // The fixed extent overload is noexcept; the dynamic one throws. This runs on the
-        // transport thread, where nothing may throw.
+        // transport thread, where nothing may throw. Release pairs with the acquire in
+        // update_status(): a new sequence must never be seen ahead of the packet it counts.
         can_packet_.store(CanPacket8{can_data.first<8>()}, std::memory_order::relaxed);
-        sequence_.fetch_add(1, std::memory_order::relaxed);
+        sequence_.fetch_add(1, std::memory_order::release);
     }
 
     auto id() const noexcept -> std::uint32_t { return esc_id_; }
@@ -226,14 +250,27 @@ public:
     bool match_then_store_status(std::uint32_t can_id, std::span<const std::byte> can_data) {
         if (can_id != recv_id())
             return false;
+        // Claimed even when rejected below: the frame id is ours, no other device on this bus
+        // may decode it either.
+        if (can_data.size() == 8 && !feedback_from_this_motor(can_data[0])) [[unlikely]] {
+            foreign_frame_count_.fetch_add(1, std::memory_order::relaxed);
+            return true;
+        }
         store_status(can_data);
         return true;
+    }
+
+    /// Frames that arrived on our feedback id but carried another motor's id in D[0]. Nonzero
+    /// means two drivers share one MST_ID register: their feedback interleaves on this id, and
+    /// without the check the angle would jump between two motors with no error at all.
+    std::uint32_t foreign_frame_count() const {
+        return foreign_frame_count_.load(std::memory_order::relaxed);
     }
 
     /// Must be called once per control cycle: the offline watchdog and the clear error backoff
     /// are both counted in calls.
     void update_status() {
-        const auto sequence = sequence_.load(std::memory_order::relaxed);
+        const auto sequence = sequence_.load(std::memory_order::acquire);
         if (sequence != last_sequence_) {
             last_sequence_ = sequence;
             received_      = true;
@@ -331,6 +368,12 @@ public:
     Error error() const { return error_; }
     bool enabled() const { return error_ == Error::kEnabled; }
     bool online() const { return online_; }
+    /// True once any feedback frame has been decoded.
+    bool received() const { return received_; }
+    /// A reported fault, as opposed to the two plain enable states. The driver keeps clearing it
+    /// on its own (see generate_command()); whether that is allowed to put torque back on the
+    /// joint is the caller's decision, which is why this is exposed at all.
+    bool faulted() const { return error_ != Error::kDisabled && error_ != Error::kEnabled; }
 
     /// @brief Bring the motor out of the power-on default state. Until this is acknowledged the
     /// driver ignores every control frame, so it is the first thing any DM motor needs.
@@ -462,6 +505,13 @@ public:
     }
 
 private:
+    /// D[0] is ID | ERR << 4. The manual calls ID "the low 8 bits of CAN_ID", but ERR takes the
+    /// high nibble of the same byte, so only the low nibble of the id survives; compare that
+    /// much and no more. ESC_ID is what the motor reports here, not MST_ID.
+    bool feedback_from_this_motor(std::byte d0) const {
+        return (std::to_integer<std::uint32_t>(d0) & 0x0F) == (esc_id_ & 0x0F);
+    }
+
     /// Enable, disable, clear error and save zero all share this shape.
     constexpr static CanPacket8 generate_control_frame(uint8_t id) {
         const struct [[gnu::packed]] {
@@ -536,6 +586,7 @@ private:
     std::atomic<CanPacket8> can_packet_;
     std::atomic<std::uint32_t> sequence_ = 0;
     std::uint32_t last_sequence_ = 0;
+    std::atomic<std::uint32_t> foreign_frame_count_ = 0;
 
     bool received_ = false;
     Error error_ = Error::kDisabled;

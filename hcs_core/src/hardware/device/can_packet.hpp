@@ -12,6 +12,9 @@
 
 namespace hcs_core::hardware::device {
 
+// 经字节视图序列化的多字节字段按主机序上线，此处为所有使用方的总闸。
+static_assert(std::endian::native == std::endian::little, "byte view assumes a LE host");
+
 template <typename T, size_t align = alignof(T)>
 requires(std::is_trivial_v<T>) struct ByteConvertible {
     alignas(align) T data;

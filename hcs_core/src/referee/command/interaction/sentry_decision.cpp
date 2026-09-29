@@ -5,27 +5,27 @@
 #include <array>
 #include <cstdint>
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/full_robot_id.hpp>
-#include <rmcs_msgs/robot_id.hpp>
-#include <rmcs_msgs/sentry_event.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/full_robot_id.hpp>
+#include <hcs_msgs/robot_id.hpp>
+#include <hcs_msgs/sentry_event.hpp>
 #include <unordered_map>
 #include <unordered_set>
 
-namespace rmcs_core::referee::command::interaction {
+namespace hcs_core::referee::command::interaction {
 
 class SentryDecision
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     using Command = status::SentryCommand;
     using Posture = Command::Posture;
-    using SentryEvent = rmcs_msgs::SentryEvent;
+    using SentryEvent = hcs_msgs::SentryEvent;
     using EventCounts = std::unordered_map<SentryEvent, std::uint16_t>;
     using Clock = std::chrono::steady_clock;
 
     InputInterface<EventCounts> sentry_events_;
-    InputInterface<rmcs_msgs::RobotId> robot_id_;
+    InputInterface<hcs_msgs::RobotId> robot_id_;
     InputInterface<std::uint8_t> sentry_posture_fb_;
     InputInterface<std::uint16_t> robot_hp_fb_;
     InputInterface<std::uint8_t> energy_core_status_;
@@ -85,7 +85,7 @@ public:
               rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)} {
 
         register_input("/referee/id", robot_id_);
-        register_input("/rmcs_navigation/sentry_events", sentry_events_, false);
+        register_input("/hcs_navigation/sentry_events", sentry_events_, false);
         register_input("/referee/sentry/posture", sentry_posture_fb_, false);
         register_input("/referee/current_hp", robot_hp_fb_, false);
         register_input(
@@ -108,8 +108,8 @@ public:
             can_rebirth_free_.make_and_bind_directly(false);
     }
 
-    auto update() -> void override {
-        if (*robot_id_ == rmcs_msgs::RobotId::UNKNOWN) {
+    auto update(const hcs_sync::Tick&) -> void HCS_NONBLOCKING override {
+        if (*robot_id_ == hcs_msgs::RobotId::UNKNOWN) {
             *sentry_decision_field_ = Field{};
             return;
         }
@@ -152,10 +152,10 @@ private:
             return;
         }
 
-        const auto id = rmcs_msgs::FullRobotId{*robot_id_};
+        const auto id = hcs_msgs::FullRobotId{*robot_id_};
         header_.command_id = 0x0120;
         header_.sender_id = id;
-        header_.receiver_id = rmcs_msgs::FullRobotId::REFEREE_SERVER;
+        header_.receiver_id = hcs_msgs::FullRobotId::REFEREE_SERVER;
 
         for (const auto event : kEventPriority) {
             if (!requests_.contains(event))
@@ -236,8 +236,8 @@ private:
     }
 };
 
-} // namespace rmcs_core::referee::command::interaction
+} // namespace hcs_core::referee::command::interaction
 
 #include <pluginlib/class_list_macros.hpp>
 PLUGINLIB_EXPORT_CLASS(
-    rmcs_core::referee::command::interaction::SentryDecision, rmcs_executor::Component)
+    hcs_core::referee::command::interaction::SentryDecision, hcs_executor::Component)

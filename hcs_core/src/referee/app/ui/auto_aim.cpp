@@ -7,16 +7,16 @@
 #include <string>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_description/tf_description.hpp>
-#include <rmcs_executor/component.hpp>
+#include <hcs_description/tf_description.hpp>
+#include <hcs_executor/component.hpp>
 
 #include "referee/app/ui/shape/shape.hpp"
 
-namespace rmcs_core::referee::app::ui {
-using namespace rmcs_description;
+namespace hcs_core::referee::app::ui {
+using namespace hcs_description;
 
 class AutoAimUi
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     AutoAimUi()
@@ -37,7 +37,7 @@ public:
         register_input("/auto_aim/single_shoot", single_shoot_, true);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         const auto type = *single_shoot_ ? "RUNE" : "ARMOR";
 
         if (!robot_center_->allFinite() || robot_center_->isZero()) {
@@ -218,7 +218,7 @@ private:
     }
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui
 
 #include <pluginlib/class_list_macros.hpp>
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::app::ui::AutoAimUi, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::app::ui::AutoAimUi, hcs_executor::Component)

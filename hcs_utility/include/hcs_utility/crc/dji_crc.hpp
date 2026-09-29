@@ -2,13 +2,34 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace hcs_utility::dji_crc {
 namespace internal {
 
-template <typename TailT, typename T>
-inline auto& get_tail(T& data) {
-    return *reinterpret_cast<TailT*>(reinterpret_cast<size_t>(&data) + sizeof(T) - sizeof(uint8_t));
+// 帧里的 CRC 字段天生可能落在任意字节偏移上(packed 结构、奇地址缓冲)。
+// 直接 reinterpret_cast<uint16_t*> 读写是非对齐访问 + 严格别名双重 UB ——
+// x86 上碰巧能跑,UBSan 一开就炸。经 memcpy 的 load/store 在所有平台上
+// 都编译成同样的一条(可能非对齐的)普通访存指令,字节序也与原实现逐位相同。
+
+inline uint16_t load_u16(const void* address) {
+    uint16_t value = 0;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+inline void store_u16(void* address, uint16_t value) {
+    std::memcpy(address, &value, sizeof(value));
+}
+
+inline uint8_t load_u8(const void* address) {
+    uint8_t value = 0;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+inline void store_u8(void* address, uint8_t value) {
+    std::memcpy(address, &value, sizeof(value));
 }
 
 constexpr uint8_t crc8_init = 0xff;
@@ -67,9 +88,12 @@ inline uint8_t calculate_crc8(const void* data, size_t length) {
 }
 
 inline bool verify_crc8(const void* data, size_t length) {
+    if (length < sizeof(uint8_t))
+        return false;
     auto checksum = calculate_crc8(data, length - sizeof(uint8_t));
-    return checksum == *(reinterpret_cast<const uint8_t*>(data) + length - sizeof(uint8_t));
+    return checksum == internal::load_u8(static_cast<const uint8_t*>(data) + length - sizeof(uint8_t));
 }
+
 template <typename T>
 inline bool verify_crc8(const T& package) {
     static_assert(sizeof(T) > sizeof(uint8_t));
@@ -77,8 +101,10 @@ inline bool verify_crc8(const T& package) {
 }
 
 inline void append_crc8(void* data, size_t length) {
+    if (length < sizeof(uint8_t))
+        return;
     auto checksum = calculate_crc8(data, length - sizeof(uint8_t));
-    *(reinterpret_cast<uint8_t*>(data) + length - sizeof(uint8_t)) = checksum;
+    internal::store_u8(static_cast<uint8_t*>(data) + length - sizeof(uint8_t), checksum);
 }
 template <typename T>
 inline void append_crc8(T& package) {
@@ -96,10 +122,11 @@ inline uint16_t calculate_crc16(const void* data, size_t length) {
 }
 
 inline bool verify_crc16(const void* data, size_t length) {
+    if (length < sizeof(uint16_t))
+        return false;
     auto checksum = calculate_crc16(data, length - sizeof(uint16_t));
     return checksum
-        == *reinterpret_cast<const uint16_t*>(
-               reinterpret_cast<const uint8_t*>(data) + length - sizeof(uint16_t));
+        == internal::load_u16(static_cast<const uint8_t*>(data) + length - sizeof(uint16_t));
 }
 template <typename T>
 inline bool verify_crc16(const T& package) {
@@ -108,9 +135,10 @@ inline bool verify_crc16(const T& package) {
 }
 
 inline void append_crc16(void* data, size_t length) {
+    if (length < sizeof(uint16_t))
+        return;
     auto checksum = calculate_crc16(data, length - sizeof(uint16_t));
-    *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(data) + length - sizeof(uint16_t)) =
-        checksum;
+    internal::store_u16(static_cast<uint8_t*>(data) + length - sizeof(uint16_t), checksum);
 }
 template <typename T>
 inline void append_crc16(T& package) {

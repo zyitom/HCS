@@ -5,6 +5,9 @@
 
 namespace hcs_msgs {
 
+// 位域依赖小端主机 + GCC/Clang LSB-first（left=bit0）。
+static_assert(std::endian::native == std::endian::little, "bitmap assumes a LE host");
+
 struct __attribute__((packed)) Mouse {
     constexpr static inline Mouse zero() {
         constexpr uint8_t zero = 0;

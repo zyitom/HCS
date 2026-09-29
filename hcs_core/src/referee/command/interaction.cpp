@@ -1,12 +1,16 @@
+#include <bit>
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
+#include <hcs_executor/component.hpp>
 
 #include "referee/command/field.hpp"
 
-namespace rmcs_core::referee::command {
+// InteractionHeader 原生 u16 packed 依赖小端主机。
+static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
+
+namespace hcs_core::referee::command {
 
 class Interaction
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     Interaction()
@@ -31,7 +35,7 @@ public:
             ui_field_.bind_directly(empty_field_);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         if (*sentry_decision_field_)
             *interaction_field_ = *sentry_decision_field_;
         else if (*communicate_field_)
@@ -58,8 +62,8 @@ private:
     OutputInterface<Field> interaction_field_;
 };
 
-} // namespace rmcs_core::referee::command
+} // namespace hcs_core::referee::command
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::command::Interaction, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::command::Interaction, hcs_executor::Component)
