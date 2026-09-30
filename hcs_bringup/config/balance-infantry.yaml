@@ -205,7 +205,7 @@ right_leg_joint_controller:
 # ── 云台（RMCS 通用链；PID 从 Helios gimbal.cpp 起步，§4.5）─────────────────
 # 链路：/remote/* → SimpleGimbalController → control_angle_error
 #       → ErrorPidController（角度环）→ control_velocity
-#       → PidController（速度环，测量 /gimbal/{yaw,pitch}/velocity_imu）→ control_torque
+#       → PidController（速度环，测量 /gimbal/imu/angular_velocity/{y,z}）→ control_torque
 # yaw 是 LK MG5010（力矩命令），pitch 是 DM（MIT 纯力矩）。
 # Helios 的 yaw 速度环输出是 LK 电流计数值（MaxOut 2048 ↔ 33 A），按
 # 33/2048·kt(0.1)·减速比(10) ≈ 0.0161 N·m/计数 折算成 N·m；pitch 直接是
@@ -229,7 +229,7 @@ yaw_angle_pid_controller:
 
 yaw_velocity_pid_controller:
   ros__parameters:
-    measurement: /gimbal/yaw/velocity_imu
+    measurement: /gimbal/imu/angular_velocity/z
     setpoint: /gimbal/yaw/control_velocity
     control: /gimbal/yaw/control_torque
     kp: 3.9     # Helios 240 计数 × 0.0161 N·m/计数
@@ -254,7 +254,7 @@ pitch_angle_pid_controller:
 
 pitch_velocity_pid_controller:
   ros__parameters:
-    measurement: /gimbal/pitch/velocity_imu
+    measurement: /gimbal/imu/angular_velocity/y
     setpoint: /gimbal/pitch/control_velocity
     control: /gimbal/pitch/control_torque
     kp: 38.0

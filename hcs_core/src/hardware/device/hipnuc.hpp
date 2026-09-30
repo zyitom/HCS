@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <limits>
 #include <numbers>
 #include <span>
 #include <string>
@@ -85,6 +86,24 @@ public:
         status_component.register_output(
             name_prefix + "/acceleration", acceleration_output_, Eigen::Vector3d::Zero());
         status_component.register_output(name_prefix + "/online", online_output_, false);
+
+        // 逐轴标量。结构化输出（上面三个向量）给需要整个量的消费者（自瞄吃四元数、
+        // 估计器吃加速度）；标量给只读一路的消费者（云台速度环、姿态角）。
+        // 轴名由**传感器**决定——一个 IMU 就是 roll/pitch/yaw 三轴，与下游要什么无关，
+        // 所以这里不再需要别处的适配表去替它挑轴。
+        // ⚠ 欧拉角的 roll/pitch/yaw 只是名字：heading 零点随 Config::module_frame 变
+        //   （ENU 东 / NWU 北），换 module_frame 等于换 yaw 的零偏，消费侧要重新标定。
+        // ⚠ 初值 NaN 而非 0：这三个是姿态量，没有"零姿态"这种合法默认；NaN 也让
+        //   组件隔离后的复位值天然带着"不可用"语义。角速度的零是合法的，用 0。
+        status_component.register_output(name_prefix + "/euler/roll", euler_roll_, kNan);
+        status_component.register_output(name_prefix + "/euler/pitch", euler_pitch_, kNan);
+        status_component.register_output(name_prefix + "/euler/yaw", euler_yaw_, kNan);
+        status_component.register_output(
+            name_prefix + "/angular_velocity/x", angular_velocity_x_, 0.0);
+        status_component.register_output(
+            name_prefix + "/angular_velocity/y", angular_velocity_y_, 0.0);
+        status_component.register_output(
+            name_prefix + "/angular_velocity/z", angular_velocity_z_, 0.0);
 
         configure(Config{});
     }
@@ -178,6 +197,15 @@ public:
         *angular_velocity_output_ = angular_velocity();
         *acceleration_output_ = acceleration();
         *online_output_ = online();
+
+        const Eigen::Vector3d& euler = euler_angles();
+        *euler_roll_ = euler[0];
+        *euler_pitch_ = euler[1];
+        *euler_yaw_ = euler[2];
+
+        *angular_velocity_x_ = angular_velocity_[0];
+        *angular_velocity_y_ = angular_velocity_[1];
+        *angular_velocity_z_ = angular_velocity_[2];
     }
 
     // Attitude of the FLU body frame relative to the module world frame. World origin depends on
@@ -431,6 +459,17 @@ private:
     Component::OutputInterface<Eigen::Vector3d> angular_velocity_output_;
     Component::OutputInterface<Eigen::Vector3d> acceleration_output_;
     Component::OutputInterface<bool> online_output_;
+
+    // 逐轴标量输出。都是 double（平凡可拷贝），所以 register_output 会给它们装复位钩子：
+    // 组件被隔离时这几个会回到初值，而上面三个向量输出不会（Eigen 类型非平凡）。
+    // 姿态用 NaN 初值，角速度用 0，理由见构造函数。
+    static constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
+    Component::OutputInterface<double> euler_roll_;
+    Component::OutputInterface<double> euler_pitch_;
+    Component::OutputInterface<double> euler_yaw_;
+    Component::OutputInterface<double> angular_velocity_x_;
+    Component::OutputInterface<double> angular_velocity_y_;
+    Component::OutputInterface<double> angular_velocity_z_;
 };
 
 } // namespace hcs_core::hardware::device

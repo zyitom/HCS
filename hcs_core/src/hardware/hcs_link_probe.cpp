@@ -424,7 +424,8 @@ private:
         } else if (mc02_) {
             auto builder = mc02_->start_transmit();
             for (std::uint32_t i = 0; i < frames; ++i)
-                builder.can1_transmit(next_frame(payloads[i], start_ns));
+                builder.can_transmit(
+                    libhcs::board::hcs::CanPort::kCan1, next_frame(payloads[i], start_ns));
         }
 
         const auto done_ns = to_ns(hcs_sync::Clock::now());

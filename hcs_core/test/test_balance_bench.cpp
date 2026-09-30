@@ -79,12 +79,8 @@ public:
         register_joint_interfaces("right_back");
         register_output("/chassis/left_wheel/velocity", left_wheel_velocity_, 0.0);
         register_output("/chassis/right_wheel/velocity", right_wheel_velocity_, 0.0);
-        register_output("/chassis/imu/pitch", imu_pitch_, 0.0);
-        register_output("/chassis/imu/roll", imu_roll_, 0.0);
-        register_output("/chassis/imu/yaw", imu_yaw_, 0.0);
-        register_output("/chassis/imu/pitch_rate", imu_pitch_rate_, 0.0);
-        register_output("/chassis/imu/roll_rate", imu_roll_rate_, 0.0);
-        register_output("/chassis/imu/yaw_rate", imu_yaw_rate_, 0.0);
+        register_output("/chassis/imu/euler", imu_euler_, Eigen::Vector3d::Zero());
+        register_output("/chassis/imu/angular_velocity", imu_angular_velocity_, Eigen::Vector3d::Zero());
         register_output("/chassis/imu/acceleration", imu_acceleration_, Eigen::Vector3d::Zero());
     }
 
@@ -99,11 +95,12 @@ public:
         }
         *left_wheel_velocity_  = 2.5 * std::sin(t) + 0.5 * noise_.next();
         *right_wheel_velocity_ = 2.5 * std::sin(t) + 0.8 * std::sin(0.3 * t) + 0.5 * noise_.next();
-        *imu_pitch_ = 0.1 * std::sin(3.0 * t);
-        *imu_roll_  = 0.06 * std::cos(2.3 * t);
-        *imu_pitch_rate_ = 0.3 * std::cos(3.0 * t) + 0.1 * noise_.next();
-        *imu_roll_rate_  = 0.2 * std::sin(2.3 * t) + 0.1 * noise_.next();
-        *imu_yaw_rate_   = 0.5 * std::sin(0.7 * t) + 0.1 * noise_.next();
+        // 欧拉角分量顺序 roll/pitch/yaw，与 Hipnuc 的 euler_angles() 一致
+        *imu_euler_ = Eigen::Vector3d{0.06 * std::cos(2.3 * t), 0.1 * std::sin(3.0 * t), 0.0};
+        *imu_angular_velocity_ = Eigen::Vector3d{
+            0.2 * std::sin(2.3 * t) + 0.1 * noise_.next(),
+            0.3 * std::cos(3.0 * t) + 0.1 * noise_.next(),
+            0.5 * std::sin(0.7 * t) + 0.1 * noise_.next()};
     }
 
 private:
@@ -127,12 +124,8 @@ private:
     std::array<OutputInterface<double>, 4> joint_torque_feedbacks_{};
     OutputInterface<double> left_wheel_velocity_;
     OutputInterface<double> right_wheel_velocity_;
-    OutputInterface<double> imu_pitch_;
-    OutputInterface<double> imu_roll_;
-    OutputInterface<double> imu_yaw_;
-    OutputInterface<double> imu_pitch_rate_;
-    OutputInterface<double> imu_roll_rate_;
-    OutputInterface<double> imu_yaw_rate_;
+    OutputInterface<Eigen::Vector3d> imu_euler_;
+    OutputInterface<Eigen::Vector3d> imu_angular_velocity_;
     OutputInterface<Eigen::Vector3d> imu_acceleration_;
 };
 

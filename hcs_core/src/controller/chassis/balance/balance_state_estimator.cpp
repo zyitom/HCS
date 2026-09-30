@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <numbers>
 #include <string>
 
@@ -49,12 +50,11 @@ public:
         register_leg("right", right_);
         register_input("/chassis/left_wheel/velocity", wheel_velocity_left_);
         register_input("/chassis/right_wheel/velocity", wheel_velocity_right_);
-        register_input("/chassis/imu/pitch", imu_pitch_);
-        register_input("/chassis/imu/roll", imu_roll_);
-        register_input("/chassis/imu/yaw", imu_yaw_);
-        register_input("/chassis/imu/pitch_rate", imu_pitch_rate_);
-        register_input("/chassis/imu/roll_rate", imu_roll_rate_);
-        register_input("/chassis/imu/yaw_rate", imu_yaw_rate_);
+        // 姿态与角速度取整条向量，不看逐轴标量：这里本来就要做轴选择
+        // （euler_swap）和符号/零偏折算，选哪一轴是**这个估计器**的决定，
+        // 不该由驱动层预先切开。轴语义见 update_body_attitude()。
+        register_input("/chassis/imu/euler", imu_euler_);
+        register_input("/chassis/imu/angular_velocity", imu_angular_velocity_);
         register_input("/chassis/imu/acceleration", imu_acceleration_);
         register_output("/chassis/balance/pitch", body_pitch_, nan_);
         register_output("/chassis/balance/pitch_rate", body_pitch_rate_, nan_);
@@ -173,14 +173,23 @@ private:
         // 欧拉角折算。ROS 标准（REP-103）正装：机体 pitch = 传感器 pitch，
         // 恒等映射；Helios 的 CH100 是驱动里软件重映射的轴（pitch 从传感器
         // roll 来、还带镜像），那套 swap/符号只在复刻它的安装时才需要。
-        const double a = euler_swap_ ? *imu_roll_ : *imu_pitch_;
-        const double b = euler_swap_ ? *imu_pitch_ : *imu_roll_;
+        //
+        // 轴分量在这里取，而不是让驱动预先切成话题：驱动只保证"euler 的
+        // 第 0/1/2 分量是 roll/pitch/yaw"，怎么映射到机体轴是这边的事。
+        const double sensor_roll = (*imu_euler_)[0];
+        const double sensor_pitch = (*imu_euler_)[1];
+        const double sensor_roll_rate = (*imu_angular_velocity_)[0];
+        const double sensor_pitch_rate = (*imu_angular_velocity_)[1];
+        const double sensor_yaw_rate = (*imu_angular_velocity_)[2];
+
+        const double a = euler_swap_ ? sensor_roll : sensor_pitch;
+        const double b = euler_swap_ ? sensor_pitch : sensor_roll;
         *body_pitch_ = pitch_sign_ * a + pitch_offset_;
         *body_roll_ = roll_sign_ * b + roll_offset_;
-        *body_yaw_ = wrap_angle(*imu_yaw_);
-        *body_pitch_rate_ = pitch_sign_ * (euler_swap_ ? *imu_roll_rate_ : *imu_pitch_rate_);
-        *body_roll_rate_ = roll_sign_ * (euler_swap_ ? *imu_pitch_rate_ : *imu_roll_rate_);
-        *body_yaw_rate_ = *imu_yaw_rate_;
+        *body_yaw_ = wrap_angle((*imu_euler_)[2]);
+        *body_pitch_rate_ = pitch_sign_ * (euler_swap_ ? sensor_roll_rate : sensor_pitch_rate);
+        *body_roll_rate_ = roll_sign_ * (euler_swap_ ? sensor_pitch_rate : sensor_roll_rate);
+        *body_yaw_rate_ = sensor_yaw_rate;
     }
 
     void update_leg(LegEstimate& leg, double side_sign, double dt) {
@@ -336,12 +345,8 @@ private:
     LegEstimate right_;
     InputInterface<double> wheel_velocity_left_;
     InputInterface<double> wheel_velocity_right_;
-    InputInterface<double> imu_pitch_;
-    InputInterface<double> imu_roll_;
-    InputInterface<double> imu_yaw_;
-    InputInterface<double> imu_pitch_rate_;
-    InputInterface<double> imu_roll_rate_;
-    InputInterface<double> imu_yaw_rate_;
+    InputInterface<Eigen::Vector3d> imu_euler_;
+    InputInterface<Eigen::Vector3d> imu_angular_velocity_;
     InputInterface<Eigen::Vector3d> imu_acceleration_;
 
     // ── 输出 ─────────────────────────────────────────────────────────────

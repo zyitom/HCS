@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <format>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <ranges>
@@ -91,54 +90,6 @@ device::DmMotor::Config leg_joint(std::uint32_t esc_id, std::uint32_t master_id,
 
 using ImuFrame = device::Hipnuc::Config::ModuleFrame;
 
-constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
-
-// IMU 标量话题表，一行一个话题：下游 PID / 估计器只吃 double，这里写明取 Hipnuc 的
-// 哪个量、哪个分量。Hipnuc 输出已是 FLU，欧拉角分量顺序是 roll/pitch/yaw。
-struct ImuScalar {
-    const char* topic;
-    const Eigen::Vector3d& (device::Hipnuc::*vector)() const;
-    Eigen::Index axis; // 0/1/2 = x/y/z = roll/pitch/yaw
-};
-
-constexpr auto kEuler = &device::Hipnuc::euler_angles;
-constexpr auto kGyro = &device::Hipnuc::angular_velocity;
-
-constexpr std::array kGimbalImuScalars{
-    ImuScalar{"/gimbal/yaw/velocity_imu", kGyro, 2},
-    ImuScalar{"/gimbal/pitch/velocity_imu", kGyro, 1},
-};
-
-constexpr std::array kChassisImuScalars{
-    ImuScalar{"/chassis/imu/roll", kEuler, 0},
-    ImuScalar{"/chassis/imu/pitch", kEuler, 1},
-    ImuScalar{"/chassis/imu/yaw", kEuler, 2},
-    ImuScalar{"/chassis/imu/roll_rate", kGyro, 0},
-    ImuScalar{"/chassis/imu/pitch_rate", kGyro, 1},
-    ImuScalar{"/chassis/imu/yaw_rate", kGyro, 2},
-};
-
-// 适配器：按表把一个 Hipnuc 的向量量拆成标量输出，注册和发布走同一张表。
-// 初值 NaN 即组件隔离时的复位值。
-template <const auto& kScalars>
-class ImuScalarOutputs {
-public:
-    ImuScalarOutputs(hcs_executor::Component& component, const device::Hipnuc& imu)
-        : imu_{imu} {
-        for (auto&& [scalar, output] : std::views::zip(kScalars, outputs_))
-            component.register_output(scalar.topic, output, kNan);
-    }
-
-    void publish() HCS_NONBLOCKING {
-        for (auto&& [scalar, output] : std::views::zip(kScalars, outputs_))
-            *output = std::invoke(scalar.vector, imu_)[scalar.axis];
-    }
-
-private:
-    const device::Hipnuc& imu_;
-    std::array<hcs_executor::Component::OutputInterface<double>, kScalars.size()> outputs_;
-};
-
 } // namespace
 
 // ============================================================================
@@ -163,6 +114,17 @@ class BalanceInfantry
 
     void for_each_motor(this auto& self, auto&& f) {
         std::apply([&](auto&... motor) { (f(motor), ...); }, self.motors());
+    }
+
+    // 每块板上真实挂了东西的 CAN 路数（= 接线表里该板上最高的端口号），只从接线表推，
+    // 不抄板卡参数。EP0 配置与上车前核对都读这一个来源。
+    auto wired_can_count(this auto const& self) {
+        std::array<std::uint8_t, kBoards.size()> required{};
+        self.for_each_motor([&](const auto& motor) {
+            auto& count = required[board_index(motor.bus.board)];
+            count = std::max(count, std::to_underlying(motor.bus.port));
+        });
+        return required;
     }
 
     // 失效即无法平衡的设备，顺序即 kCriticalNames 与 SafetyLatch::tripped_device() 的下标。
@@ -204,7 +166,7 @@ public:
         // 板卡构造期就可能回调，放在所有它会碰的数据都就位之后
         for (const auto board : {Board::kGimbal, Board::kChassis, Board::kAux})
             create_board(board);
-        check_classic_can();
+        check_can_coverage();
 
         transmitter_ = std::make_unique<util::BoardTransmitter>(
             std::array{boards_[0].get(), boards_[1].get(), boards_[2].get()},
@@ -396,10 +358,8 @@ private:
     }
 
     // ── IMU 桥接 ─────────────────────────────────────────────────────────
+    // 标量输出由 Hipnuc 自己在 update_status() 里推，这里只挂 TF。
     void update_imu() HCS_NONBLOCKING {
-        gimbal_imu_scalars_.publish();
-        chassis_imu_scalars_.publish();
-
         tf_->set_state<hcs_description::GimbalCenterLink, hcs_description::YawLink>(yaw_.angle());
         tf_->set_state<hcs_description::YawLink, hcs_description::PitchLink>(pitch_.angle());
         tf_->set_transform<hcs_description::PitchLink, hcs_description::OdomImu>(
@@ -439,9 +399,19 @@ private:
         if (io_cpu >= 0)
             options.set_io_thread_affinity(static_cast<int>(io_cpu), static_cast<int>(io_priority));
 
-        // 波特率走构造期 Configuration：before-session 同步 apply 并读回，重连自动重发
+        // 波特率走构造期 Configuration：before-session 同步 apply 并读回，重连自动重发。
+        // 只设 baudrate，其余字段留 0 = "改速率、沿用固件当前的成帧"。
         libhcs::board::hcs::Configuration config;
-        config.uart_baudrate[0] = uart0_baudrate;
+        config.uart[0] = libhcs::board::hcs::UartSetting{.baudrate = uart0_baudrate};
+
+        // CAN 也走同一个 Configuration：接线表用到的每一路都是经典 CAN 2.0、1 Mbps。帧型与速率
+        // 是接线事实，写在这里经 EP0 握手下发；hpm5321 板端按它重初始化控制器并关掉 FD（总线只
+        // 支持 2.0，任何 FD 位都会让总线崩溃），自己回读确认，不符即构造失败；重连自动重放。
+        // 只有真挂了设备的总线才声明：闲置 CAN 上面接什么都不关这一台的事。
+        const auto wired = wired_can_count();
+        for (std::uint8_t bus = 0; bus < wired[board_index(board)]; ++bus)
+            config.can[bus] = libhcs::board::hcs::kClassic1M;
+
         const auto serial_filter = param<std::string>(key("serial_filter"), "");
         auto& slot = boards_[board_index(board)];
         slot = std::make_unique<libhcs::board::Hpm5321>(
@@ -452,42 +422,26 @@ private:
             throw std::runtime_error(
                 std::format("{}: board {} faulted at construction", get_component_name(), name));
 
-        // 再读回一道：失配超 5% 起不来
-        const std::uint32_t effective = slot->uart0_baudrate();
-        const auto drift = effective > uart0_baudrate ? effective - uart0_baudrate
-                                                      : uart0_baudrate - effective;
-        if (std::uint64_t{drift} * 100U > std::uint64_t{uart0_baudrate} * 5U)
-            throw std::runtime_error(std::format(
-                "{}: board {} uart0 asked {} baud but reads back {}; do not trust this link",
-                get_component_name(), name, uart0_baudrate, effective));
-
+        // 构造返回即说明板端已确认 UART0 与 CAN 帧型生效(被拒会在构造里抛), 不再回读。
         RCLCPP_INFO(
             get_logger(), "[%s] board %s: serial_filter='%s' io_cpu=%lld io_prio=%lld uart0=%u",
             get_component_name().c_str(), name, serial_filter.c_str(),
-            static_cast<long long>(io_cpu), static_cast<long long>(io_priority), effective);
+            static_cast<long long>(io_cpu), static_cast<long long>(io_priority), uart0_baudrate);
     }
 
-    // CAN 路数够用（按接线表推出）且全为经典 CAN 2.0
-    void check_classic_can() const {
-        std::array<std::uint8_t, kBoards.size()> required{};
-        for_each_motor([&](const auto& motor) {
-            auto& count = required[board_index(motor.bus.board)];
-            count = std::max(count, std::to_underlying(motor.bus.port));
-        });
+    // CAN 路数够用（按接线表推出）。模式不在这里查：接线表用到的每一路已在构造期
+    // 通过 Configuration.can_fd 向板卡声明为经典 CAN 2.0，模式不符在那一步就抛了。
+    void check_can_coverage() const {
+        const auto required = wired_can_count();
         for (std::size_t index = 0; index < boards_.size(); ++index) {
             if (!boards_[index])
                 continue;
             const auto name = kBoards[index].name;
-            const auto interface = boards_[index]->interface();
-            if (interface.can_count < required[index])
+            if (const auto can_count = boards_[index]->interface().can_count;
+                can_count < required[index])
                 throw std::runtime_error(std::format(
                     "{}: board {} carries CAN1..CAN{} but the wiring needs {} buses",
-                    get_component_name(), name, interface.can_count, required[index]));
-            if (interface.can_fd_mask != 0)
-                throw std::runtime_error(std::format(
-                    "{}: board {} reports CAN FD (mask=0x{:x}) but all motors are classic "
-                    "CAN 2.0; reflash the firmware",
-                    get_component_name(), name, interface.can_fd_mask));
+                    get_component_name(), name, can_count, required[index]));
         }
     }
 
@@ -665,8 +619,6 @@ private:
     // IMU 模块 flash 坐标系：云台 NWU（直通 FLU），底盘 ENU（驱动把 RFU 转 FLU）
     device::Hipnuc gimbal_imu_{*this, "/gimbal/imu", device::Hipnuc::Config{}.set_module_frame(ImuFrame::kNwu)};
     device::Hipnuc chassis_imu_{*this, "/chassis/imu", device::Hipnuc::Config{}.set_module_frame(ImuFrame::kEnu)};
-    ImuScalarOutputs<kGimbalImuScalars> gimbal_imu_scalars_{*this, gimbal_imu_};
-    ImuScalarOutputs<kChassisImuScalars> chassis_imu_scalars_{*this, chassis_imu_};
     device::Vt13 vt13_;
     device::RemoteControl remote_control_{*this};
 

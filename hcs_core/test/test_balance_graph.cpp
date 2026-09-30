@@ -60,12 +60,8 @@ public:
         register_output("/chassis/right_wheel/velocity", right_wheel_velocity_, 0.0);
 
 
-        register_output("/chassis/imu/pitch", imu_pitch_, 0.0);
-        register_output("/chassis/imu/roll", imu_roll_, 0.0);
-        register_output("/chassis/imu/yaw", imu_yaw_, 0.0);
-        register_output("/chassis/imu/pitch_rate", imu_pitch_rate_, 0.0);
-        register_output("/chassis/imu/roll_rate", imu_roll_rate_, 0.0);
-        register_output("/chassis/imu/yaw_rate", imu_yaw_rate_, 0.0);
+        register_output("/chassis/imu/euler", imu_euler_, Eigen::Vector3d::Zero());
+        register_output("/chassis/imu/angular_velocity", imu_angular_velocity_, Eigen::Vector3d::Zero());
         register_output("/chassis/imu/acceleration", imu_acceleration_, Eigen::Vector3d::Zero());
     }
 
@@ -92,12 +88,8 @@ private:
     std::array<InputInterface<double>, 4> joint_torques_{};
     OutputInterface<double> left_wheel_velocity_;
     OutputInterface<double> right_wheel_velocity_;
-    OutputInterface<double> imu_pitch_;
-    OutputInterface<double> imu_roll_;
-    OutputInterface<double> imu_yaw_;
-    OutputInterface<double> imu_pitch_rate_;
-    OutputInterface<double> imu_roll_rate_;
-    OutputInterface<double> imu_yaw_rate_;
+    OutputInterface<Eigen::Vector3d> imu_euler_;
+    OutputInterface<Eigen::Vector3d> imu_angular_velocity_;
     OutputInterface<Eigen::Vector3d> imu_acceleration_;
     InputInterface<double> left_wheel_torque_;
     InputInterface<double> right_wheel_torque_;
