@@ -23,20 +23,21 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/timer.hpp>
 
-#include <hcs_sync/tick.hpp>
-#include <hcs_sync/time_base.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/channel/time_base.hpp>
 
 #include "predefined_msg_provider.hpp"
 #include "hcs_executor/component.hpp"
 #include "hcs_executor/graph.hpp"
 #include "hcs_executor/wiring.hpp"
 #include "rt_reporter.hpp"
-#include "hcs_utility/doorbell.hpp"
-#include "hcs_utility/precise_sleep.hpp"
-#include "hcs_utility/realtime_arm.hpp"
-#include "hcs_utility/realtime_scope.hpp"
-#include "hcs_utility/rt_sampler.hpp"
-#include "hcs_utility/thread_config.hpp"
+#include "hcs_base/thread/doorbell.hpp"
+#include "hcs_base/check/machine_guard.hpp"
+#include "hcs_base/thread/precise_sleep.hpp"
+#include "hcs_base/thread/realtime_arm.hpp"
+#include "hcs_base/thread/realtime_scope.hpp"
+#include "rt_sampler.hpp"
+#include "hcs_base/thread/thread_config.hpp"
 
 // 逐组件计时默认关：开着的话每个组件每拍多两次 clock_gettime，
 // 在 1 kHz × 几十个组件的量级上这本身就是被测量的东西的一大部分。
@@ -86,6 +87,7 @@ public:
     /// 控制线程的实时武装失败会被原样 rethrow 到这里的调用方 —— 改造前那条路径只打一条
     /// WARN 就继续跑，结果是"以为自己是 RT，其实不是"，比直接起不来危险得多。
     void start() {
+        run_machine_guard();
         init();
 
         for (auto& component : component_list_)
@@ -177,6 +179,45 @@ public:
     }
 
 private:
+    /// 机器护栏：只读检查 USB 实时路径依赖的内核状态（RT 限流、xHCI 中断线程优先级与落核、
+    /// 中断核 C1、板卡枚举速度、bootloader 滞留……），判据来自 libhcs HOST_TUNING.md 的实测。
+    /// 放在调度器里而不是各个硬件组件里：每进程只该跑一次，而且新写的硬件组件不该有机会忘掉它。
+    ///
+    /// 参数 `machine_guard`：
+    ///   enforce（默认）有 kCritical 就拒绝启动 —— 与武装失败同一个道理：带着已知会掐死
+    ///                   RT 线程的内核状态跑起来，比直接起不来危险；
+    ///   warn            只打日志，照常启动（开发机、没调优的台架）；
+    ///   off             不检查。
+    void run_machine_guard() {
+        std::string mode;
+        get_parameter_or<std::string>("machine_guard", mode, "enforce");
+        if (mode == "off")
+            return;
+        if (mode != "enforce" && mode != "warn")
+            throw std::runtime_error{
+                "Parameter machine_guard must be one of enforce / warn / off, got '" + mode + "'"};
+
+        using Level = hcs_utility::MachineGuard::Level;
+        std::size_t critical_count = 0;
+        for (const auto& finding : hcs_utility::MachineGuard::run()) {
+            const char* text = finding.text.c_str();
+            switch (finding.level) {
+            case Level::kCritical:
+                ++critical_count;
+                RCLCPP_ERROR(get_logger(), "[machine] %s", text);
+                break;
+            case Level::kWarn: RCLCPP_WARN(get_logger(), "[machine] %s", text); break;
+            default: RCLCPP_INFO(get_logger(), "[machine] %s", text); break;
+            }
+        }
+
+        if (critical_count != 0 && mode == "enforce")
+            throw std::runtime_error{
+                std::to_string(critical_count)
+                + " critical machine finding(s) above; fix them (hcs_rt_tune.sh) or set "
+                  "machine_guard: warn to start anyway"};
+    }
+
     void thread_main(
         std::promise<void> armed, hcs_utility::ThreadConfig thread_config,
         hcs_utility::RealtimeArmOptions arm_options, std::chrono::nanoseconds period) {

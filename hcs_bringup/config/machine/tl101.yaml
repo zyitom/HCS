@@ -1,0 +1,23 @@
+# ---------------------------------------------------------------------------
+# 机器配置：TL101（i7-1165G7，4 核 8 线程，PREEMPT_RT，cmdline 带 isolcpus=3,7；
+# 3 和 7 是同一物理核的两个超线程）。
+#
+#   ros2 launch hcs_bringup hcs.launch.py robot:=balance-infantry            # 默认 machine:=tl101
+#   ros2 launch hcs_bringup hcs.launch.py robot:=balance-infantry machine:=none   # 不加载机器配置
+#
+# launch 先加载本文件、再加载机器人 yaml：机器人 yaml 里写了同名键就以机器人为准。
+# 这里只放 executor 这一层的机器事实（控制线程的核号与优先级、实时武装、两条尽力域线程）；
+# 各组件自己的线程（发送线程 tx_thread_config、板卡 IO 线程的核号与优先级）挂在组件实例名下，
+# 和具体机器人绑定，仍写在机器人 yaml 里 —— 换机器时那几行也要跟着改。
+#
+# 核号是机器事实，抄错了比不配还差。实测依据见 hcs_link.yaml 与 demo.yaml 的注释。
+# ---------------------------------------------------------------------------
+hcs_executor:
+  ros__parameters:
+    thread_config: "name=hcs-ctrl;policy=fifo;priority=90;cpus=3"
+    realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M"
+    reporter_thread_config: "name=hcs-report;policy=other;nice=5;cpus=0-2,4-6"
+    spin_thread_config: "name=hcs-spin;policy=other;nice=5;cpus=0-2,4-6"
+    # 有 Critical 级机器问题（RT 限流没关、xHCI 中断线程掉回 FIFO 50……）就拒绝启动。
+    # 临时要在没调优的机器上跑：machine_guard: "warn"。
+    machine_guard: "enforce"

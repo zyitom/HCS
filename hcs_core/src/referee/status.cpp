@@ -6,9 +6,9 @@
 #include <hcs_msgs/game_stage.hpp>
 #include <hcs_msgs/robot_id.hpp>
 #include <hcs_msgs/serial_interface.hpp>
-#include <hcs_utility/crc/dji_crc.hpp>
-#include <hcs_utility/package_receive.hpp>
-#include <hcs_utility/tick_timer.hpp>
+#include <hcs_base/protocol/dji_crc.hpp>
+#include <hcs_base/protocol/package_receive.hpp>
+#include <hcs_base/tick_timer.hpp>
 
 #include "referee/frame.hpp"
 #include "referee/status/field.hpp"

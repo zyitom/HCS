@@ -27,6 +27,10 @@ hcs_executor:
     #
     # 也就是说：绑核那一下值 441 us，其余全部旋钮加起来值 5 us。先绑核。
     thread_config: "name=hcs-ctrl;cpus=7"
+    # 下面两行压住 config/machine/tl101.yaml（launch 默认加载）：保持这份 demo 原来"不需要
+    # 任何权限"的形态——不武装 mlock，也不因为机器没调优而拒绝启动。
+    realtime_config: ""
+    machine_guard: "warn"
     #
     # 上面是不需要任何权限的形态。要拿满（p99 6 us / max 13 us）就用下面这组，
     # 但 policy=fifo 需要 rtprio、cpu_dma_latency 需要 CAP_SYS_ADMIN：
@@ -57,7 +61,7 @@ hcs_executor:
     # 重启后归零，别指望改过一次就一直生效。
 
     components:
-      - hcs_demo::hardware::DemoBoard -> demo_hardware
+      - hcs_core::hardware::DemoBoard -> demo_hardware
       # demo_hardware_command 由 create_partner_component 自动创建，不写在这里
 
       - hcs_core::controller::pid::PidController -> velocity_pid_controller

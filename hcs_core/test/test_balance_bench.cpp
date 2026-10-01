@@ -30,7 +30,7 @@
 #include <hcs_msgs/keyboard.hpp>
 #include <hcs_msgs/mouse.hpp>
 #include <hcs_msgs/switch.hpp>
-#include <hcs_sync/tick.hpp>
+#include <hcs_base/channel/tick.hpp>
 
 #include "controller/chassis/balance/balance_types.hpp"
 #include "controller/chassis/balance/nlmpc_solver.hpp"

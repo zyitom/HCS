@@ -8,7 +8,6 @@
 #include <format>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -24,16 +23,15 @@
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
 #include <hcs_executor/component.hpp>
-#include <hcs_sync/event_queue.hpp>
-#include <hcs_sync/snapshot.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/doorbell.hpp>
-#include <hcs_utility/doorbell_worker.hpp>
-#include <hcs_utility/machine_guard.hpp>
-#include <hcs_utility/rt_attributes.hpp>
-#include <hcs_utility/thread_config.hpp>
+#include <hcs_base/channel/event_queue.hpp>
+#include <hcs_base/channel/snapshot.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/doorbell.hpp>
+#include <hcs_base/thread/doorbell_worker.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
+#include <hcs_base/thread/thread_config.hpp>
 
-namespace hcs_demo::hardware {
+namespace hcs_core::hardware {
 
 // ============================================================================
 // 链路探针：一个实例 = 一块 libhcs 板卡，在真实执行器里量主机侧每一段花了多久。
@@ -248,26 +246,6 @@ public:
             static_cast<long long>(burst_off_ns_ / 1'000'000),
             static_cast<long long>(io_thread_cpu), static_cast<long long>(io_thread_rt_priority),
             static_cast<long long>(slow_rtt_threshold_ns_ / 1000), inline_submit_ ? 1 : 0);
-
-        // 机器护栏：只读检查 USB 实时路径依赖的内核状态（IRQ 线程优先级/落核、中断核
-        // C1、板卡枚举速度、bootloader 滞留……），判据来自 HOST_TUNING.md 的实测。
-        // 需要修改的项归 hcs_rt_tune.sh（开机服务）管，这里只负责发现"它没生效"。
-        // 每进程只跑一次：构造函数按板各跑一遍，护栏结果与板无关。
-        static std::once_flag machine_guard_once;
-        std::call_once(machine_guard_once, [this]() {
-            for (const auto& finding : hcs_utility::MachineGuard::run()) {
-                const char* text = finding.text.c_str();
-                switch (finding.level) {
-                case hcs_utility::MachineGuard::Level::kCritical:
-                    RCLCPP_ERROR(get_logger(), "[machine] %s", text);
-                    break;
-                case hcs_utility::MachineGuard::Level::kWarn:
-                    RCLCPP_WARN(get_logger(), "[machine] %s", text);
-                    break;
-                default: RCLCPP_INFO(get_logger(), "[machine] %s", text); break;
-                }
-            }
-        });
     }
 
     ~HcsLinkProbe() override = default;
@@ -634,8 +612,8 @@ private:
     rclcpp::TimerBase::SharedPtr report_timer_;
 };
 
-} // namespace hcs_demo::hardware
+} // namespace hcs_core::hardware
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(hcs_demo::hardware::HcsLinkProbe, hcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::hardware::HcsLinkProbe, hcs_executor::Component)

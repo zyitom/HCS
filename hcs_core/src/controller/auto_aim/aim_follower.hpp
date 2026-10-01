@@ -6,7 +6,7 @@
 
 #include <hcs_link/autoaim.hpp>
 #include <hcs_link/channel.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 namespace hcs_core::controller::auto_aim {
 

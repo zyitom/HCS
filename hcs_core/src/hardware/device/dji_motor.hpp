@@ -8,19 +8,26 @@
 #include <cstdint>
 #include <cstring>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
 
 #include <hcs_executor/component.hpp>
-#include <hcs_utility/endian_promise.hpp>
+#include <hcs_base/protocol/endian_promise.hpp>
 
 #include "hardware/device/can_packet.hpp"
+#include "hardware/util/required.hpp"
 
 namespace hcs_core::hardware::device {
 
 class DjiMotor {
 public:
+    /// The bus this driver speaks: classic CAN 2.0, 8-byte frames, at the motor's factory
+    /// 1 Mbps. A bus declared otherwise is refused when the motor is attached to it.
+    static constexpr std::uint32_t kCanBitrate = 1'000'000;
+    static constexpr bool kCanFd = false;
+
     enum class Type : uint8_t { kGM6020, kGM6020Voltage, kM3508, kM2006 };
 
     /// Feedback DATA[7]. Older ESC firmware documents this byte as null and sends 0, which
@@ -38,37 +45,36 @@ public:
         kMotorOverheat        = 8, // >= 125 C
     };
 
+    /// An aggregate, so a wiring table names what it sets. motor_type and id are required
+    /// (util::Required); reduction_ratio defaults to the model's own gearbox.
     struct Config {
-        explicit Config(Type motor_type, std::uint8_t id = 0)
-            : motor_type(motor_type)
-            , id(id) {
-            switch (motor_type) {
-            case Type::kGM6020:
-            case Type::kGM6020Voltage: reduction_ratio = 1.0; break;
-            case Type::kM3508: reduction_ratio = 3591.0 / 187.0; break;
-            case Type::kM2006: reduction_ratio = 36.0; break;
-            }
-            this->reversed = false;
-            this->multi_turn_angle_enabled = false;
-        }
-
         Config& set_encoder_zero_point(int value) { return encoder_zero_point = value, *this; }
         Config& set_reduction_ratio(double value) { return reduction_ratio = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
         Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
 
-        Type motor_type;
-        std::uint8_t id;
+        util::Required<Type> motor_type;
+        /// ESC id set by the DIP switches / LED blink count (1..8).
+        util::Required<std::uint8_t> id;
         int encoder_zero_point = 0;
-        double reduction_ratio;
-        bool reversed;
-        bool multi_turn_angle_enabled;
-        /// Update cycles without a feedback frame before the motor is considered offline. The
-        /// ESC reports on its own at 1 kHz whatever the host sends, so this watches the feedback
-        /// path only: an ESC that no longer receives commands still reads online.
+        /// Rotor to output shaft. Unset: the model's own gearbox (3591/187 for M3508, 36 for
+        /// M2006, 1 for GM6020); set it to replace that, e.g. an external stage.
+        std::optional<double> reduction_ratio = std::nullopt;
+        bool reversed = false;
+        bool multi_turn_angle_enabled = false;
         int offline_timeout = 100;
     };
+
+    static constexpr double default_reduction_ratio(Type type) {
+        switch (type) {
+        case Type::kGM6020:
+        case Type::kGM6020Voltage: return 1.0;
+        case Type::kM3508: return 3591.0 / 187.0;
+        case Type::kM2006: return 36.0;
+        }
+        return 1.0;
+    }
 
     DjiMotor(
         hcs_executor::Component& status_component, hcs_executor::Component& command_component,
@@ -103,6 +109,7 @@ public:
     void configure(const Config& config) {
         type_ = config.motor_type;
         id_ = config.id;
+        const double reduction_ratio = config.reduction_ratio.value_or(default_reduction_ratio(type_));
         encoder_zero_point_ = config.encoder_zero_point % kRawAngleMax;
         if (encoder_zero_point_ < 0)
             encoder_zero_point_ += kRawAngleMax;
@@ -110,15 +117,15 @@ public:
         const double sign = config.reversed ? -1 : 1;
 
         raw_angle_to_angle_coefficient_ =
-            sign / config.reduction_ratio / kRawAngleMax * 2 * std::numbers::pi;
+            sign / reduction_ratio / kRawAngleMax * 2 * std::numbers::pi;
         angle_to_raw_angle_coefficient_ = 1 / raw_angle_to_angle_coefficient_;
 
         raw_velocity_to_velocity_coefficient_ =
-            sign / config.reduction_ratio / 60 * 2 * std::numbers::pi;
+            sign / reduction_ratio / 60 * 2 * std::numbers::pi;
         velocity_to_raw_velocity_coefficient_ = 1 / raw_velocity_to_velocity_coefficient_;
 
         double torque_constant, raw_current_max, current_max;
-        switch (config.motor_type) {
+        switch (type_) {
         case Type::kGM6020:
             torque_constant = 0.741;
             raw_current_max = 16384.0;
@@ -143,10 +150,10 @@ public:
         }
 
         raw_current_to_torque_coefficient_ =
-            sign * config.reduction_ratio * torque_constant / raw_current_max * current_max;
+            sign * reduction_ratio * torque_constant / raw_current_max * current_max;
         torque_to_raw_current_coefficient_ = 1 / raw_current_to_torque_coefficient_;
 
-        max_torque_ = 1 * config.reduction_ratio * torque_constant * current_max;
+        max_torque_ = 1 * reduction_ratio * torque_constant * current_max;
 
         last_raw_angle_ = 0;
         multi_turn_angle_enabled_ = config.multi_turn_angle_enabled;
@@ -256,6 +263,26 @@ public:
         return std::bit_cast<CanPacket8::Quarter>(control_current);
     }
 
+    /// Which 2-byte slot of the shared frame send_id() this motor writes; nothing for id 0.
+    /// Two motors on one bus must not share both the send id and the slot (an M3508 with id 5
+    /// and a voltage GM6020 with id 1 do: both write slot 0 of 0x1FF).
+    std::optional<std::size_t> command_slot() const noexcept {
+        if (id_ == 0)
+            return std::nullopt;
+        return static_cast<std::size_t>((id_ - 1) % 4);
+    }
+
+    /// @brief Hand this cycle's current to the bus it sits on. The ESC takes four motors per
+    /// frame: every motor with the same send id on one bus writes its own 2-byte slot,
+    /// (id - 1) % 4, of one shared frame. A safe cycle writes zero current. id 0 (unassigned)
+    /// still opens the frame but leaves every slot alone.
+    template <class BusFrames>
+    void append_command(BusFrames& bus, bool safe) const {
+        auto& packet = bus.shared_frame(send_id());
+        if (id_ != 0)
+            packet.data[(id_ - 1) % 4] = safe ? std::uint16_t{0} : generate_command().data;
+    }
+
     int calibrate_zero_point() {
         angle_multi_turn_ = 0;
         encoder_zero_point_ = last_raw_angle_;
@@ -359,15 +386,5 @@ private:
 
     hcs_executor::Component::InputInterface<double> control_torque_;
 };
-
-} // namespace hcs_core::hardware::device
-
-namespace hcs_core::hardware::device {
-
-inline auto operator<<(CanPacket8& packet, const DjiMotor& motor) -> CanPacket8& {
-    if (motor.id() != 0)
-        packet.data[(motor.id() - 1) % 4] = motor.generate_command().data;
-    return packet;
-}
 
 } // namespace hcs_core::hardware::device

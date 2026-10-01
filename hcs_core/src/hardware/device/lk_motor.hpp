@@ -18,6 +18,7 @@
 #include <hcs_executor/component.hpp>
 
 #include "hardware/device/can_packet.hpp"
+#include "hardware/util/required.hpp"
 
 // LK 反馈/命令帧为原生类型 packed，双向依赖小端主机。
 static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
@@ -26,6 +27,11 @@ namespace hcs_core::hardware::device {
 
 class LkMotor {
 public:
+    /// The bus this driver speaks: classic CAN 2.0, 8-byte frames, at the motor's factory
+    /// 1 Mbps. A bus declared otherwise is refused when the motor is attached to it.
+    static constexpr std::uint32_t kCanBitrate = 1'000'000;
+    static constexpr bool kCanFd = false;
+
     enum class Type : uint8_t {
         kMG5010Ei10,
         kMG4010Ei10,
@@ -35,18 +41,35 @@ public:
         kMHF7015,
     };
 
-    struct Config {
-        explicit Config(Type type, std::uint32_t can_id = 0)
-            : motor_type(type)
-            , can_id(can_id) {}
+    /// Which command frame this motor is driven with. Chosen in the config, never inferred from
+    /// wiring: the driver registers only the inputs its mode uses. Before, wiring
+    /// /control_velocity (say, the output of a host angle loop that feeds a host velocity loop)
+    /// silently switched a torque motor to 0xA2, closing the velocity loop inside the motor and
+    /// demoting /control_torque to a current limit.
+    enum class ControlMode : uint8_t {
+        /// 0xA1 from /control_torque. The host closes every loop.
+        kTorque,
+        /// 0xA2 from /control_velocity, with /control_torque as the current limit.
+        kVelocity,
+        /// 0xA3 / 0xA4 from /control_angle, with /control_velocity as the speed limit.
+        kAngle,
+        /// 0xA7 / 0xA8 from /control_angle_shift, with /control_velocity as the speed limit.
+        kAngleShift,
+    };
 
+    /// An aggregate, so a wiring table names what it sets. motor_type, control_mode and can_id
+    /// are required (util::Required): forgetting one must not compile, rather than quietly
+    /// picking a mode or id 0 for you.
+    struct Config {
         Config& set_encoder_zero_point(int value) { return encoder_zero_point = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
         Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
 
-        Type motor_type;
-        std::uint32_t can_id; // 指令与反馈同 id（0x140+n）
+        util::Required<Type> motor_type;
+        /// Fixed at construction of the motor: it decides which inputs exist.
+        util::Required<ControlMode> control_mode;
+        util::Required<std::uint32_t> can_id; // 指令与反馈同 id（0x140+n）
         /// Software offset on top of the zero the driver already subtracts: the encoder field of
         /// a status frame is (raw - ROM offset), see protocol command 0x90.
         int encoder_zero_point = 0;
@@ -58,7 +81,8 @@ public:
 
     LkMotor(
         hcs_executor::Component& status_component, hcs_executor::Component& command_component,
-        const std::string& name_prefix) {
+        const std::string& name_prefix, const Config& config)
+        : control_mode_(config.control_mode) {
         status_component.register_output(name_prefix + "/angle", angle_output_, 0.0);
         status_component.register_output(name_prefix + "/raw_angle", raw_angle_output_, 0);
         status_component.register_output(name_prefix + "/velocity", velocity_output_, 0.0);
@@ -67,23 +91,36 @@ public:
         status_component.register_output(name_prefix + "/max_torque", max_torque_output_, 0.0);
         status_component.register_output(name_prefix + "/online", online_output_, false);
 
-        command_component.register_input( //
-            name_prefix + "/control_torque", control_torque_, false);
-        command_component.register_input( //
-            name_prefix + "/control_velocity", control_velocity_, false);
-        command_component.register_input( //
-            name_prefix + "/control_angle", control_angle_, false);
-        command_component.register_input( //
-            name_prefix + "/control_angle_shift", control_angle_shift_, false);
-    }
+        // Only what the mode uses. All optional: an unwired input reads as NaN, never as 0.
+        switch (control_mode_) {
+        case ControlMode::kTorque:
+            command_component.register_input( //
+                name_prefix + "/control_torque", control_torque_, false);
+            break;
+        case ControlMode::kVelocity:
+            command_component.register_input( //
+                name_prefix + "/control_velocity", control_velocity_, false);
+            command_component.register_input( //
+                name_prefix + "/control_torque", control_torque_, false);
+            break;
+        case ControlMode::kAngle:
+            command_component.register_input( //
+                name_prefix + "/control_angle", control_angle_, false);
+            command_component.register_input( //
+                name_prefix + "/control_velocity", control_velocity_, false);
+            break;
+        case ControlMode::kAngleShift:
+            command_component.register_input( //
+                name_prefix + "/control_angle_shift", control_angle_shift_, false);
+            command_component.register_input( //
+                name_prefix + "/control_velocity", control_velocity_, false);
+            break;
+        }
 
-    LkMotor(
-        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
-        const std::string& name_prefix, const Config& config)
-        : LkMotor(status_component, command_component, name_prefix) {
         configure(config);
     }
 
+    /// Re-applies everything but the control mode, which the constructor fixed.
     void configure(const Config& config) {
         can_id_ = config.can_id;
         multi_turn_encoder_count_ = 0;
@@ -110,7 +147,7 @@ public:
         // status frame: 33 A on MG, 16.5 A on MF and MH (protocol V2.36 commands 0x9C and 0xA1).
         current_max_ = kMgCurrentMax;
 
-        switch (config.motor_type) {
+        switch (config.motor_type.get()) {
         case Type::kMG5010Ei10:
             raw_angle_modulus_ = 1 << 16;
             torque_constant = 0.1;
@@ -470,21 +507,35 @@ public:
         return generate_angle_shift_command(control_angle_shift());
     }
 
-    /// @brief Pick the command frame from whichever inputs have a provider, highest first:
-    /// angle shift > angle > velocity > torque.
-    /// @note Wiring /control_velocity makes this send 0xA2, which closes the velocity loop inside
-    /// the motor and demotes /control_torque to the current limit of that frame. A host side
-    /// cascade that writes both (angle loop -> velocity, velocity loop -> torque) must call
-    /// generate_torque_command() instead.
-    CanPacket8 generate_command() {
-        if (!std::isnan(control_angle_shift()))
-            return generate_angle_shift_command(control_angle_shift(), control_velocity());
-        if (!std::isnan(control_angle()))
-            return generate_angle_command(control_angle(), control_velocity());
-        if (!std::isnan(control_velocity()))
+    /// @brief The command frame of the configured mode. Each generator sends the disable frame
+    /// when its setpoint is NaN.
+    CanPacket8 generate_command() const {
+        switch (control_mode_) {
+        case ControlMode::kTorque: return generate_torque_command(control_torque());
+        case ControlMode::kVelocity:
             return generate_velocity_command(control_velocity(), control_torque());
-        return generate_torque_command(control_torque());
+        case ControlMode::kAngle:
+            return generate_angle_command(control_angle(), control_velocity());
+        case ControlMode::kAngleShift:
+            return generate_angle_shift_command(control_angle_shift(), control_velocity());
+        }
+        return generate_disable_command();
     }
+
+    /// @brief What this motor sends this cycle, with the safety rule applied: a safe cycle sends
+    /// the disable frame (zero current, which unlike the real 0x81 still makes the motor report).
+    /// A NaN setpoint does the same through generate_command().
+    CanPacket8 command_frame(bool safe) const {
+        return safe ? generate_disable_command() : generate_command();
+    }
+
+    /// @brief Hand this cycle's frame to the bus it sits on. One frame per motor.
+    template <class BusFrames>
+    void append_command(BusFrames& bus, bool safe) const {
+        bus.push(send_id(), command_frame(safe));
+    }
+
+    ControlMode control_mode() const noexcept { return control_mode_; }
 
     // has_provider(), not ready(): HCS 在接线时就把没人提供的可选输入绑到默认值 0.0，
     // ready() 从此恒为真。若在这里读 ready()，一个没接控制器的电机会把 0.0 当成
@@ -586,6 +637,7 @@ private:
     static constexpr double kMfCurrentMax = 16.5;
     double current_max_;
     int raw_angle_modulus_;
+    ControlMode control_mode_;
 
     // Constants
     static constexpr double kDegToRad = std::numbers::pi / 180;

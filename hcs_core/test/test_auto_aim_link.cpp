@@ -22,7 +22,7 @@
 #include <hcs_link/autoaim.hpp>
 #include <hcs_link/channel.hpp>
 #include <hcs_link/rendezvous.hpp>
-#include <hcs_sync/tick.hpp>
+#include <hcs_base/channel/tick.hpp>
 
 // 组件是单文件类（.cpp 里定义 + 底部 PLUGINLIB 导出），和 test_balance_graph 一样直接包含。
 #include "controller/auto_aim/auto_aim_link.cpp"

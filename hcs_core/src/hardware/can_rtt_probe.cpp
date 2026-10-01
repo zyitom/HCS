@@ -22,14 +22,14 @@
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
 #include <hcs_executor/component.hpp>
-#include <hcs_sync/snapshot.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/doorbell.hpp>
-#include <hcs_utility/doorbell_worker.hpp>
-#include <hcs_utility/rt_attributes.hpp>
-#include <hcs_utility/thread_config.hpp>
+#include <hcs_base/channel/snapshot.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/doorbell.hpp>
+#include <hcs_base/thread/doorbell_worker.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
+#include <hcs_base/thread/thread_config.hpp>
 
-namespace hcs_demo::hardware {
+namespace hcs_core::hardware {
 
 // ============================================================================
 // 底层测试探针：CAN2.0 电机指令一发一收 + 串口 IMU（HI91 协议），会不会被拖过
@@ -552,8 +552,8 @@ private:
     rclcpp::TimerBase::SharedPtr report_timer_;
 };
 
-} // namespace hcs_demo::hardware
+} // namespace hcs_core::hardware
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(hcs_demo::hardware::CanRttProbe, hcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::hardware::CanRttProbe, hcs_executor::Component)

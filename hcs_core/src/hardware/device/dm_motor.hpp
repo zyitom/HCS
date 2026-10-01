@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <optional>
 #include <span>
@@ -16,12 +17,50 @@
 #include <hcs_executor/component.hpp>
 
 #include "hardware/device/can_packet.hpp"
+#include "hardware/util/required.hpp"
 
 namespace hcs_core::hardware::device {
 
 class DmMotor {
 public:
-    enum class Type : uint8_t { kJ4310, kJ8009};
+    /// The bus this driver speaks: classic CAN 2.0, 8-byte frames, at the motor's factory
+    /// 1 Mbps. A bus declared otherwise is refused when the motor is attached to it.
+    static constexpr std::uint32_t kCanBitrate = 1'000'000;
+    static constexpr bool kCanFd = false;
+
+    /// The MIT mapping range stored in THIS motor's registers PMAX (0x15) / VMAX (0x16) /
+    /// TMAX (0x17). The position, velocity and torque fields of both the command and the
+    /// feedback frame are integers scaled onto [-max, +max] by these three, so they must equal
+    /// what the motor actually holds: a mismatch scales everything and reports no error.
+    ///
+    /// They are writable registers (DMTool rewrites them), so they belong to the individual
+    /// motor, not to its model: two J4310 on one robot can differ. Hence one per motor, required,
+    /// with no model default to fall back on. Read them back at bring-up (0x7FF, read command
+    /// 0x33, RID 0x15 / 0x16 / 0x17) to prove the copy here is right.
+    struct MitRange {
+        double position_max; // rad
+        double velocity_max; // rad/s
+        double torque_max;   // N*m
+    };
+
+    /// A J4310 as shipped. Only for motors whose registers were never rewritten, and only when
+    /// named explicitly.
+    static constexpr MitRange kJ4310Factory{12.5, 30.0, 10.0};
+
+    /// Which MIT shape this motor runs. Chosen in the config, never inferred from wiring: the
+    /// driver registers only the inputs its mode uses, so an upstream signal that happens to
+    /// share a name (a cascade writing /control_velocity for its own velocity loop) can no
+    /// longer switch on an inner loop inside the motor.
+    enum class ControlMode : uint8_t {
+        /// /control_torque only; kp = kd = 0. The host closes every loop.
+        kTorque,
+        /// /control_velocity, with /control_torque as feed forward; kp = 0, kd from
+        /// /control_kd or the config.
+        kVelocity,
+        /// /control_angle, with /control_velocity and /control_torque as feed forward; kp and
+        /// kd from /control_kp, /control_kd or the config.
+        kPosition,
+    };
 
     /// Motor status, carried in the high nibble of feedback D[0].
     enum class Error : uint8_t {
@@ -36,39 +75,10 @@ public:
         kOverload            = 0xE,
     };
 
+    /// An aggregate, so a wiring table names what it sets. The four fields up to mit_range are
+    /// required (util::Required): leaving one out must not compile, rather than quietly picking
+    /// a mode or a mapping range for you.
     struct Config {
-        explicit Config(Type motor_type, std::uint32_t esc_id = 0, std::uint32_t master_id = 0)
-            : motor_type(motor_type)
-            , esc_id(esc_id)
-            , master_id(master_id) {
-            switch (motor_type) {
-            case Type::kJ4310:
-                // Factory defaults of registers PMAX(0x15) / VMAX(0x16) / TMAX(0x17).
-                //
-                // Note: these are NOT model constants, they are writable registers. In MIT mode
-                // they are the mapping basis of BOTH the command and the feedback frame, so a
-                // mismatch against the value actually stored in the driver silently scales
-                // everything and reports no error. Read them back over 0x7FF/RID 0x33 once at
-                // bringup rather than trusting these defaults.
-                position_max = 12.5;
-                velocity_max = 30.0;
-                torque_max   = 10.0;
-                break;
-            case Type::kJ8009:
-                // Copied from the RMCS driver, not yet checked against a J8009 manual.
-                position_max = 12.5;
-                velocity_max = 45.0;
-                torque_max   = 54.0;
-                break;
-            default: std::unreachable();
-            }
-            this->reversed                 = false;
-            this->multi_turn_angle_enabled = false;
-        }
-
-        Config& set_position_max(double value) { return position_max = value, *this; }
-        Config& set_velocity_max(double value) { return velocity_max = value, *this; }
-        Config& set_torque_max(double value) { return torque_max = value, *this; }
         Config& set_gain(double kp_value, double kd_value) {
             return kp = kp_value, kd = kd_value, *this;
         }
@@ -80,20 +90,20 @@ public:
         Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
         Config& set_error_retry_interval(int value) { return error_retry_interval = value, *this; }
 
-        Type motor_type;
+        /// Fixed at construction of the motor: it decides which inputs exist.
+        util::Required<ControlMode> control_mode;
 
         /// Receive id of the driver (register ESC_ID 0x08). MIT control frames are sent to this
         /// id with no offset. The other three modes add 0x100 / 0x200 / 0x300 and are not
         /// implemented here.
-        std::uint32_t esc_id;
+        util::Required<std::uint32_t> esc_id;
         /// Feedback id of the driver (register MST_ID 0x07). Must be unique per motor, and must
         /// not collide with the DJI feedback range (0x201~0x20B) on the same bus. A collision
         /// produces no error, only silence.
-        std::uint32_t master_id;
+        util::Required<std::uint32_t> master_id;
 
-        double position_max; // rad
-        double velocity_max; // rad/s
-        double torque_max;   // N*m
+        /// This motor's PMAX / VMAX / TMAX. See MitRange.
+        util::Required<MitRange> mit_range;
 
         /// Default MIT gains, used when /control_kp and /control_kd have no provider.
         /// Protocol range is kp in [0, 500] and kd in [0, 5].
@@ -109,17 +119,17 @@ public:
         /// encoder_zero_point. The raw position is scaled by position_max, so the same physical
         /// zero is a different raw count under a different PMAX; giving it as an angle keeps it
         /// valid when position_max is corrected to match a re-flashed register.
-        std::optional<double> zero_angle;
+        std::optional<double> zero_angle = std::nullopt;
 
         /// External gearbox only. The 10:1 stage inside a J4310 is already accounted for by the
         /// driver, whose feedback is output shaft referred. Note that kp / kd are driver side
         /// gains and are NOT scaled by this.
         double reduction_ratio = 1.0;
 
-        bool reversed;
+        bool reversed = false;
         /// Off: angle is what the driver reports, spanning +-position_max (about +-4 turns).
         /// On: the wrap at +-position_max is accumulated and angle grows without bound.
-        bool multi_turn_angle_enabled;
+        bool multi_turn_angle_enabled = false;
 
         /// Update cycles without new feedback before the motor is considered offline.
         int offline_timeout = 100;
@@ -131,7 +141,8 @@ public:
 
     DmMotor(
         hcs_executor::Component& status_component, hcs_executor::Component& command_component,
-        const std::string& name_prefix) {
+        const std::string& name_prefix, const Config& config)
+        : control_mode_(config.control_mode) {
         status_component.register_output(name_prefix + "/angle", angle_output_, 0.0);
         status_component.register_output(name_prefix + "/raw_angle", raw_angle_output_, 0);
         status_component.register_output(name_prefix + "/velocity", velocity_output_, 0.0);
@@ -143,22 +154,22 @@ public:
         status_component.register_output(name_prefix + "/error_code", error_code_output_, uint8_t{0});
         status_component.register_output(name_prefix + "/online", online_output_, false);
 
-        command_component.register_input( //
-            name_prefix + "/control_angle", control_angle_, false);
-        command_component.register_input( //
-            name_prefix + "/control_velocity", control_velocity_, false);
+        // Only what the mode uses. All optional: an unwired input reads as NaN, never as 0.
         command_component.register_input( //
             name_prefix + "/control_torque", control_torque_, false);
-        command_component.register_input( //
-            name_prefix + "/control_kp", control_kp_, false);
-        command_component.register_input( //
-            name_prefix + "/control_kd", control_kd_, false);
-    }
+        if (control_mode_ != ControlMode::kTorque) {
+            command_component.register_input( //
+                name_prefix + "/control_velocity", control_velocity_, false);
+            command_component.register_input( //
+                name_prefix + "/control_kd", control_kd_, false);
+        }
+        if (control_mode_ == ControlMode::kPosition) {
+            command_component.register_input( //
+                name_prefix + "/control_angle", control_angle_, false);
+            command_component.register_input( //
+                name_prefix + "/control_kp", control_kp_, false);
+        }
 
-    DmMotor(
-        hcs_executor::Component& status_component, hcs_executor::Component& command_component,
-        const std::string& name_prefix, const Config& config)
-        : DmMotor(status_component, command_component, name_prefix) {
         configure(config);
     }
 
@@ -169,16 +180,19 @@ public:
 
     ~DmMotor() = default;
 
+    /// Re-applies everything but the control mode, which the constructor fixed.
     void configure(const Config& config) {
         esc_id_    = config.esc_id;
         master_id_ = config.master_id;
+        mit_range_ = config.mit_range;
 
         // Inverse of the DM decode angle = raw * 2PMAX / 65535 - PMAX, so the driver's own
         // position zero_angle lands exactly on raw zero here.
+        const double position_max = config.mit_range->position_max;
         const int encoder_zero_point =
             config.zero_angle ? static_cast<int>(std::lround(
-                                    (*config.zero_angle + config.position_max) * kRawAngleMax
-                                    / (2 * config.position_max)))
+                                    (*config.zero_angle + position_max) * kRawAngleMax
+                                    / (2 * position_max)))
                               : config.encoder_zero_point;
         encoder_zero_point_ = encoder_zero_point & (kRawAngleModulus - 1);
 
@@ -190,22 +204,22 @@ public:
         const double reduction_ratio = config.reduction_ratio;
 
         raw_angle_to_angle_coefficient_ =
-            sign / reduction_ratio * (2 * config.position_max) / kRawAngleMax;
+            sign / reduction_ratio * (2 * config.mit_range->position_max) / kRawAngleMax;
         angle_to_raw_angle_coefficient_ = 1 / raw_angle_to_angle_coefficient_;
 
         raw_velocity_to_velocity_coefficient_ =
-            sign / reduction_ratio * (2 * config.velocity_max) / kRawVelocityMax;
+            sign / reduction_ratio * (2 * config.mit_range->velocity_max) / kRawVelocityMax;
         velocity_to_raw_velocity_coefficient_ = 1 / raw_velocity_to_velocity_coefficient_;
 
         raw_torque_to_torque_coefficient_ =
-            sign * reduction_ratio * (2 * config.torque_max) / kRawTorqueMax;
+            sign * reduction_ratio * (2 * config.mit_range->torque_max) / kRawTorqueMax;
         torque_to_raw_torque_coefficient_ = 1 / raw_torque_to_torque_coefficient_;
 
         // Note: unlike LkMotor, max_torque_ here is NOT the datasheet peak torque (11 N*m at 0.8
         // over current, 12.5 N*m at 0.98, rated 3.5 N*m for a J4310). It is the largest torque the
         // MIT frame can actually express, which is TMAX. A controller saturating against the
         // datasheet number would just be clipped again by the protocol.
-        max_torque_ = config.torque_max * reduction_ratio;
+        max_torque_ = config.mit_range->torque_max * reduction_ratio;
 
         kp_ = config.kp;
         kd_ = config.kd;
@@ -265,6 +279,38 @@ public:
     /// without the check the angle would jump between two motors with no error at all.
     std::uint32_t foreign_frame_count() const {
         return foreign_frame_count_.load(std::memory_order::relaxed);
+    }
+
+    /// One line for the bring-up log: ids and the MIT range this driver assumes, against the
+    /// J4310 factory values. A range that differs means the registers were rewritten, and the copy
+    /// in the wiring table has to be proven by reading them back (0x7FF, read command 0x33,
+    /// RID 0x15 / 0x16 / 0x17): a wrong copy scales every command and feedback silently.
+    std::string describe() const {
+        constexpr auto factory = kJ4310Factory;
+        const auto differs = [](double a, double b) { return std::abs(a - b) > 1e-9; };
+        const bool rewritten = differs(mit_range_.position_max, factory.position_max)
+                            || differs(mit_range_.velocity_max, factory.velocity_max)
+                            || differs(mit_range_.torque_max, factory.torque_max);
+        return std::format(
+            "DM esc_id=0x{:x} master_id=0x{:x} PMAX={:.6g} VMAX={:.6g} TMAX={:.6g} "
+            "(J4310 factory {:.6g}/{:.6g}/{:.6g}){}",
+            esc_id_, master_id_, mit_range_.position_max, mit_range_.velocity_max,
+            mit_range_.torque_max, factory.position_max, factory.velocity_max, factory.torque_max,
+            rewritten ? " -- registers rewritten: read them back (0x7FF, 0x33, RID 0x15-0x17)"
+                      : " (factory values)");
+    }
+
+    /// Best effort (1 Hz, never in the cycle): what went wrong since the last call, or nothing.
+    /// Reports each rise of foreign_frame_count() once.
+    std::optional<std::string> take_problem() {
+        const auto count = foreign_frame_count();
+        if (count == reported_foreign_frames_)
+            return std::nullopt;
+        reported_foreign_frames_ = count;
+        return std::format(
+            "{} frames on feedback id 0x{:x} carried another motor's id; two drivers share one "
+            "MST_ID, fix the register",
+            count, master_id_);
     }
 
     /// Must be called once per control cycle: the offline watchdog and the clear error backoff
@@ -438,17 +484,24 @@ public:
         return std::bit_cast<CanPacket8>(command);
     }
 
+    /// @brief The MIT frame of the configured mode, from the wired inputs.
     CanPacket8 generate_mit_command() const {
-        return generate_mit_command(
-            control_angle(), control_velocity(), control_torque(), control_kp(), control_kd());
+        switch (control_mode_) {
+        case ControlMode::kTorque:
+            return generate_mit_command(kNan, kNan, control_torque(), kNan, kNan);
+        case ControlMode::kVelocity:
+            return generate_mit_command(
+                kNan, control_velocity(), control_torque(), kNan, control_kd());
+        case ControlMode::kPosition:
+            return generate_mit_command(
+                control_angle(), control_velocity(), control_torque(), control_kp(),
+                control_kd());
+        }
+        return generate_disable_command();
     }
 
-    /// @brief The frame to put on the bus this cycle.
-    /// @note Which of the three usual MIT shapes comes out is decided by which inputs are wired,
-    /// the same way LkMotor picks between its four command frames:
-    /// - only /control_torque: kp = kd = 0, pure torque
-    /// - /control_velocity too: kp = 0, constant velocity
-    /// - /control_angle too: full position loop, with the other two as feed forward
+    /// @brief The frame to put on the bus this cycle: enable, clear error, or the MIT frame of
+    /// the configured mode.
     /// @note The enable and clear error frames return early, before the MIT frame is built. A
     /// state machine that builds the control frame first and then overwrites it hides from the
     /// caller that no command went out this cycle.
@@ -465,6 +518,23 @@ public:
 
         return generate_mit_command();
     }
+
+    /// @brief What this motor sends this cycle, with the safety rule applied: a safe cycle, or a
+    /// NaN on the mode's own setpoint (controller disabled, fallen, isolated), puts the motor
+    /// in the disabled state (0xFD) instead of commanding it.
+    CanPacket8 command_frame(bool safe) {
+        if (safe || std::isnan(setpoint()))
+            return generate_disable_command();
+        return generate_command();
+    }
+
+    /// @brief Hand this cycle's frame to the bus it sits on. One frame per motor.
+    template <class BusFrames>
+    void append_command(BusFrames& bus, bool safe) {
+        bus.push(send_id(), command_frame(safe));
+    }
+
+    ControlMode control_mode() const noexcept { return control_mode_; }
 
     double control_angle() const {
         // has_provider(), not ready(): an optional input with nobody upstream is bound to a
@@ -505,6 +575,16 @@ public:
     }
 
 private:
+    /// The input the mode is built around: NaN there means "do not command this motor".
+    double setpoint() const {
+        switch (control_mode_) {
+        case ControlMode::kTorque: return control_torque();
+        case ControlMode::kVelocity: return control_velocity();
+        case ControlMode::kPosition: return control_angle();
+        }
+        return kNan;
+    }
+
     /// D[0] is ID | ERR << 4. The manual calls ID "the low 8 bits of CAN_ID", but ERR takes the
     /// high nibble of the same byte, so only the low nibble of the id survives; compare that
     /// much and no more. ESC_ID is what the motor reports here, not MST_ID.
@@ -570,7 +650,10 @@ private:
     static constexpr double kRawVelocityZero = kRawVelocityMax / 2.0;
     static constexpr double kRawTorqueZero   = kRawTorqueMax / 2.0;
 
+    ControlMode control_mode_;
     std::uint32_t esc_id_ = 0, master_id_ = 0;
+    MitRange mit_range_{};
+    std::uint32_t reported_foreign_frames_ = 0; ///< best effort side only, see take_problem()
 
     bool multi_turn_angle_enabled_;
     int encoder_zero_point_;

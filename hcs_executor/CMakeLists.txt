@@ -95,7 +95,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_wiring test/test_wiring.cpp)
   target_include_directories(test_wiring PRIVATE ${PROJECT_SOURCE_DIR}/include)
   target_link_libraries(test_wiring ${PROJECT_NAME}_lib)
-  ament_target_dependencies(test_wiring hcs_sync hcs_utility)
+  ament_target_dependencies(test_wiring hcs_base)
 endif()
 
 set_property(TARGET ${PROJECT_NAME}_lib PROPERTY OUTPUT_NAME ${PROJECT_NAME})

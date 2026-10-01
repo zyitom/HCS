@@ -16,7 +16,7 @@
 
 #include "executor.hpp"
 #include "hcs_executor/component.hpp"
-#include "hcs_utility/thread_config.hpp"
+#include "hcs_base/thread/thread_config.hpp"
 
 void segmentation_fault_handler(int) {
     void* array[100];

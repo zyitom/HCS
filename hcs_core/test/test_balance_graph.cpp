@@ -20,7 +20,7 @@
 #include <hcs_msgs/keyboard.hpp>
 #include <hcs_msgs/mouse.hpp>
 #include <hcs_msgs/switch.hpp>
-#include <hcs_sync/tick.hpp>
+#include <hcs_base/channel/tick.hpp>
 
 #include "controller/chassis/balance/balance_types.hpp"
 
@@ -43,7 +43,7 @@ using hcs_executor::Linker;
 using hcs_executor::Wiring;
 
 /// 假硬件（状态侧）：注册整车硬件组件对外提供的全部反馈输出，没有输入
-/// ——与真实 BalanceInfantry 的 update() 相同的图语义。
+/// ——与真实的三个板组件（gimbal/chassis/aux_board）合起来的图语义相同。
 class FakeBalanceHardware : public Component {
 public:
     FakeBalanceHardware() {

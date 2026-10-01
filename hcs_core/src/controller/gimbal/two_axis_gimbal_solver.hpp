@@ -8,10 +8,10 @@
 #include <eigen3/Eigen/Geometry>
 
 #include <hcs_executor/component.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include <hcs_description/tf_description.hpp>
-#include <hcs_utility/eigen_structured_bindings.hpp>
+#include <hcs_base/protocol/eigen_structured_bindings.hpp>
 
 namespace hcs_core::controller::gimbal {
 using namespace hcs_description;

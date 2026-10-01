@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>hcs_demo</name>
+  <name>hcs_core</name>
   <version>1.0.0</version>
   <description>Minimal runnable example components for the HCS executor framework</description>
   <maintainer email="zyi024424@gmail.com">zyi</maintainer>
@@ -12,9 +12,8 @@
   <depend>rclcpp</depend>
   <depend>pluginlib</depend>
   <depend>hcs_executor</depend>
-  <depend>hcs_sync</depend>
+  <depend>hcs_base</depend>
   <depend>hcs_link</depend>
-  <depend>hcs_utility</depend>
   <depend>hcs_msgs</depend>
   <depend>hcs_description</depend>
   <depend>fast_tf</depend>

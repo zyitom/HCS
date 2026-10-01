@@ -12,11 +12,15 @@ hcs_executor:
   ros__parameters:
     update_rate: 1000.0
     thread_config: "name=hcs-ctrl"
+    # 下面两行压住 config/machine/tl101.yaml：这份配置要在没有 rtprio / memlock 权限、
+    # 没调优的机器上也能跑（原来就不武装 mlock、也不跑机器护栏）。
+    realtime_config: ""
+    machine_guard: "warn"
     reporter_thread_config: "name=hcs-report;policy=other;nice=5"
     spin_thread_config: "name=hcs-spin;policy=other;nice=5"
 
     components:
-      - hcs_demo::hardware::CanRttProbe -> can_rtt_probe
+      - hcs_core::hardware::CanRttProbe -> can_rtt_probe
 
 can_rtt_probe:
   ros__parameters:

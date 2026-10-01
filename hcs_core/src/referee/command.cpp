@@ -3,7 +3,7 @@
 #include <rclcpp/node.hpp>
 #include <hcs_executor/component.hpp>
 #include <hcs_msgs/serial_interface.hpp>
-#include <hcs_utility/crc/dji_crc.hpp>
+#include <hcs_base/protocol/dji_crc.hpp>
 
 #include "referee/command/field.hpp"
 #include "referee/frame.hpp"

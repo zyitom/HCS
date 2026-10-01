@@ -11,14 +11,12 @@
 #include <variant>
 
 #include <eigen3/Eigen/Dense>
-#include <rclcpp/logger.hpp>
-#include <rclcpp/logging.hpp>
 #include <hcs_executor/component.hpp>
 #include <hcs_msgs/keyboard.hpp>
 #include <hcs_msgs/mouse.hpp>
 #include <hcs_msgs/switch.hpp>
-#include <hcs_utility/crc/dji_crc.hpp>
-#include <hcs_utility/ring_buffer.hpp>
+#include <hcs_base/protocol/dji_crc.hpp>
+#include <hcs_base/protocol/ring_buffer.hpp>
 
 // DJI 遥控帧为原生类型 packed，依赖小端主机。
 static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
@@ -36,7 +34,10 @@ public:
 
     Vt13() = default;
 
-    void store_status(std::span<const std::byte> uart_data) {
+    // libhcs IO 线程（事件域）调用：和周期域一样不许打日志——同步写日志一旦被堵住，
+    // 整条 IO 线程就停在这里，三块板的反馈一起断。溢出只计数，由硬件组件的尽力域
+    // 定时器读 overflow_count() / overflow_dropped_bytes() 报出来。
+    void store_status(std::span<const std::byte> uart_data) noexcept {
         store_calls_.fetch_add(1, std::memory_order_relaxed);
         received_bytes_.fetch_add(uart_data.size(), std::memory_order_relaxed);
 
@@ -46,15 +47,18 @@ public:
             },
             uart_data.size());
         if (written != uart_data.size()) {
-            const auto dropped = uart_data.size() - written;
             overflow_count_.fetch_add(1, std::memory_order_relaxed);
-            overflow_dropped_bytes_.fetch_add(dropped, std::memory_order_relaxed);
-            if (should_log_overflow()) {
-                RCLCPP_WARN(
-                    logger_, "VT13 input buffer overflow: dropped %zu of %zu bytes", dropped,
-                    uart_data.size());
-            }
+            overflow_dropped_bytes_.fetch_add(
+                uart_data.size() - written, std::memory_order_relaxed);
         }
+    }
+
+    /// 输入缓冲溢出的次数与累计丢弃字节数（尽力域读，relaxed 即可）。
+    uint64_t overflow_count() const noexcept {
+        return overflow_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t overflow_dropped_bytes() const noexcept {
+        return overflow_dropped_bytes_.load(std::memory_order_relaxed);
     }
 
     /// @param now 有效性计时的时间源。周期域调用方传 tick.scheduled（同一
@@ -117,7 +121,6 @@ private:
 
     static constexpr auto kFreshTimeout = std::chrono::milliseconds(500);
     static constexpr auto kVerificationLogInterval = std::chrono::seconds(1);
-    static constexpr auto kOverflowLogInterval = std::chrono::seconds(1);
     static constexpr auto kStatisticsLogInterval = std::chrono::seconds(5);
     static constexpr std::size_t kRefereeFrameMaxSize = 256;
 
@@ -258,16 +261,6 @@ private:
         return true;
     }
 
-    bool should_log_overflow() {
-        const auto now = Clock::now();
-        if (last_overflow_log_time_ != TimePoint::min()
-            && now - last_overflow_log_time_ < kOverflowLogInterval)
-            return false;
-
-        last_overflow_log_time_ = now;
-        return true;
-    }
-
     void refresh_validity(const TimePoint now) {
         if (!timeout_enabled_ || !valid_ || now - last_remote_control_received_at_ <= kFreshTimeout)
             return;
@@ -293,7 +286,6 @@ private:
         return 0.0;
     }
 
-    rclcpp::Logger logger_ = rclcpp::get_logger("vt13");
     hcs_utility::RingBuffer<std::byte> data_buffer_{1024};
 
     std::atomic<uint64_t> store_calls_{0};
@@ -303,7 +295,6 @@ private:
 
     TimePoint last_remote_control_received_at_ = TimePoint::min();
     TimePoint last_verification_log_time_ = TimePoint::min();
-    TimePoint last_overflow_log_time_ = TimePoint::min();
     TimePoint last_statistics_log_time_ = TimePoint::min();
 
     bool valid_ = false;

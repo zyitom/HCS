@@ -25,6 +25,7 @@ namespace {
 
 using hcs_core::hardware::device::CanPacket8;
 using hcs_core::hardware::device::LkMotor;
+constexpr auto kTorque = LkMotor::ControlMode::kTorque;
 using hcs_executor::Component;
 
 class Host : public Component {
@@ -65,7 +66,7 @@ constexpr double kCountToRad = 2 * std::numbers::pi / 65536;
 } // namespace
 
 TEST(LkMotor, DecodesStatusTwoLayout) {
-    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}};
+    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}};
     bench.receive(0x9C, 1024, 360, 16384, 42);
     bench.motor.update_status();
 
@@ -80,7 +81,7 @@ TEST(LkMotor, DecodesStatusTwoLayout) {
 
 TEST(LkMotor, EveryControlReplyIsStatus) {
     for (const std::uint8_t command : {0x9C, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8}) {
-        Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}};
+        Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}};
         bench.receive(command, 0, 0, 1000);
         bench.motor.update_status();
         EXPECT_EQ(bench.motor.last_raw_angle(), 1000) << "command 0x" << std::hex << +command;
@@ -88,7 +89,8 @@ TEST(LkMotor, EveryControlReplyIsStatus) {
 }
 
 TEST(LkMotor, OtherRepliesDoNotCorruptTheTurnCount) {
-    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}.enable_multi_turn_angle()};
+    Bench bench{
+        LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}.enable_multi_turn_angle()};
     bench.receive(0xA1, 0, 0, 100);
     bench.motor.update_status();
     const double angle = bench.motor.angle();
@@ -106,7 +108,7 @@ TEST(LkMotor, OtherRepliesDoNotCorruptTheTurnCount) {
 }
 
 TEST(LkMotor, NothingDecodedBeforeFirstFrame) {
-    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}
+    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}
                     .set_encoder_zero_point(9051)
                     .enable_multi_turn_angle()};
     for (int i = 0; i < 5; ++i)
@@ -121,7 +123,7 @@ TEST(LkMotor, NothingDecodedBeforeFirstFrame) {
 }
 
 TEST(LkMotor, GoesOfflineAfterTimeout) {
-    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}.set_offline_timeout(3)};
+    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}.set_offline_timeout(3)};
     bench.receive(0xA1, 0, 0, 0);
     bench.motor.update_status();
     EXPECT_TRUE(bench.motor.online());
@@ -138,7 +140,7 @@ TEST(LkMotor, GoesOfflineAfterTimeout) {
 }
 
 TEST(LkMotor, ReversedZeroPointAndSingleTurnRange) {
-    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}
+    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}
                     .set_encoder_zero_point(9051)
                     .set_reversed()};
     bench.receive(0xA1, 0, 0, 9051);
@@ -156,13 +158,13 @@ TEST(LkMotor, ReversedZeroPointAndSingleTurnRange) {
 
 TEST(LkMotor, CurrentFullScaleFollowsSeries) {
     // MG：±2048 ↔ ±33 A
-    Bench mg{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}};
+    Bench mg{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}};
     mg.receive(0xA1, 2048, 0, 0);
     mg.motor.update_status();
     EXPECT_NEAR(mg.motor.torque(), 33.0 * 0.1 * 10, 1e-9);
 
     // MF/MH：±2048 ↔ ±16.5 A
-    Bench mh{LkMotor::Config{LkMotor::Type::kMHF7015, 0x141}};
+    Bench mh{LkMotor::Config{LkMotor::Type::kMHF7015, kTorque, 0x141}};
     mh.receive(0xA1, 2048, 0, 0);
     mh.motor.update_status();
     EXPECT_NEAR(mh.motor.torque(), 16.5 * 0.51, 1e-9);
@@ -180,7 +182,7 @@ TEST(LkMotor, CurrentFullScaleFollowsSeries) {
 }
 
 TEST(LkMotor, UnwiredTorqueSendsZeroCurrent) {
-    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, 0x145}};
+    Bench bench{LkMotor::Config{LkMotor::Type::kMG5010Ei10, kTorque, 0x145}};
     auto frame = bench.motor.generate_torque_command();
     const auto bytes = frame.as_bytes();
     EXPECT_EQ(std::to_integer<std::uint8_t>(bytes[0]), 0xA1);

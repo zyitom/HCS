@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include <hcs_msgs/switch.hpp>
 
@@ -43,8 +44,7 @@ public:
     /// 周期域每拍调用一次。返回这一拍是否必须发安全批次。
     /// @param devices 关键设备，顺序即 tripped_device() 的下标
     /// @param switch_left 遥控左拨杆
-    template <std::size_t N>
-    bool update(const DeviceHealth (&devices)[N], hcs_msgs::Switch switch_left) noexcept {
+    bool update(std::span<const DeviceHealth> devices, hcs_msgs::Switch switch_left) noexcept {
         const auto [index, reason] = first_failure(devices);
 
         if (!latched_ && reason != Reason::kNone) {
@@ -69,6 +69,11 @@ public:
         return latched_;
     }
 
+    template <std::size_t N>
+    bool update(const DeviceHealth (&devices)[N], hcs_msgs::Switch switch_left) noexcept {
+        return update(std::span<const DeviceHealth>{devices}, switch_left);
+    }
+
     [[nodiscard]] bool latched() const noexcept { return latched_; }
     [[nodiscard]] Reason reason() const noexcept { return reason_; }
     /// 首个失效设备在 devices 里的下标；未锁存时无意义。
@@ -82,9 +87,8 @@ private:
         Reason reason;
     };
 
-    template <std::size_t N>
-    static Failure first_failure(const DeviceHealth (&devices)[N]) noexcept {
-        for (std::size_t index = 0; index < N; ++index) {
+    static Failure first_failure(std::span<const DeviceHealth> devices) noexcept {
+        for (std::size_t index = 0; index < devices.size(); ++index) {
             const auto& device = devices[index];
             if (!device.received)
                 continue;

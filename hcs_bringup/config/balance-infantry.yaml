@@ -4,11 +4,12 @@
 #   ros2 launch hcs_bringup hcs.launch.py robot:=balance-infantry
 #
 # 线程布局照 hcs_link.yaml（TL101，cmdline 带 isolcpus=3,7；3 和 7 是同一物理核
-# 的两个超线程），换机器必须重配核号：
+# 的两个超线程），换机器必须重配核号：hcs-ctrl 那一行在 config/machine/tl101.yaml，
+# 其余（发送线程、各板 IO 线程）在本文件：
 #
 #   CPU 3（隔离核，控制输出侧）
 #     hcs-ctrl     FIFO 90   拍循环
-#     tx-balance   FIFO 85   三块板共用的发送线程（拍尾门铃叫醒）
+#     tx-balance   FIFO 85   三块板共用的发送线程（tx_balance 组件，拍尾门铃叫醒）
 #   CPU 7（隔离核，USB 事件侧）
 #     IO-gimbal    FIFO 80   xHCI 中断（CPU 4）给回包后经 IPI 唤醒
 #     IO-chassis   FIFO 79
@@ -18,22 +19,26 @@
 # 台架形态：三块板全部 enabled:false，设备保持离线（驱动状态机照常跑，
 # 只是板卡不打开、帧不出门）——缺板也能验证整条组件链路。
 #
-# 接线表（哪块板、哪条总线、什么型号、CAN id、零点、方向、DM 寄存器镜像、
-# 各板 UART0 波特率）全在 hcs_core/src/hardware/balance_infantry.cpp，本文件
+# 硬件是几个组件：每块板一个（gimbal_board / chassis_board / aux_board，各自收发），
+# 三块板共用的发送线程（tx_balance），跨板的安全锁存（safety_latch）。
+#
+# 接线表（哪块板、哪条总线及其帧型速率、什么型号、CAN id、零点、方向、DM 寄存器镜像、
+# 串口设备及其波特率）全在 hcs_core/src/hardware/balance_infantry.cpp，本文件
 # 只放部署项。serial_filter 是 USB 序列号子串：同 PID 多块板时必须填，否则 SDK
 # 拒绝打开。上车前要由用户核对：serial_filter、接线表的全部 id 与零点、
-# DM 电机里实际存的 PMAX/VMAX/TMAX。
+# DM 电机里实际存的 PMAX/VMAX/TMAX、CH040 模块 flash 里的波特率。
 # ---------------------------------------------------------------------------
 hcs_executor:
   ros__parameters:
     update_rate: 1000.0
-    thread_config: "name=hcs-ctrl;policy=fifo;priority=90;cpus=3"
-    realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M"
-    reporter_thread_config: "name=hcs-report;policy=other;nice=5;cpus=0-2,4-6"
-    spin_thread_config: "name=hcs-spin;policy=other;nice=5;cpus=0-2,4-6"
+    # 控制线程 / 实时武装 / 尽力域线程的核号与优先级在 config/machine/tl101.yaml（launch 默认加载）。
 
     components:
-      - hcs_core::hardware::BalanceInfantry -> balance_hardware
+      - hcs_core::hardware::TransmitThread -> tx_balance
+      - hcs_core::hardware::BalanceGimbalBoard -> gimbal_board
+      - hcs_core::hardware::BalanceChassisBoard -> chassis_board
+      - hcs_core::hardware::BalanceAuxBoard -> aux_board
+      - hcs_core::hardware::SafetyLatch -> safety_latch
       - hcs_core::controller::chassis::balance::BalanceChassisController -> balance_chassis_controller
       - hcs_core::controller::chassis::balance::BalanceStateEstimator -> balance_state_estimator
       - hcs_core::controller::chassis::balance::BalanceModeManager -> balance_mode_manager
@@ -41,36 +46,59 @@ hcs_executor:
       - hcs_core::controller::chassis::balance::LegForceController -> leg_force_controller
       - hcs_core::controller::chassis::balance::LegJointController -> left_leg_joint_controller
       - hcs_core::controller::chassis::balance::LegJointController -> right_leg_joint_controller
+      - hcs_core::controller::gimbal::GimbalTf -> gimbal_tf
       - hcs_core::controller::gimbal::SimpleGimbalController -> gimbal_controller
       - hcs_core::controller::pid::ErrorPidController -> yaw_angle_pid_controller
       - hcs_core::controller::pid::PidController -> yaw_velocity_pid_controller
       - hcs_core::controller::pid::ErrorPidController -> pitch_angle_pid_controller
       - hcs_core::controller::pid::PidController -> pitch_velocity_pid_controller
 
-balance_hardware:
+# ── 硬件（构造期一次性）──────────────────────────────────────────────────
+tx_balance:
   ros__parameters:
-    # ── 板卡（构造期一次性）───────────────────────────────────────────────
+    thread_config: "name=tx-balance;policy=fifo;priority=85;cpus=3"
+    stale_after_ms: 10             # 批次陈旧阈值：某块板被隔离后超过它，给那块板补发一次全失能
+
+gimbal_board:
+  ros__parameters:
+    enabled: false
+    serial_filter: ""
+    io_thread_cpu: 7
+    io_thread_rt_priority: 80
     dangerously_skip_version_checks: true
     exit_on_board_fault: true      # link_state == kFaulted 时整体退出
-    expected_update_rate: 1000.0   # 总线负载估算用
-    tx_thread_config: "name=tx-balance;policy=fifo;priority=85;cpus=3"
-    tx_stale_after_ms: 10          # 批次陈旧阈值：隔离后超过它补发一次全失能
 
-    gimbal_enabled: false
-    gimbal_serial_filter: ""
-    gimbal_io_thread_cpu: 7
-    gimbal_io_thread_rt_priority: 80
+chassis_board:
+  ros__parameters:
+    enabled: false
+    serial_filter: ""
+    io_thread_cpu: 7
+    io_thread_rt_priority: 79
+    dangerously_skip_version_checks: true
+    exit_on_board_fault: true
 
-    chassis_enabled: false
-    chassis_serial_filter: ""
-    chassis_io_thread_cpu: 7
-    chassis_io_thread_rt_priority: 79
+aux_board:
+  ros__parameters:
+    enabled: false
+    serial_filter: ""
+    io_thread_cpu: 7
+    io_thread_rt_priority: 78
+    dangerously_skip_version_checks: true
+    exit_on_board_fault: true
 
-    aux_enabled: false
-    aux_serial_filter: ""
-    aux_io_thread_cpu: 7
-    aux_io_thread_rt_priority: 78
-    # 电机 id / 零点 / 型号 / 方向与 IMU 模块坐标系（云台 NWU、底盘 ENU）写死在 balance_infantry.cpp
+# 这些设备上过线之后掉线或报故障，整车锁存全失能（腿、轮、底盘 IMU：少了它们车站不住）；
+# 遥控左拨杆先拨到 DOWN 再拨离 DOWN 复位。
+safety_latch:
+  ros__parameters:
+    critical_devices:
+      - /chassis/left_front_joint
+      - /chassis/left_back_joint
+      - /chassis/right_front_joint
+      - /chassis/right_back_joint
+      - /chassis/left_wheel
+      - /chassis/right_wheel
+      - /chassis/imu
+    rearm_switch: /remote/switch/left
 
 # ── 平衡底盘控制链（阶段 2）──────────────────────────────────────────────
 balance_chassis_controller:

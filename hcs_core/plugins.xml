@@ -1,7 +1,11 @@
-<library path="hcs_demo">
-  <class type="hcs_demo::hardware::CanRttProbe"           base_class_type="hcs_executor::Component" />
-  <class type="hcs_demo::hardware::HcsLinkProbe"          base_class_type="hcs_executor::Component" />
-  <class type="hcs_core::hardware::BalanceInfantry"       base_class_type="hcs_executor::Component" />
+<library path="hcs_core">
+  <class type="hcs_core::hardware::CanRttProbe"           base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::HcsLinkProbe"          base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::BalanceGimbalBoard"    base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::BalanceChassisBoard"   base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::BalanceAuxBoard"       base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::TransmitThread"        base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::SafetyLatch"           base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::chassis::balance::BalanceChassisController" base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::chassis::balance::BalanceStateEstimator" base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::chassis::balance::BalanceModeManager" base_class_type="hcs_executor::Component" />
@@ -9,6 +13,7 @@
   <class type="hcs_core::controller::chassis::balance::LegForceController" base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::chassis::balance::LegJointController" base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::gimbal::SimpleGimbalController" base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::controller::gimbal::GimbalTf"   base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::auto_aim::AutoAimLink" base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::pid::PidController"  base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::pid::ErrorPidController" base_class_type="hcs_executor::Component" />

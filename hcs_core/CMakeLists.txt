@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-project(hcs_demo)
+project(hcs_core)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 23)
@@ -26,9 +26,9 @@ if(NOT _libhcs_source_dir)
   endforeach()
 endif()
 if(NOT EXISTS "${_libhcs_source_dir}/host/CMakeLists.txt")
-  message(FATAL_ERROR "hcs_demo: libhcs not found; pass -DLIBHCS_SOURCE_DIR=<libhcs checkout>")
+  message(FATAL_ERROR "hcs_core: libhcs not found; pass -DLIBHCS_SOURCE_DIR=<libhcs checkout>")
 endif()
-message(STATUS "hcs_demo: libhcs from ${_libhcs_source_dir}")
+message(STATUS "hcs_core: libhcs from ${_libhcs_source_dir}")
 
 # libhcs 的版本号取自 git tag；工作区里没有 tag 时它自己的 CMake 会直接 FATAL。
 # 这里先替它跑一次版本脚本，拿不到就退回 0.0.0（和本机固件构建用的覆盖值一致，
@@ -79,7 +79,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
       add_compile_options(-march=${HCS_MARCH})
     else()
       message(STATUS
-        "hcs_demo: -march=${HCS_MARCH} not supported by ${CMAKE_CXX_COMPILER_ID}, skipping")
+        "hcs_core: -march=${HCS_MARCH} not supported by ${CMAKE_CXX_COMPILER_ID}, skipping")
     endif()
   endif()
 endif()
@@ -93,6 +93,9 @@ ament_auto_find_build_dependencies()
 set(PROJECT_SOURCE
   src/hardware/can_rtt_probe.cpp
   src/hardware/hcs_link_probe.cpp
+  src/hardware/board/board.cpp
+  src/hardware/transmit_thread.cpp
+  src/hardware/safety_latch.cpp
   src/hardware/balance_infantry.cpp
   src/controller/pid/pid_controller.cpp
   src/controller/pid/error_pid_controller.cpp
@@ -103,6 +106,7 @@ set(PROJECT_SOURCE
   src/controller/chassis/balance/leg_force_controller.cpp
   src/controller/chassis/balance/leg_joint_controller.cpp
   src/controller/gimbal/simple_gimbal_controller.cpp
+  src/controller/gimbal/gimbal_tf.cpp
   src/controller/auto_aim/auto_aim_link.cpp
   src/broadcaster/tf_broadcaster.cpp
   src/broadcaster/value_broadcaster.cpp
@@ -150,7 +154,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_board_transmitter libhcs-sdk)
   ament_target_dependencies(
     test_board_transmitter
-    hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf)
+    hcs_executor hcs_base hcs_msgs hcs_description fast_tf)
 
   # 数学函数与 Helios 原函数（测试内嵌 float 参考）的同输入对拍。
   ament_add_gtest(test_balance_math test/test_balance_math.cpp)
@@ -161,25 +165,46 @@ if(BUILD_TESTING)
   ament_add_gtest(test_lk_motor test/test_lk_motor.cpp)
   target_include_directories(test_lk_motor PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_lk_motor hcs_executor hcs_sync hcs_utility rclcpp)
+  ament_target_dependencies(test_lk_motor hcs_executor hcs_base rclcpp)
 
   # DJI 驱动反馈 DATA[7] 错误码：新旧固件兼容、未列出的码原样保留。
   ament_add_gtest(test_dji_motor test/test_dji_motor.cpp)
   target_include_directories(test_dji_motor PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_dji_motor hcs_executor hcs_sync hcs_utility)
+  ament_target_dependencies(test_dji_motor hcs_executor hcs_base)
 
   # DM 驱动：D[0] 电机 ID 校验（MST_ID 撞号）、首帧门控、离线、零点随 PMAX 换算。
   ament_add_gtest(test_dm_motor test/test_dm_motor.cpp)
   target_include_directories(test_dm_motor PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_dm_motor hcs_executor hcs_sync hcs_utility)
+  ament_target_dependencies(test_dm_motor hcs_executor hcs_base)
+
+  # 三种电机驱动的指令帧：显式控制模式、统一失能规则、DJI 合帧，逐字节对照重构前的实际输出。
+  ament_add_gtest(test_motor_command_frames test/test_motor_command_frames.cpp)
+  target_include_directories(test_motor_command_frames PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(test_motor_command_frames libhcs-sdk)
+  ament_target_dependencies(test_motor_command_frames hcs_executor hcs_base rclcpp)
 
   # 关键设备失效锁存：触发条件、不自动恢复、DOWN→离开 的复位手势。
   ament_add_gtest(test_safety_latch test/test_safety_latch.cpp)
   target_include_directories(test_safety_latch PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
   ament_target_dependencies(test_safety_latch hcs_msgs)
+
+  # 板组件：设备登记与分发、撞号与总线速率检查、共用发送线程、安全锁存组件（假 SDK）；
+  # 真实平衡步兵三块板全禁用接进组件图空跑。
+  ament_add_gtest(test_board test/test_board.cpp src/hardware/board/board.cpp)
+  target_include_directories(test_board PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(test_board libhcs-sdk)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang") # 真用到 SDK 符号：同主库，消费侧补 -flto
+    target_compile_options(test_board PRIVATE -flto)
+    target_link_options(test_board PRIVATE -flto)
+  endif()
+  ament_target_dependencies(
+    test_board
+    hcs_executor hcs_base hcs_msgs hcs_description fast_tf rclcpp pluginlib)
 
   # 平衡组件图：假硬件 + 全部平衡组件 link + 空跑，参数文件挂给 rclcpp::init。
   ament_add_gtest(test_balance_graph test/test_balance_graph.cpp)
@@ -189,7 +214,7 @@ if(BUILD_TESTING)
     BALANCE_GRAPH_TEST_YAML="${CMAKE_CURRENT_SOURCE_DIR}/test/balance_graph_test.yaml")
   ament_target_dependencies(
     test_balance_graph
-    hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf rclcpp)
+    hcs_executor hcs_base hcs_msgs hcs_description fast_tf rclcpp)
 
   # 性能基准：同图 + 确定性激励，打印整拍/逐组件/NLMPC-LQR 求解耗时分位数。
   # 无板环境只能测算力这一维；节奏质量上板后由 rt_sampler 测。
@@ -200,12 +225,12 @@ if(BUILD_TESTING)
     BALANCE_GRAPH_TEST_YAML="${CMAKE_CURRENT_SOURCE_DIR}/test/balance_graph_test.yaml")
   ament_target_dependencies(
     test_balance_bench
-    hcs_executor hcs_sync hcs_utility hcs_msgs hcs_description fast_tf rclcpp)
+    hcs_executor hcs_base hcs_msgs hcs_description fast_tf rclcpp)
   # 自瞄跟随逻辑：新命令就跟、陈旧就停、坏命令不跟、开火只在窗内、换会话清旧命令。
   ament_add_gtest(test_aim_follower test/test_aim_follower.cpp)
   target_include_directories(test_aim_follower PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_aim_follower hcs_link hcs_utility)
+  ament_target_dependencies(test_aim_follower hcs_link hcs_base)
 
   # AutoAimLink 端到端：真组件 + 真 socket + 真 memfd 通道，视觉由测试线程扮演。
   ament_add_gtest(test_auto_aim_link test/test_auto_aim_link.cpp TIMEOUT 60)
@@ -213,7 +238,7 @@ if(BUILD_TESTING)
     ${PROJECT_SOURCE_DIR}/src)
   ament_target_dependencies(
     test_auto_aim_link
-    hcs_executor hcs_sync hcs_utility hcs_description fast_tf hcs_link rclcpp pluginlib)
+    hcs_executor hcs_base hcs_description fast_tf hcs_link rclcpp pluginlib)
 endif()
 
 ament_auto_package()

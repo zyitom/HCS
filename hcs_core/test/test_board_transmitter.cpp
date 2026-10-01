@@ -5,7 +5,7 @@
 
 #include <libhcs/board/hcs_can_port.hpp>
 
-#include <hcs_sync/snapshot.hpp>
+#include <hcs_base/channel/snapshot.hpp>
 
 #include "hardware/device/can_packet.hpp"
 #include "hardware/util/board_transmitter.hpp"
@@ -28,11 +28,10 @@ TEST(board_transmitter, batch_packing) {
     auto packet =
         CanPacket8{CanPacket8::Quarter{0x1111}, CanPacket8::Quarter{0x2222},
                    CanPacket8::PaddingQuarter{}, CanPacket8::Quarter{0x4444}};
-    push_frame(batch, 1, libhcs::board::hcs::CanPort::kCan2, 0x201, packet);
+    push_frame(batch, libhcs::board::hcs::CanPort::kCan2, 0x201, packet);
 
     ASSERT_EQ(batch.frame_count, 1u);
     const auto& frame = batch.frames[0];
-    EXPECT_EQ(frame.board, 1);
     EXPECT_EQ(frame.port, static_cast<std::uint8_t>(libhcs::board::hcs::CanPort::kCan2));
     EXPECT_EQ(frame.can_id, 0x201u);
 
@@ -41,12 +40,11 @@ TEST(board_transmitter, batch_packing) {
 }
 
 TEST(board_transmitter, batch_capacity_matches_robot) {
-    // 平衡步兵每拍 9 帧（云台 4、底盘 4、aux 1），容量必须装得下且不翻倍浪费。
+    // 批次按板：平衡步兵帧最多的一块板每拍 4 帧（云台、底盘各 4，aux 1），装得下。
     TransmitBatch batch;
-    for (std::uint32_t index = 0; index < 9; ++index)
-        push_frame(
-            batch, 0, libhcs::board::hcs::CanPort::kCan1, 0x100 + index, CanPacket8{});
-    EXPECT_EQ(batch.frame_count, 9u);
+    for (std::uint32_t index = 0; index < 4; ++index)
+        push_frame(batch, libhcs::board::hcs::CanPort::kCan1, 0x100 + index, CanPacket8{});
+    EXPECT_EQ(batch.frame_count, 4u);
     EXPECT_GE(TransmitBatch::kMaxFrames, batch.frame_count);
 }
 

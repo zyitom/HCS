@@ -10,8 +10,8 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <hcs_executor/component.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include "controller/chassis/balance/balance_types.hpp"
 #include "controller/chassis/balance/control_math.hpp"

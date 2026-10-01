@@ -16,8 +16,8 @@
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
 
-#include "hcs_utility/rt_sampler.hpp"
-#include "hcs_utility/thread_config.hpp"
+#include "rt_sampler.hpp"
+#include "hcs_base/thread/thread_config.hpp"
 
 #include "tdigest.hpp"
 

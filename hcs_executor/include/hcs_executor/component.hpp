@@ -17,9 +17,9 @@
 #include <utility>
 #include <vector>
 
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/raw_storage.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/raw_storage.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include "hcs_executor/graph.hpp"
 

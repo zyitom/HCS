@@ -16,9 +16,12 @@
 #include <eigen3/Eigen/Dense>
 
 #include <hcs_executor/component.hpp>
-#include <hcs_utility/double_buffer.hpp>
-#include <hcs_utility/endian_promise.hpp>
-#include <hcs_utility/package_receive.hpp>
+#include <hcs_base/channel/double_buffer.hpp>
+#include <hcs_base/protocol/endian_promise.hpp>
+#include <hcs_base/protocol/package_receive.hpp>
+
+#include "hardware/device/serial_line.hpp"
+#include "hardware/util/required.hpp"
 
 namespace hcs_core::hardware::device {
 using hcs_executor::Component;
@@ -70,6 +73,10 @@ public:
         Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
         Config& set_module_frame(ModuleFrame value) { return module_frame = value, *this; }
 
+        /// The UART rate the module's flash is set to (CONFIG SERIAL BAUD). Required: it is a
+        /// property of this module, not of the model.
+        util::Required<std::uint32_t> baudrate;
+
         /// Update cycles without a new frame before the module is considered offline. Counted in
         /// update_status() calls: at a 1 kHz control loop and the default 100 Hz HI91 output one
         /// frame is expected every 10 cycles.
@@ -78,7 +85,7 @@ public:
         ModuleFrame module_frame = ModuleFrame::kEnu;
     };
 
-    Hipnuc(Component& status_component, const std::string& name_prefix) {
+    Hipnuc(Component& status_component, const std::string& name_prefix, const Config& config) {
         status_component.register_output(
             name_prefix + "/quaternion", quaternion_output_, Eigen::Quaterniond::Identity());
         status_component.register_output(
@@ -105,11 +112,6 @@ public:
         status_component.register_output(
             name_prefix + "/angular_velocity/z", angular_velocity_z_, 0.0);
 
-        configure(Config{});
-    }
-
-    Hipnuc(Component& status_component, const std::string& name_prefix, const Config& config)
-        : Hipnuc(status_component, name_prefix) {
         configure(config);
     }
 
@@ -120,7 +122,11 @@ public:
 
     ~Hipnuc() = default;
 
+    /// The port setting this module needs: its flash baudrate, 8N1 (HI91 framing).
+    [[nodiscard]] SerialLine serial_line() const noexcept { return {.baudrate = baudrate_}; }
+
     void configure(const Config& config) {
+        baudrate_ = config.baudrate;
         offline_timeout_ = config.offline_timeout;
         module_frame_    = config.module_frame;
 
@@ -470,6 +476,8 @@ private:
     Component::OutputInterface<double> angular_velocity_x_;
     Component::OutputInterface<double> angular_velocity_y_;
     Component::OutputInterface<double> angular_velocity_z_;
+
+    std::uint32_t baudrate_ = 0;
 };
 
 } // namespace hcs_core::hardware::device

@@ -7,7 +7,7 @@
 
 #include <cstdio>
 
-#include <hcs_utility/machine_guard.hpp>
+#include <hcs_base/check/machine_guard.hpp>
 
 int main() {
     const auto findings = hcs_utility::MachineGuard::run();

@@ -6,8 +6,8 @@
 #include <hcs_executor/component.hpp>
 #include <hcs_msgs/mouse.hpp>
 #include <hcs_msgs/switch.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include "controller/gimbal/two_axis_gimbal_solver.hpp"
 

@@ -53,7 +53,8 @@ struct Bench {
 };
 
 DmMotor::Config j4310(std::uint32_t esc_id, std::uint32_t master_id) {
-    return DmMotor::Config{DmMotor::Type::kJ4310, esc_id, master_id};
+    return DmMotor::Config{
+        DmMotor::ControlMode::kTorque, esc_id, master_id, DmMotor::kJ4310Factory};
 }
 
 // raw → rad，按协议 V1.4 图 2：raw 0 ↔ -PMAX，raw 65535 ↔ +PMAX
@@ -141,7 +142,9 @@ TEST(DmMotor, NothingDecodedBeforeFirstFrame) {
 TEST(DmMotor, ZeroAngleFollowsPositionMax) {
     constexpr double kOrgPos = 0.717242718;
     for (const double pmax : {6.283185, 12.5, 12.566}) {
-        Bench bench{j4310(0x02, 0x14).set_position_max(pmax).set_zero_angle(kOrgPos)};
+        auto config = DmMotor::Config{
+            DmMotor::ControlMode::kTorque, 0x02, 0x14, DmMotor::MitRange{pmax, 30.0, 10.0}};
+        Bench bench{config.set_zero_angle(kOrgPos)};
         const auto raw = static_cast<std::uint16_t>(std::lround((kOrgPos + pmax) * 65535 / (2 * pmax)));
         ASSERT_NEAR(decode(raw, pmax), kOrgPos, pmax / 65535) << "pmax " << pmax;
 

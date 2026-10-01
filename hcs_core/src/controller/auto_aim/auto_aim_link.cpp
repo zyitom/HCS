@@ -20,8 +20,8 @@
 #include <hcs_link/channel.hpp>
 #include <hcs_link/quiescent_cell.hpp>
 #include <hcs_link/rendezvous.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include "controller/auto_aim/aim_follower.hpp"
 

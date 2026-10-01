@@ -6,7 +6,7 @@ from launch import (
     LaunchDescription,
     LaunchDescriptionEntity,
 )
-from launch.actions import LogInfo
+from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
 
 from launch_ros.actions import Node
@@ -33,17 +33,20 @@ class MyLaunchDescriptionEntity(LaunchDescriptionEntity):
             )
         )
 
+        # 先机器、后机器人：机器人 yaml 里的同名键覆盖机器配置。machine:=none 不加载。
+        config_dir = os.path.join(FindPackageShare("hcs_bringup").perform(context), "config")
+        machine_name = LaunchConfiguration("machine").perform(context)
+        parameter_files = []
+        if machine_name != "none":
+            parameter_files.append(os.path.join(config_dir, "machine", machine_name + ".yaml"))
+            entities.append(LogInfo(msg=f"Machine config: machine/{machine_name}.yaml"))
+        parameter_files.append(os.path.join(config_dir, robot_name + ".yaml"))
+
         entities.append(
             Node(
                 package="hcs_executor",
                 executable="hcs_executor",
-                parameters=[
-                    os.path.join(
-                        FindPackageShare("hcs_bringup").perform(context),
-                        "config",
-                        robot_name + ".yaml",
-                    ),
-                ],
+                parameters=parameter_files,
                 respawn=True,
                 respawn_delay=1.0,
                 output="log",  # stdout and stderr are logged to launch log file and stderr to the screen.
@@ -57,6 +60,16 @@ class MyLaunchDescriptionEntity(LaunchDescriptionEntity):
 
 
 def generate_launch_description():
-    ld = LaunchDescription([MyLaunchDescriptionEntity()])
+    ld = LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "machine",
+                default_value="tl101",
+                description="config/machine/<machine>.yaml, loaded before the robot yaml; "
+                "'none' skips it",
+            ),
+            MyLaunchDescriptionEntity(),
+        ]
+    )
 
     return ld
