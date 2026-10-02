@@ -5,22 +5,19 @@
 namespace hcs_msgs {
 
 enum class ShootMode : uint8_t {
-    // Fires one projectile each time the mouse is clicked.
+    // 每点一下鼠标打一发。
     SINGLE = 0,
 
-    // Continuously fires projectiles while the mouse is held down.
+    // 按住鼠标连续发射。
     AUTOMATIC = 1,
 
-    // Fires one projectile each time the mouse is clicked, with improved accuracy at the cost of
-    // increased firing delay.
+    // 每点一下鼠标打一发，更准，代价是发射延迟更大。
     PRECISE = 2,
 
-    // Fires one projectile each time the mouse is clicked, with reduced input delay for faster
-    // response, may cause unintended emissions.
+    // 每点一下鼠标打一发，输入延迟更小、响应更快，可能误发。
     LOW_LATENCY = 3,
 
-    // Continuously fires projectiles while the mouse is held down, ignoring heat limits but causing
-    // health loss.
+    // 按住鼠标连续发射，不管热量上限，代价是扣血。
     OVERDRIVE = 4,
 };
 

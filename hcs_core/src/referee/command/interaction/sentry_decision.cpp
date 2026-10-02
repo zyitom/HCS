@@ -184,9 +184,8 @@ private:
 
             if (kPoseEvents.contains(event)) {
                 if (!logged_events_.contains(event)) {
-                    RCLCPP_INFO(
-                        get_logger(), "Sentry pose command: %d",
-                        std::to_underlying(command_.posture));
+                    logger().rt().info(
+                        "Sentry pose command: {}", static_cast<int>(command_.posture));
                     logged_events_.insert(event);
                 }
             }
@@ -200,8 +199,9 @@ private:
         const auto energy_core_status = *energy_core_status_;
 
         if (fb_posture_id != last_fb_posture_) {
-            RCLCPP_INFO(
-                get_logger(), "Sentry posture feedback: %d → %d", last_fb_posture_, fb_posture_id);
+            logger().rt().info(
+                "Sentry posture feedback: {} → {}", static_cast<int>(last_fb_posture_),
+                static_cast<int>(fb_posture_id));
             last_fb_posture_ = fb_posture_id;
         }
 

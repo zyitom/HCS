@@ -96,7 +96,7 @@ requires(std::is_integral_v<T> || std::is_floating_point_v<T>) struct EndianCont
         return U(*this) != o;
     }
 
-    // Arithmetic assignment operators
+    // 算术赋值运算符
     EndianContainer& operator++() noexcept /* prefix */ {
         *this = T(*this) + T(1);
         return *this;
@@ -116,7 +116,7 @@ requires(std::is_integral_v<T> || std::is_floating_point_v<T>) struct EndianCont
         return t;
     }
 
-    // Compound assignment operators
+    // 复合赋值运算符
     EndianContainer& operator+=(const T& value) noexcept {
         *this = T(*this) + value;
         return *this;

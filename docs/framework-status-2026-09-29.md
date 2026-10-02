@@ -194,3 +194,76 @@ DJI 合帧与槽位、跨总线帧序。唯一有意的差异是 pitch：力矩�
 读请求：ID 0x7FF，`[CANID_L, CANID_H, 0x33, RID, 0,0,0,0]`；回复在 **MST_ID**（与反馈帧同 ID），
 `[CANID_L, CANID_H, 0x33, RID, 4 字节 float]`。**必须同时加过滤**：回复的 D[0] 是 CANID 低字节，恰好能通过
 现在"D[0] 低 4 位 == ESC_ID"的反馈校验，不筛掉（D[2]==0x33 且 D[0..1]==本电机 ID）就会被当 MIT 反馈解码。
+
+## 8. 2026-10-02：异步日志
+
+第 3 节第 3 条、第 7 节第 2 条当时的结论（"没有另造异步日志队列"、libhcs 的同步日志"未改"）已经过时：
+后来还是做了一个自己的日志库 `hcs_log`，libhcs 也加了公开的日志出口并接了上去。设计、用法、
+保证与不保证见 [logging.md](logging.md)。
+
+- 第 7 节"顺带发现"里 `referee/status.cpp` 在周期域打日志那一条，日志的部分已解决（改走
+  `logger().rt()`）。那个文件剩下的 `-Wfunction-effects` 告警是取时钟和 `std::function`，与日志无关。
+- 仍然没有上车验证。
+
+## 9. 2026-10-02：设备驱动层改薄（收尾）
+
+2026-10-01 起的一轮重构把设备驱动改成了"只写协议"：驱动的每个函数都在控制线程上被调用，里面不再有
+原子、序号配对、掉线计数；线程边界、掉线计数和健康输出只在端口包装层写一遍
+（`hardware/board/devices.hpp` 的 `Can<Driver>` / `Serial<Driver>`，约定是那里的两个 concept）。
+[balance-infantry-rewrite.md](balance-infantry-rewrite.md) 里"`can_receive` 分发到 `device.store_status()`、
+`update()` 里调 `update_status()`"的描述说的是改之前的样子。
+
+那一轮停在"驱动和两个测试改完"，这次补完：
+
+- `test_lk_motor` / `test_hipnuc` / `test_motor_command_frames` 改到新接口（之前编不过，`colcon build` 一直失败）。
+- 从驱动挪到包装层的行为原来的测试跟着消失了，在 `test_board` 里补回来（`DeviceWrapper.*` 9 个用例）：
+  帧 / 字节不在 IO 线程上解码、CAN 只留最新一帧、被拒的帧只计数不算反馈、掉线计数与
+  `<名字>/online` `<名字>/health`、串口溢出会报出来、IO 线程与控制线程并发时一帧不撕一帧不少。
+  故意把包装层改坏三处，其中 5 个用例报错。
+- VT13 遥控驱动在那一轮被整个重写而没有测试，新增 `test_vt13`（11 个用例）。解码逻辑与重写前逐行一致。
+  UBSan 顺带抓到一处未对齐访问（键盘位图直接从 packed 结构体的奇数偏移成员上取引用），已修。
+
+现在 gcc 14 与 clang 20 各全量构建一遍，8 个包、34 个测试程序、261 个 gtest 用例全过；clang 的
+`-Wfunction-effects` 仍是 22 条，都在 `referee/` 与 `hcs_link_probe.cpp`，设备层和测试里 0 条。
+
+之后又做了一轮，把设备层里不一致的地方统一掉：
+
+- **DR16 移植过来了**，形状和 VT13 一一对应：`dr16.hpp`（只解帧）+ `dr16_remote.hpp`（串口驱动），
+  `test_dr16` 13 个用例。DBUS 没有帧头也没有校验，对齐靠"一拍没字节就扔掉半帧"加"值不合法就丢一个字节重试"。
+- 原来的 `RemoteControl`（里面写死了 VT13 的仲裁）改成 `RemoteOutputs`：只是 `/remote/*` 那组输出。
+  每种接收机自己决定这一拍发布什么。两种接收机接在同一块板上会在构造时被拒绝（输出重名）。
+- 五个旧驱动统一了四件事：反馈 / 指令 id 只叫 `feedback_id()` / `command_id()`（原来驱动里叫
+  `recv_id` / `send_id`，包装层里叫另一套）；`configure()` 不再是公开的第二步初始化；DJI 只剩一个构造函数；
+  整数类型一律写 `std::uintN_t`。
+
+设备层现在的样子：`device/` 下每个在构建里的驱动都满足 `devices.hpp` 里两个 concept 之一、都有自己的单测。
+
+之后把 RMCS 留下的东西也移植了，注释统一成中文：
+
+- **板载 IMU（BMI088）**：加了第三种端口 `ImuPort` 和包装层 `Imu<Driver>`（约定是 `ImuDriver` 这个 concept），
+  IO 线程只把原始样本放进队列，解算在控制线程上。两种解算都移植了：
+  - `Bmi088`（Mahony）：步长改成取自陀螺仪样本的板上时间戳。RMCS 是每拍一步、步长写死 1 ms，
+    在 HCS 里那等于用控制频率算 dt，是不允许的。
+  - `Bmi088Ekf`（按时间戳的 EKF）连同 `BoardClockLifter`、`filter/imu_ekf.hpp`、
+    `hcs_msgs` 的 `BoardClock` / `ImuSnapshot`。算法未改；原来在 IO 线程上加锁解算，现在不需要锁。
+    clang 推不出 Eigen 的特征值分解"不阻塞"，所以滤波器上是手工担保，依据是 RealtimeSanitizer 的实测。
+  - 所有 IMU（含 HiPNUC）共用一组输出 `ImuOutputs`，消费者不用管车上装的是哪一种。
+- **射击控制器 8 个**（热量 ×2、摩擦轮 ×2、17 mm / 42 mm 拨弹、推杆、弹速记录）移进构建并登记为插件，
+  `test_shooting` 27 个用例。和 RMCS 不同的地方：
+  - 所有计时改成按 `Tick::dt` 累计的时长，不数拍、不读时钟；
+  - 周期域里的 `RCLCPP_INFO` 改成 `logger().rt()`；
+  - 弹速记录器按两个域重写：控制线程只把样本放进队列，排序、写文件、打日志在记录线程上。
+  - RMCS 里看着像笔误的几处**原样保留**并在文件头写明了，上车前要对着实物确认：英雄摩擦轮的
+    卡住检测两个分支都返回 false；英雄出弹判断比的是第 2 个轮的目标转速；17 mm 摩擦轮的卡住计时不清零；
+    推杆的"上膛完成"信号在下一次顶住之前一直保持上一发的值。
+- **注释**：驱动、fast_tf、hcs_base、hcs_msgs 里的英文注释都翻成了中文（逐个文件核对过去掉注释后代码不变）。
+
+现在 gcc 14 与 clang 20 各全量构建一遍，8 个包、37 个测试程序、322 个 gtest 用例全过；`plugins.xml`
+里声明的 38 个组件类都确实由库导出。clang 的 `-Wfunction-effects` 仍是 22 条，新代码里 0 条。
+
+还没统一的：
+- `hardware/deprecated_reference_rmcs_real_car.cpp` 是一整台 RMCS 车（变形步兵）的硬件文件，留作参考，
+  不在构建里。HCS 里没有它要的底盘控制器、超级电容驱动和状态监视器。
+- 仍是英文注释的：`hcs_executor/src/tdigest.hpp`（源自 Apache-2.0 的第三方代码，保留上游注释）、
+  `hcs_core/src/referee/`（约定不动的目录）、libhcs（它自己的规范要求英文）。
+- DR16、BMI088、射击控制器都没有接过真机，也没有哪一份车的配置用到它们。

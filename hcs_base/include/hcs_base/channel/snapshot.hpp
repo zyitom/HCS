@@ -39,18 +39,19 @@ public:
 
     /// 事件域调用。wait-free，不阻塞任何人。
     void publish(const T& value, Timestamp sampled_at) noexcept {
-        const std::uint32_t sequence = next_sequence(write_seq_.load(std::memory_order_relaxed));
-        write_seq_.store(sequence, std::memory_order_relaxed);
+        const std::uint32_t sequence =
+            next_sequence(writer_.sequence.load(std::memory_order_relaxed));
+        writer_.sequence.store(sequence, std::memory_order_relaxed);
 
-        cells_[write_index_] = Cell{value, sampled_at, sequence};
+        cells_[writer_.index] = Cell{value, sampled_at, sequence};
         // 必须是 acq_rel，两半都要：
         //   release —— 把上面那次整格写钉在交换之前，读者 acquire 到这个槽位时格子必然完整；
         //   acquire —— 换回来的那个槽是读者刚还回来的，读者对它的最后一次读必须在
         //              下一轮我们重写它之前。少了这一半，「读者读完 X」与「写者重用 X」
         //              之间没有 happens-before，形式上就是数据竞争。
         //              x86 上 LOCK XCHG 本来就是全屏障、看不出来，aarch64 上会真撕。
-        const unsigned old = back_.exchange(write_index_ | kDirty, std::memory_order_acq_rel);
-        write_index_ = old & kMask;
+        const unsigned old = back_.exchange(writer_.index | kDirty, std::memory_order_acq_rel);
+        writer_.index = old & kMask;
     }
 
     /// 周期域调用。wait-free。**非 const**（推进读者私有状态）。
@@ -59,9 +60,9 @@ public:
         if (back_.load(std::memory_order_relaxed) & kDirty)
             // 同样两半都要：acquire 看见写者的整格写，release 把我们对旧槽的最后一次读
             // 钉在交还之前（写者随后就会重用那个槽）。参见 publish() 里的注释。
-            read_index_ = back_.exchange(read_index_, std::memory_order_acq_rel) & kMask;
+            reader_.index = back_.exchange(reader_.index, std::memory_order_acq_rel) & kMask;
 
-        const Cell& cell = cells_[read_index_];
+        const Cell& cell = cells_[reader_.index];
         Reading reading;
         reading.value = cell.value;
         reading.sequence = cell.sequence;
@@ -69,14 +70,14 @@ public:
         reading.age = reading.valid
                         ? std::chrono::duration_cast<Duration>(reference - cell.sampled_at)
                         : Duration{};
-        reading.fresh = reading.valid && (cell.sequence != last_seen_seq_);
-        last_seen_seq_ = cell.sequence;
+        reading.fresh = reading.valid && (cell.sequence != reader_.last_seen);
+        reader_.last_seen = cell.sequence;
         return reading;
     }
 
     /// 只读窥视，不推进 fresh 状态。给 reporter / 调试用。
     [[nodiscard]] std::uint32_t published_sequence() const noexcept {
-        return write_seq_.load(std::memory_order_relaxed);
+        return writer_.sequence.load(std::memory_order_relaxed);
     }
 
     /// 三个槽位号。仅供单测验排列不变式用，产品代码不要碰——它不参与任何同步。
@@ -88,30 +89,48 @@ public:
 
     [[nodiscard]] SlotIndices slot_indices_for_test() const noexcept {
         return SlotIndices{
-            write_index_, read_index_, back_.load(std::memory_order_relaxed) & kMask};
+            writer_.index, reader_.index, back_.load(std::memory_order_relaxed) & kMask};
     }
 
 private:
-    struct Cell {
+    // 布局规则：**一条 cache line 只有一个写者**。两侧各自的状态、三个槽位、那个共享的
+    // 交换字，各占自己的行。不这样的话，写者每推进一次自己的序号、读者每记一次 last_seen，
+    // 都会把对方正要用的那条行从对方核上抢走——逻辑上互不相干，硬件上却在抢同一条行。
+
+    /// 一个槽位。按 cache line 对齐（sizeof 随之取整到行的整数倍），
+    /// 所以写者正在写的那格与读者正在读的那格永远不共行，无论 T 多小。
+    struct alignas(hcs_utility::kCacheLine) Cell {
         T value;
         Timestamp sampled_at;
         std::uint32_t sequence;
     };
 
+    /// 只有写者碰。
+    struct alignas(hcs_utility::kCacheLine) WriterSide {
+        unsigned index = 1;
+        // 本该是普通 uint32；用 atomic 只为让 published_sequence() 能被 reporter 线程
+        // 无 UB 地窥视，relaxed 不参与任何跨线程定序。
+        std::atomic<std::uint32_t> sequence{0};
+    };
+
+    /// 只有读者碰。
+    struct alignas(hcs_utility::kCacheLine) ReaderSide {
+        unsigned index = 2;
+        std::uint32_t last_seen = 0;
+    };
+
     static constexpr unsigned kMask = 0b011u;
     static constexpr unsigned kDirty = 0b100u;
 
-    // 不变式：任何时刻 {write_index_, read_index_, back_.load() & kMask} 都是 {0,1,2} 的一个排列。
-    // 三个槽位分别是“写者正在写的”“读者正在读的”“已发布待取的”，两次 exchange 只是换手，
-    // 从不复制槽号，所以排列性由构造时的 {1,2,0} 一路保持下去。
+    // 不变式：任何时刻 {writer_.index, reader_.index, back_.load() & kMask} 都是 {0,1,2} 的
+    // 一个排列。三个槽位分别是“写者正在写的”“读者正在读的”“已发布待取的”，两次 exchange
+    // 只是换手，从不复制槽号，所以排列性由构造时的 {1,2,0} 一路保持下去。
     Cell cells_[3]{};
+    /// 两侧唯一共享的一个字。换手时这条行必然在两核之间走一趟——那是传递数据本身的代价，
+    /// 省不掉；独占一行是为了让它**只**在换手时走。
     alignas(hcs_utility::kCacheLine) std::atomic<unsigned> back_{0};
-    unsigned write_index_ = 1; // 写者私有
-    unsigned read_index_ = 2;  // 读者私有
-    // 写者私有计数器，本该是普通 uint32；用 atomic 只为让 published_sequence()
-    // 能被 reporter 线程无 UB 地窥视，relaxed 不参与任何跨线程定序。
-    std::atomic<std::uint32_t> write_seq_{0};
-    std::uint32_t last_seen_seq_ = 0;
+    WriterSide writer_;
+    ReaderSide reader_;
 };
 
 } // namespace hcs_sync

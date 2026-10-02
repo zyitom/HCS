@@ -8,13 +8,15 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <exception>
 #include <regex>
 
 #include <pluginlib/class_loader.hpp>
 #include <rclcpp/executors.hpp>
-#include <rclcpp/logging.hpp>
 
 #include "executor.hpp"
+#include "rclcpp_log_sink.hpp"
 #include "hcs_executor/component.hpp"
 #include "hcs_base/thread/thread_config.hpp"
 
@@ -24,9 +26,9 @@ void segmentation_fault_handler(int) {
     int size = backtrace(array, 100);
     fprintf(stderr, "[Fatal] Segmentation fault\n>>> STACK TRACE BEGIN\n");
 
-    // Print the stack trace to stderr.
+    // 把栈回溯打到 stderr。
     if (size >= 2)
-        // Remove the stack trace used to call this function.
+        // 去掉调用这个函数本身占的那几层栈。
         backtrace_symbols_fd(array + 2, size - 2, STDERR_FILENO);
     else
         backtrace_symbols_fd(array, size, STDERR_FILENO);
@@ -82,8 +84,30 @@ static void apply_debug_ptracer_grant_from_environment() {
         fprintf(stderr, "[warn] PR_SET_PTRACER failed: %s\n", std::strerror(errno));
 }
 
+/// 未捕获的异常会走到 std::terminate，那里不做栈展开，也不跑静态析构：
+/// 还在队列里的日志——多半正是解释"为什么起不来"的那几行——会跟着进程一起消失。
+/// 所以先把队列排空，再交回原来的处理函数（它负责打印异常的 what() 并 abort）。
+///
+/// 只等一小会儿：输出端堵着（stderr 那头的管道没人读）的话，这几行日志就不要了。
+/// 进程必须死得掉——它不死，USB 不断，板子不会进失联保护，电机停在最后一条指令上。
+static std::terminate_handler previous_terminate_handler = nullptr;
+
+static void flush_logs_then_terminate() {
+    // 兜底，先设好再做别的。排空日志有超时，但原来的处理函数往 stderr 打 what() 是一次
+    // 没有超时的 fputs：实测 stderr 接一根写满了没人读的管道时，进程就挂在那一句上，
+    // SIGTERM 也收不走它（rclcpp 的信号处理只置一个标志，等 spin 去看）。
+    // SIGALRM 没有人接管，默认动作就是结束进程——两秒后内核无条件送到。
+    ::alarm(2);
+
+    (void)hcs_executor::process_log_backend().flush_for(std::chrono::milliseconds{500});
+    if (previous_terminate_handler != nullptr)
+        previous_terminate_handler();
+    std::abort();
+}
+
 int main(int argc, char** argv) {
     std::signal(SIGSEGV, segmentation_fault_handler);
+    previous_terminate_handler = std::set_terminate(flush_logs_then_terminate);
 
     // 在 init 之前 —— 见上面那段注释。
     apply_process_affinity_from_environment();
@@ -93,6 +117,11 @@ int main(int argc, char** argv) {
 
     pluginlib::ClassLoader<hcs_executor::Component> component_loader(
         "hcs_executor", "hcs_executor::Component");
+
+    // 从这里起日志走 rclcpp。声明在 component_loader 之后是有意的：它先析构，
+    // 在组件库被卸载之前把日志队列排空（见 RclcppLogScope）。
+    hcs_executor::RclcppLogScope rclcpp_log_scope{hcs_executor::process_log_backend()};
+    const hcs_log::Logger log{hcs_executor::process_log_backend(), "hcs_executor"};
 
     rclcpp::executors::SingleThreadedExecutor rcl_executor;
     auto executor = std::make_shared<hcs_executor::Executor>("hcs_executor", rcl_executor);
@@ -125,6 +154,10 @@ int main(int argc, char** argv) {
         executor->add_component(component);
     }
 
+    // 组件到齐了，哪些名字背后是节点也就定了：不是节点的那些从这里起挂到 executor 的
+    // logger 下面，才上得了 /rosout（见 RclcppSink）。
+    rclcpp_log_scope.attach(executor->get_logger(), executor->node_loggers());
+
     executor->start();
 
     // spin 线程自己的亲和/优先级。注意它**只管这一条线程** —— DDS 那十几条早在建节点时
@@ -137,16 +170,15 @@ int main(int argc, char** argv) {
             const auto spin_thread_config =
                 hcs_utility::ThreadConfig{spin_thread_config_spec, "hcs-spin"};
             if (const auto result = spin_thread_config.apply_to_current_thread(); !result)
-                RCLCPP_WARN(
-                    executor->get_logger(), "Failed to apply spin_thread_config: %s",
-                    result.error().c_str());
+                log.warn("Failed to apply spin_thread_config: {}", result.error());
         } catch (const std::exception& exception) {
-            RCLCPP_WARN(
-                executor->get_logger(), "Invalid spin_thread_config: %s", exception.what());
+            log.warn("Invalid spin_thread_config: {}", exception.what());
         }
     }
 
     rcl_executor.spin();
 
+    // 关 rclcpp 之前把日志的输出端换回 stderr：关掉之后再走 rclcpp 的日志没人保证。
+    rclcpp_log_scope.restore();
     rclcpp::shutdown();
 }

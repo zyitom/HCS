@@ -1,286 +1,249 @@
 #pragma once
 
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-
-#include <atomic>
-#include <bit>
-#include <chrono>
+#include <span>
 
 #include <eigen3/Eigen/Dense>
-#include <rmcs_msgs/keyboard.hpp>
-#include <rmcs_msgs/mouse.hpp>
-#include <rmcs_msgs/switch.hpp>
+#include <hcs_msgs/keyboard.hpp>
+#include <hcs_msgs/mouse.hpp>
+#include <hcs_msgs/switch.hpp>
 
-namespace rmcs_core::hardware::device {
+// DBUS 帧里的多字节字段按小端排，位域从低位排起。
+static_assert(std::endian::native == std::endian::little, "wire layout assumes a LE host");
 
+namespace hcs_core::hardware::device {
+
+/// DR16 接收机的 DBUS 字节流：18 字节一帧，**没有帧头，也没有校验**，帧与帧之间只靠线路上的
+/// 空闲隔开（一帧发 2 ms，然后静默到下一帧）。
+///
+///   位 0-43     四个 11 位摇杆通道，中位 1024，量程 364..1684
+///   位 44-45    右拨杆，46-47 左拨杆：1 上 / 2 下 / 3 中
+///   字节 6-11   鼠标 x / y / z，int16
+///   字节 12-13  鼠标左键、右键，各一个字节（0 / 1）
+///   字节 14-15  键盘位图
+///   字节 16-17  拨轮，同摇杆通道的编码
+///
+/// 只写协议：全部成员都在控制线程上，字节由端口包装层（board::Serial<>）按到达顺序喂进来；
+/// 掉线判定也在包装层，结果经 set_online() 告诉这里。
+///
+/// 对齐。字节流里没有任何东西标着"一帧从这里开始"，所以靠两条规矩：
+///   - 空闲：一拍里一个字节都没来，手上那半帧就不要了（end_of_tick()）。帧间的静默远比一拍长，
+///     所以半帧只可能是上电时从中间接上的、或者丢过字节之后剩下的。
+///   - 合理性：凑满 18 字节但通道或拨杆的值不在协议允许的范围里，说明没对齐，丢一个字节再试。
+/// 第二条是给"控制回路慢到每一拍都有字节"的情况兜底的；它会放过恰好看起来合理的错位帧，
+/// 所以真正靠的是第一条。
 class Dr16 {
 public:
+    static constexpr std::size_t kFrameSize = 18;
+
     Dr16() = default;
 
-    void store_status(const std::byte* uart_data, size_t uart_data_length) {
-        if (uart_data_length != 6 + 8 + 4)
-            return;
+    /// 喂一段串口字节，帧边界不保证。
+    /// @return 这一段里有没有解出至少一帧
+    bool on_bytes(std::span<const std::byte> uart_data) noexcept {
+        received_this_tick_ = received_this_tick_ || !uart_data.empty();
 
-        // Avoid using reinterpret_cast here because it does not account for pointer alignment.
-        // Dr16DataPart structures are aligned, and using reinterpret_cast on potentially unaligned
-        // uart_data can cause undefined behavior on architectures that enforce strict alignment
-        // requirements (e.g., ARM).
-        // Directly accessing unaligned memory through a casted pointer can lead to crashes,
-        // inefficiencies, or incorrect data reads. Instead, std::memcpy safely copies the data from
-        // unaligned memory to properly aligned structures without violating alignment or strict
-        // aliasing rules.
+        bool decoded = false;
+        for (const std::byte byte : uart_data) {
+            frame_[filled_++] = byte;
+            if (filled_ < kFrameSize)
+                continue;
 
-        uint64_t part1{};
-        std::memcpy(&part1, uart_data, 6);
-        uart_data += 6;
-        data_part1_.store(part1, std::memory_order::relaxed);
-
-        uint64_t part2{};
-        std::memcpy(&part2, uart_data, 8);
-        uart_data += 8;
-        data_part2_.store(part2, std::memory_order::relaxed);
-
-        uint32_t part3{};
-        std::memcpy(&part3, uart_data, 4);
-        uart_data += 4;
-        data_part3_.store(part3, std::memory_order::relaxed);
-
-        last_remote_control_received_at_ = Clock::now();
-        valid_ = true;
-    }
-
-    void update_status() {
-        const auto now = Clock::now();
-        refresh_validity(now);
-        if (!valid_)
-            return;
-
-        auto part1 alignas(uint64_t) =
-            std::bit_cast<Dr16DataPart1>(data_part1_.load(std::memory_order::relaxed));
-
-        auto channel_to_double = [](int32_t value) {
-            value -= 1024;
-            if (-660 <= value && value <= 660)
-                return value / 660.0;
-            return 0.0;
-        };
-        joystick_right_.y = -channel_to_double(static_cast<uint16_t>(part1.joystick_channel0));
-        joystick_right_.x = channel_to_double(static_cast<uint16_t>(part1.joystick_channel1));
-        joystick_left_.y = -channel_to_double(static_cast<uint16_t>(part1.joystick_channel2));
-        joystick_left_.x = channel_to_double(static_cast<uint16_t>(part1.joystick_channel3));
-
-        switch_right_ = static_cast<Switch>(part1.switch_right);
-        switch_left_ = static_cast<Switch>(part1.switch_left);
-
-        auto part2 alignas(uint64_t) =
-            std::bit_cast<Dr16DataPart2>(data_part2_.load(std::memory_order::relaxed));
-
-        mouse_velocity_.x = -part2.mouse_velocity_y / 32768.0;
-        mouse_velocity_.y = -part2.mouse_velocity_x / 32768.0;
-
-        mouse_wheel_ = -part2.mouse_velocity_z / 32768.0;
-
-        mouse_.left = part2.mouse_left;
-        mouse_.right = part2.mouse_right;
-
-        auto part3 alignas(uint32_t) =
-            std::bit_cast<Dr16DataPart3>(data_part3_.load(std::memory_order::relaxed));
-
-        keyboard_ = part3.keyboard;
-        rotary_knob_ = channel_to_double(part3.rotary_knob);
-
-        update_rotary_knob_switch();
-    }
-
-    struct Vector {
-        constexpr static Vector zero() { return {.x = 0, .y = 0}; }
-        double x, y;
-    };
-
-    enum class Switch : uint8_t { kUnknown = 0, kUp = 1, kDown = 2, kMiddle = 3 };
-
-    struct [[gnu::packed]] Mouse {
-        constexpr static Mouse zero() {
-            constexpr uint8_t zero = 0;
-            return std::bit_cast<Mouse>(zero);
+            if (decode()) {
+                filled_ = 0;
+                decoded = true;
+            } else {
+                ++rejected_frames_;
+                std::memmove(frame_.data(), frame_.data() + 1, kFrameSize - 1);
+                filled_ = kFrameSize - 1;
+            }
         }
-
-        bool left  : 1;
-        bool right : 1;
-    };
-    static_assert(sizeof(Mouse) == 1);
-
-    struct [[gnu::packed]] Keyboard {
-        constexpr static Keyboard zero() {
-            constexpr uint16_t zero = 0;
-            return std::bit_cast<Keyboard>(zero);
-        }
-
-        bool w     : 1;
-        bool s     : 1;
-        bool a     : 1;
-        bool d     : 1;
-        bool shift : 1;
-        bool ctrl  : 1;
-        bool q     : 1;
-        bool e     : 1;
-        bool r     : 1;
-        bool f     : 1;
-        bool g     : 1;
-        bool z     : 1;
-        bool x     : 1;
-        bool c     : 1;
-        bool v     : 1;
-        bool b     : 1;
-    };
-    static_assert(sizeof(Keyboard) == 2);
-
-    Eigen::Vector2d joystick_right() const { return to_eigen_vector(joystick_right_); }
-    Eigen::Vector2d joystick_left() const { return to_eigen_vector(joystick_left_); }
-
-    rmcs_msgs::Switch switch_right() const {
-        return std::bit_cast<rmcs_msgs::Switch>(switch_right_);
+        return decoded;
     }
-    rmcs_msgs::Switch switch_left() const { return std::bit_cast<rmcs_msgs::Switch>(switch_left_); }
 
-    Eigen::Vector2d mouse_velocity() const { return to_eigen_vector(mouse_velocity_); }
+    /// 每拍一次，在这一拍的 on_bytes() 都调完之后：这一拍没有字节来，就把半帧扔掉。
+    void end_of_tick() noexcept {
+        if (!received_this_tick_)
+            filled_ = 0;
+        received_this_tick_ = false;
+    }
 
-    rmcs_msgs::Mouse mouse() const { return std::bit_cast<rmcs_msgs::Mouse>(mouse_); }
-    rmcs_msgs::Keyboard keyboard() const { return std::bit_cast<rmcs_msgs::Keyboard>(keyboard_); }
+    /// 链路是否在线，每拍由掉线计数的那一方告知。掉线的那一拍把摇杆、拨杆、鼠标、键盘、拨轮
+    /// 全部归零：读它的人拿到的永远不是掉线前的最后一帧。
+    void set_online(bool online) noexcept {
+        if (valid_ && !online)
+            reset();
+        valid_ = online;
+    }
 
-    rmcs_msgs::Switch rotary_knob_switch() const { return rotary_knob_switch_; }
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
 
-    bool valid() const noexcept { return valid_; }
+    [[nodiscard]] const Eigen::Vector2d& joystick_right() const noexcept { return joystick_right_; }
+    [[nodiscard]] const Eigen::Vector2d& joystick_left() const noexcept { return joystick_left_; }
 
-    void set_timeout_enabled(bool enabled) { timeout_enabled_ = enabled; }
+    [[nodiscard]] hcs_msgs::Switch switch_right() const noexcept { return switch_right_; }
+    [[nodiscard]] hcs_msgs::Switch switch_left() const noexcept { return switch_left_; }
 
-    double rotary_knob() const { return rotary_knob_; }
+    [[nodiscard]] const Eigen::Vector2d& mouse_velocity() const noexcept { return mouse_velocity_; }
+    [[nodiscard]] double mouse_wheel() const noexcept { return mouse_wheel_; }
 
-    double mouse_wheel() const { return mouse_wheel_; }
+    [[nodiscard]] hcs_msgs::Mouse mouse() const noexcept { return mouse_; }
+    [[nodiscard]] hcs_msgs::Keyboard keyboard() const noexcept { return keyboard_; }
+
+    /// 拨轮，-1..1。
+    [[nodiscard]] double rotary_knob() const noexcept { return rotary_knob_; }
+    /// 拨轮当三挡开关用：过 ±0.7 换挡，带 0.05 的回差防抖。
+    [[nodiscard]] hcs_msgs::Switch rotary_knob_switch() const noexcept {
+        return rotary_knob_switch_;
+    }
+
+    /// 凑满了 18 字节但不像一帧的次数。一直在涨说明流没对齐：查波特率、校验位、取反。
+    [[nodiscard]] std::uint32_t rejected_frames() const noexcept { return rejected_frames_; }
 
 private:
-    static Eigen::Vector2d to_eigen_vector(Vector vector) { return {vector.x, vector.y}; }
+    static constexpr int kChannelCentre = 1024;
+    static constexpr int kChannelRange = 660;
 
-    void update_rotary_knob_switch() {
-        constexpr double divider = 0.7, anti_shake_shift = 0.05;
-        double upper_divider = divider, lower_divider = -divider;
+    struct [[gnu::packed]] Sticks {
+        std::uint64_t joystick_channel0 : 11;
+        std::uint64_t joystick_channel1 : 11;
+        std::uint64_t joystick_channel2 : 11;
+        std::uint64_t joystick_channel3 : 11;
+        std::uint64_t switch_right      : 2;
+        std::uint64_t switch_left       : 2;
+        std::uint64_t padding           : 16;
+    };
+    static_assert(sizeof(Sticks) == 8);
 
-        auto switch_value = rotary_knob_switch_;
-        if (switch_value == rmcs_msgs::Switch::UP)
-            upper_divider -= anti_shake_shift, lower_divider -= anti_shake_shift;
-        else if (switch_value == rmcs_msgs::Switch::MIDDLE)
-            upper_divider += anti_shake_shift, lower_divider -= anti_shake_shift;
-        else if (switch_value == rmcs_msgs::Switch::DOWN)
-            upper_divider += anti_shake_shift, lower_divider += anti_shake_shift;
+    struct [[gnu::packed]] Pointer {
+        std::int16_t mouse_velocity_x;
+        std::int16_t mouse_velocity_y;
+        std::int16_t mouse_velocity_z;
+        std::uint8_t mouse_left;
+        std::uint8_t mouse_right;
+    };
+    static_assert(sizeof(Pointer) == 8);
 
-        const auto knob_value = -rotary_knob_;
-        if (knob_value > upper_divider) {
-            switch_value = rmcs_msgs::Switch::UP;
-        } else if (knob_value < lower_divider) {
-            switch_value = rmcs_msgs::Switch::DOWN;
-        } else {
-            switch_value = rmcs_msgs::Switch::MIDDLE;
+    struct [[gnu::packed]] Keys {
+        std::uint16_t keyboard;
+        std::uint16_t rotary_knob;
+    };
+    static_assert(sizeof(Keys) == 4);
+    static_assert(6 + sizeof(Pointer) + sizeof(Keys) == kFrameSize);
+
+    [[nodiscard]] static constexpr bool channel_in_range(int raw) noexcept {
+        return kChannelCentre - kChannelRange <= raw && raw <= kChannelCentre + kChannelRange;
+    }
+
+    [[nodiscard]] static constexpr double channel_to_double(int raw) noexcept {
+        return channel_in_range(raw) ? (raw - kChannelCentre) / static_cast<double>(kChannelRange)
+                                     : 0.0;
+    }
+
+    /// 把凑满的 18 字节当一帧解。值不在协议允许的范围里就不解，返回 false。
+    bool decode() noexcept {
+        // memcpy 到对齐的局部变量上再读：缓存里的帧不保证对齐。前 6 个字节摊在一个 64 位里。
+        std::uint64_t sticks_bits = 0;
+        std::memcpy(&sticks_bits, frame_.data(), 6);
+        const auto sticks = std::bit_cast<Sticks>(sticks_bits);
+        Pointer pointer;
+        std::memcpy(&pointer, frame_.data() + 6, sizeof(pointer));
+        Keys keys;
+        std::memcpy(&keys, frame_.data() + 6 + sizeof(pointer), sizeof(keys));
+
+        const int channel0 = static_cast<int>(sticks.joystick_channel0);
+        const int channel1 = static_cast<int>(sticks.joystick_channel1);
+        const int channel2 = static_cast<int>(sticks.joystick_channel2);
+        const int channel3 = static_cast<int>(sticks.joystick_channel3);
+        const bool plausible =
+            channel_in_range(channel0) && channel_in_range(channel1) && channel_in_range(channel2)
+            && channel_in_range(channel3) && sticks.switch_right != 0 && sticks.switch_left != 0
+            && pointer.mouse_left <= 1 && pointer.mouse_right <= 1;
+        if (!plausible)
+            return false;
+
+        // 输出坐标：x 向前，y 向左。
+        joystick_right_ = {channel_to_double(channel1), -channel_to_double(channel0)};
+        joystick_left_ = {channel_to_double(channel3), -channel_to_double(channel2)};
+
+        // 线上的 1 上 / 2 下 / 3 中 与 hcs_msgs::Switch 的取值相同。
+        switch_right_ = static_cast<hcs_msgs::Switch>(sticks.switch_right);
+        switch_left_ = static_cast<hcs_msgs::Switch>(sticks.switch_left);
+
+        mouse_velocity_ = {
+            -pointer.mouse_velocity_y / 32768.0,
+            -pointer.mouse_velocity_x / 32768.0,
+        };
+        mouse_wheel_ = -pointer.mouse_velocity_z / 32768.0;
+        mouse_ = {.left = pointer.mouse_left != 0, .right = pointer.mouse_right != 0};
+
+        keyboard_ = std::bit_cast<hcs_msgs::Keyboard>(keys.keyboard);
+        rotary_knob_ = channel_to_double(keys.rotary_knob);
+        update_rotary_knob_switch();
+        return true;
+    }
+
+    void update_rotary_knob_switch() noexcept {
+        constexpr double kDivider = 0.7;
+        constexpr double kHysteresis = 0.05;
+        double upper = kDivider;
+        double lower = -kDivider;
+
+        // 离开当前挡要多走 kHysteresis：拨轮停在分界线上时不来回跳。
+        if (rotary_knob_switch_ == hcs_msgs::Switch::UP) {
+            upper -= kHysteresis;
+            lower -= kHysteresis;
+        } else if (rotary_knob_switch_ == hcs_msgs::Switch::MIDDLE) {
+            upper += kHysteresis;
+            lower -= kHysteresis;
+        } else if (rotary_knob_switch_ == hcs_msgs::Switch::DOWN) {
+            upper += kHysteresis;
+            lower += kHysteresis;
         }
-        rotary_knob_switch_ = switch_value;
+
+        const double value = -rotary_knob_;
+        rotary_knob_switch_ = value > upper   ? hcs_msgs::Switch::UP
+                            : value < lower   ? hcs_msgs::Switch::DOWN
+                                              : hcs_msgs::Switch::MIDDLE;
     }
 
-    using Clock = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
-
-    static constexpr auto kFreshTimeout = std::chrono::milliseconds(500);
-
-    void refresh_validity(const TimePoint now) {
-        if (!timeout_enabled_ || !valid_ || now - last_remote_control_received_at_ <= kFreshTimeout)
-            return;
-
-        reset_remote_control_state();
-        valid_ = false;
-    }
-
-    void reset_remote_control_state() {
-        joystick_right_ = Vector::zero();
-        joystick_left_ = Vector::zero();
-        switch_right_ = Switch::kUnknown;
-        switch_left_ = Switch::kUnknown;
-        mouse_velocity_ = Vector::zero();
+    void reset() noexcept {
+        joystick_right_ = Eigen::Vector2d::Zero();
+        joystick_left_ = Eigen::Vector2d::Zero();
+        switch_right_ = hcs_msgs::Switch::UNKNOWN;
+        switch_left_ = hcs_msgs::Switch::UNKNOWN;
+        mouse_velocity_ = Eigen::Vector2d::Zero();
         mouse_wheel_ = 0.0;
-        mouse_ = Mouse::zero();
-        keyboard_ = Keyboard::zero();
+        mouse_ = hcs_msgs::Mouse::zero();
+        keyboard_ = hcs_msgs::Keyboard::zero();
         rotary_knob_ = 0.0;
-        rotary_knob_switch_ = rmcs_msgs::Switch::UNKNOWN;
+        rotary_knob_switch_ = hcs_msgs::Switch::UNKNOWN;
     }
 
-    struct [[gnu::packed]] Dr16DataPart1 {
-        uint64_t joystick_channel0 : 11;
-        uint64_t joystick_channel1 : 11;
-        uint64_t joystick_channel2 : 11;
-        uint64_t joystick_channel3 : 11;
+    /// 正在凑的那一帧，和已经凑了多少。
+    std::array<std::byte, kFrameSize> frame_{};
+    std::size_t filled_ = 0;
+    bool received_this_tick_ = false;
+    std::uint32_t rejected_frames_ = 0;
 
-        uint64_t switch_right : 2;
-        uint64_t switch_left  : 2;
+    bool valid_ = false;
 
-        uint64_t padding : 16;
-    };
-    static_assert(sizeof(Dr16DataPart1) == 8);
-    std::atomic<uint64_t> data_part1_{std::bit_cast<uint64_t>(Dr16DataPart1{
-        .joystick_channel0 = 1024,
-        .joystick_channel1 = 1024,
-        .joystick_channel2 = 1024,
-        .joystick_channel3 = 1024,
-        .switch_right = static_cast<uint64_t>(Switch::kUnknown),
-        .switch_left = static_cast<uint64_t>(Switch::kUnknown),
-        .padding = 0,
-    })};
-    static_assert(decltype(data_part1_)::is_always_lock_free);
+    Eigen::Vector2d joystick_right_ = Eigen::Vector2d::Zero();
+    Eigen::Vector2d joystick_left_ = Eigen::Vector2d::Zero();
+    hcs_msgs::Switch switch_right_ = hcs_msgs::Switch::UNKNOWN;
+    hcs_msgs::Switch switch_left_ = hcs_msgs::Switch::UNKNOWN;
 
-    struct [[gnu::packed]] Dr16DataPart2 {
-        int16_t mouse_velocity_x;
-        int16_t mouse_velocity_y;
-        int16_t mouse_velocity_z;
-
-        bool mouse_left;
-        bool mouse_right;
-    };
-    static_assert(sizeof(Dr16DataPart2) == 8);
-    std::atomic<uint64_t> data_part2_{std::bit_cast<uint64_t>(Dr16DataPart2{
-        .mouse_velocity_x = 0,
-        .mouse_velocity_y = 0,
-        .mouse_velocity_z = 0,
-        .mouse_left = false,
-        .mouse_right = false,
-    })};
-    static_assert(decltype(data_part2_)::is_always_lock_free);
-
-    struct [[gnu::packed]] Dr16DataPart3 {
-        Keyboard keyboard;
-        uint16_t rotary_knob;
-    };
-    static_assert(sizeof(Dr16DataPart3) == 4);
-    std::atomic<uint32_t> data_part3_ = {std::bit_cast<uint32_t>(Dr16DataPart3{
-        .keyboard = Keyboard::zero(),
-        .rotary_knob = 0,
-    })};
-    static_assert(decltype(data_part3_)::is_always_lock_free);
-
-    Vector joystick_right_ = Vector::zero();
-    Vector joystick_left_ = Vector::zero();
-
-    Switch switch_right_ = Switch::kUnknown;
-    Switch switch_left_ = Switch::kUnknown;
-
-    Vector mouse_velocity_ = Vector::zero();
+    Eigen::Vector2d mouse_velocity_ = Eigen::Vector2d::Zero();
     double mouse_wheel_ = 0.0;
-
-    Mouse mouse_ = Mouse::zero();
-    Keyboard keyboard_ = Keyboard::zero();
+    hcs_msgs::Mouse mouse_ = hcs_msgs::Mouse::zero();
+    hcs_msgs::Keyboard keyboard_ = hcs_msgs::Keyboard::zero();
 
     double rotary_knob_ = 0.0;
-    rmcs_msgs::Switch rotary_knob_switch_ = rmcs_msgs::Switch::UNKNOWN;
-    TimePoint last_remote_control_received_at_ = TimePoint::min();
-    bool valid_ = false;
-    bool timeout_enabled_ = true;
+    hcs_msgs::Switch rotary_knob_switch_ = hcs_msgs::Switch::UNKNOWN;
 };
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device

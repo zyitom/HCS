@@ -3,7 +3,6 @@
 #include <string>
 #include <vector>
 
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
@@ -61,9 +60,8 @@ private:
             return;
         reported_trips_ = trips;
         const auto index = latch_.tripped_device();
-        RCLCPP_ERROR(
-            get_logger(),
-            "SAFETY LATCHED: %s %s; all motors disabled. "
+        logger().error(
+            "SAFETY LATCHED: {} {}; all motors disabled. "
             "Fix it, then flip the rearm switch DOWN and back to re-arm",
             index < names_.size() ? names_[index].c_str() : "?",
             latch_.reason() == Reason::kFaulted ? "reported a fault" : "went offline");

@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <utility>
 
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/utilities.hpp>
 
@@ -139,6 +138,23 @@ void SerialPort::attach(SerialDevice& device) {
     device_ = &device;
 }
 
+// ── ImuPort ──────────────────────────────────────────────────────────────
+
+ImuPort::ImuPort(BoardCore& board)
+    : board_(board) {
+    board.add(*this);
+}
+
+std::string ImuPort::label() const { return std::format("{}/imu", board_.get_component_name()); }
+
+void ImuPort::attach(ImuDevice& device) {
+    if (device_)
+        throw std::invalid_argument(std::format(
+            "{}: {} and {} on one onboard imu; there is only one sensor to read", label(),
+            device_->name(), device.name()));
+    device_ = &device;
+}
+
 // ── BoardCore ────────────────────────────────────────────────────────────
 
 /// 指令侧伙伴：设备的 /control_* 输入都注册在它身上，它排在所有控制器之后。
@@ -180,6 +196,8 @@ std::vector<Device*> BoardCore::devices() const {
     for (const auto* port : serial_ports_)
         if (port->device())
             devices.push_back(port->device());
+    if (imu_port_ && imu_port_->device())
+        devices.push_back(imu_port_->device());
     return devices;
 }
 
@@ -200,6 +218,12 @@ void BoardCore::add(SerialPort& serial) {
     serial_ports_.push_back(&serial);
 }
 
+void BoardCore::add(ImuPort& imu) {
+    if (imu_port_)
+        throw std::invalid_argument(std::format("{} declared twice", imu.label()));
+    imu_port_ = &imu;
+}
+
 libhcs::board::hcs::Configuration BoardCore::configuration() const {
     // 声明了的 CAN 口按声明的帧型与速率下发：板端重初始化控制器（经典即关掉 FD，2.0 总线上
     // 任何 FD 位都会让总线崩溃）并自己回读确认，不符即构造失败；重连自动重放。
@@ -216,14 +240,13 @@ void BoardCore::before_updating() {
     devices_ = devices();
     for (const auto* bus : can_buses_)
         for (const auto* device : bus->devices())
-            RCLCPP_INFO(
-                get_logger(), "%s %s: %s", bus->label().c_str(), device->name().c_str(),
-                device->describe().c_str());
+            logger().info("{} {}: {}", bus->label(), device->name(), device->describe());
     for (const auto* serial : serial_ports_)
         if (const auto* device = serial->device())
-            RCLCPP_INFO(
-                get_logger(), "%s %s: %s", serial->label().c_str(), device->name().c_str(),
-                device->describe().c_str());
+            logger().info("{} {}: {}", serial->label(), device->name(), device->describe());
+    if (imu_port_)
+        if (const auto* device = imu_port_->device())
+            logger().info("{} {}: {}", imu_port_->label(), device->name(), device->describe());
 
     try {
         open();
@@ -235,9 +258,7 @@ void BoardCore::before_updating() {
 
 void BoardCore::open() {
     if (!param<bool>("enabled", false)) {
-        RCLCPP_WARN(
-            get_logger(), "[%s] disabled by parameter; its devices stay offline",
-            get_component_name().c_str());
+        logger().warn("[{}] disabled by parameter; its devices stay offline", get_component_name());
         return;
     }
 
@@ -266,10 +287,9 @@ void BoardCore::open() {
             "{}: the board carries {} CAN buses but the wiring declares {}", get_component_name(),
             have, need));
 
-    RCLCPP_INFO(
-        get_logger(), "[%s] opened: serial_filter='%s' io_cpu=%lld io_prio=%lld",
-        get_component_name().c_str(), serial_filter.c_str(), static_cast<long long>(io_cpu),
-        static_cast<long long>(io_priority));
+    logger().info(
+        "[{}] opened: serial_filter='{}' io_cpu={} io_prio={}", get_component_name(),
+        serial_filter, static_cast<long long>(io_cpu), static_cast<long long>(io_priority));
 
     util::TransmitBatch safe_batch;
     pack_frames(safe_batch, true);
@@ -344,31 +364,25 @@ void BoardCore::report_bus_load() {
         const double load = frames * update_rate * 130e-6 * 100.0;
         summary += std::format(" {}={:.0f}%", bus->label(), load);
         if (load > 70.0)
-            RCLCPP_WARN(
-                get_logger(), "bus %s at %.0f%% estimated load (>70%%)", bus->label().c_str(),
-                load);
+            logger().warn("bus {} at {:.0f}% estimated load (>70%)", bus->label(), load);
     }
-    RCLCPP_INFO(get_logger(), "bus load estimate at %.0f Hz:%s", update_rate, summary.c_str());
+    logger().info("bus load estimate at {:.0f} Hz:{}", update_rate, summary);
 }
 
 void BoardCore::report() {
     for (auto* device : devices_)
         if (const auto problem = device->take_problem())
-            RCLCPP_ERROR(
-                get_logger(), "%s: %s", device->name().c_str(), problem->c_str());
+            logger().error("{}: {}", device->name(), *problem);
 
     if (link_faulted()) {
         if (param<bool>("exit_on_board_fault", true)) {
-            RCLCPP_FATAL(
-                get_logger(), "[%s] board faulted (link lost); shutting down",
-                get_component_name().c_str());
+            logger().fatal("[{}] board faulted (link lost); shutting down", get_component_name());
             rclcpp::shutdown();
             return;
         }
-        RCLCPP_ERROR_THROTTLE(
-            get_logger(), *get_clock(), 5000,
-            "[%s] board faulted (link lost); its devices are offline",
-            get_component_name().c_str());
+        if (link_fault_report_.ready())
+            logger().error(
+                "[{}] board faulted (link lost); its devices are offline", get_component_name());
         return;
     }
     report_can_health();
@@ -381,17 +395,16 @@ void BoardCore::log_can_status(
     const bool flagged = (flags & (vc::kCanErrorPassive | vc::kCanWarning | vc::kCanBusOff)) != 0;
     if (!flagged && status.tec == 0 && status.rec == 0 && status.rx_fifo_level == 0)
         return;
-    RCLCPP_WARN(
-        get_logger(), "can%u: tec=%u rec=%u last=%s flags=0x%02x rx_backlog=%u",
-        static_cast<unsigned>(port), static_cast<unsigned>(status.tec),
-        static_cast<unsigned>(status.rec), libhcs::board::hcs::last_error_name(status.last_error),
-        flags, status.rx_fifo_level);
+    logger().warn(
+        "can{}: tec={} rec={} last={} flags=0x{:02x} rx_backlog={}", static_cast<unsigned>(port),
+        static_cast<unsigned>(status.tec), static_cast<unsigned>(status.rec),
+        libhcs::board::hcs::last_error_name(status.last_error), static_cast<unsigned>(flags),
+        static_cast<unsigned>(status.rx_fifo_level));
 }
 
 void BoardCore::log_can_status_failure(
     libhcs::board::hcs::CanPort port, const std::exception& error) {
-    RCLCPP_WARN(
-        get_logger(), "can%u status read failed: %s", static_cast<unsigned>(port), error.what());
+    logger().warn("can{} status read failed: {}", static_cast<unsigned>(port), error.what());
 }
 
 } // namespace hcs_core::hardware::board

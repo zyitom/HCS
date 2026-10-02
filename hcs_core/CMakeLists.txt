@@ -94,6 +94,7 @@ set(PROJECT_SOURCE
   src/hardware/can_rtt_probe.cpp
   src/hardware/hcs_link_probe.cpp
   src/hardware/board/board.cpp
+  src/hardware/libhcs_log_bridge.cpp
   src/hardware/transmit_thread.cpp
   src/hardware/safety_latch.cpp
   src/hardware/balance_infantry.cpp
@@ -108,6 +109,14 @@ set(PROJECT_SOURCE
   src/controller/gimbal/simple_gimbal_controller.cpp
   src/controller/gimbal/gimbal_tf.cpp
   src/controller/auto_aim/auto_aim_link.cpp
+  src/controller/shooting/heat_controller.cpp
+  src/controller/shooting/hero_heat_controller.cpp
+  src/controller/shooting/friction_wheel_controller.cpp
+  src/controller/shooting/hero_friction_wheel_controller.cpp
+  src/controller/shooting/bullet_feeder_controller_17mm.cpp
+  src/controller/shooting/bullet_feeder_controller_42mm.cpp
+  src/controller/shooting/putter_controller.cpp
+  src/controller/shooting/shooting_recorder.cpp
   src/broadcaster/tf_broadcaster.cpp
   src/broadcaster/value_broadcaster.cpp
   src/referee/status.cpp
@@ -161,7 +170,8 @@ if(BUILD_TESTING)
   target_include_directories(test_balance_math PRIVATE
     ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/test)
 
-  # LK 驱动反馈侧：回复过滤、首帧门控、离线看门狗、按系列的电流满量程（对照协议 V2.36）。
+  # LK 驱动反馈侧：回复过滤、首帧门控、多圈回绕、按系列的电流满量程（对照协议 V2.36）。
+  # 掉线计数在端口包装层，测在 test_board。
   ament_add_gtest(test_lk_motor test/test_lk_motor.cpp)
   target_include_directories(test_lk_motor PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
@@ -172,6 +182,36 @@ if(BUILD_TESTING)
   target_include_directories(test_dji_motor PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
   ament_target_dependencies(test_dji_motor hcs_executor hcs_base)
+
+  # fast_tf::capture：关节集合 → 定长位姿数组（TfBroadcaster 跨线程发布用）。
+  ament_add_gtest(test_tf_capture test/test_tf_capture.cpp)
+  ament_target_dependencies(test_tf_capture fast_tf hcs_description)
+
+  # HiPNUC 驱动：手册示例帧、分段喂入、CRC、重新对齐、写到输出上。
+  # 掉线计数与跨线程交接（IO 线程写、控制线程取）在端口包装层，测在 test_board。
+  ament_add_gtest(test_hipnuc test/test_hipnuc.cpp)
+  target_include_directories(test_hipnuc PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_hipnuc hcs_executor hcs_base)
+
+  # VT13 遥控：帧解码的方向与量程、重新对齐、裁判格式帧跳过、缓存不越界、失联归零。
+  ament_add_gtest(test_vt13 test/test_vt13.cpp)
+  target_include_directories(test_vt13 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_vt13 hcs_executor hcs_base hcs_msgs)
+
+  # 板载 BMI088 的两种解算（Mahony / 按时间戳的 EKF）与板上时钟展开：量程、收敛、积分、
+  # 时间戳跳变与回绕。
+  ament_add_gtest(test_bmi088 test/test_bmi088.cpp)
+  target_include_directories(test_bmi088 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_bmi088 hcs_executor hcs_base hcs_msgs)
+
+  # DR16 遥控（DBUS）：帧解码的方向与量程、靠空闲与合理性对齐、缓存不越界、拨轮回差、失联归零。
+  ament_add_gtest(test_dr16 test/test_dr16.cpp)
+  target_include_directories(test_dr16 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_dr16 hcs_executor hcs_base hcs_msgs)
 
   # DM 驱动：D[0] 电机 ID 校验（MST_ID 撞号）、首帧门控、离线、零点随 PMAX 换算。
   ament_add_gtest(test_dm_motor test/test_dm_motor.cpp)
@@ -193,6 +233,7 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_safety_latch hcs_msgs)
 
   # 板组件：设备登记与分发、撞号与总线速率检查、共用发送线程、安全锁存组件（假 SDK）；
+  # 端口包装层 Can<> / Serial<>：跨线程交接、掉线计数、被拒帧计数、串口溢出上报；
   # 真实平衡步兵三块板全禁用接进组件图空跑。
   ament_add_gtest(test_board test/test_board.cpp src/hardware/board/board.cpp)
   target_include_directories(test_board PRIVATE
@@ -205,6 +246,27 @@ if(BUILD_TESTING)
   ament_target_dependencies(
     test_board
     hcs_executor hcs_base hcs_msgs hcs_description fast_tf rclcpp pluginlib)
+
+  # libhcs 的日志出口接到 hcs_log：加载时自动接上、文本与级别原样、SDK 不再碰 stderr。
+  # 测试要替 SDK"打一行日志"，所以多给一个 SDK 源码根目录的包含路径（它的私有头）。
+  ament_add_gtest(test_libhcs_log_bridge
+    test/test_libhcs_log_bridge.cpp src/hardware/libhcs_log_bridge.cpp)
+  target_include_directories(test_libhcs_log_bridge PRIVATE ${_libhcs_source_dir})
+  target_link_libraries(test_libhcs_log_bridge libhcs-sdk)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang") # 真用到 SDK 符号：同主库，消费侧补 -flto
+    target_compile_options(test_libhcs_log_bridge PRIVATE -flto)
+    target_link_options(test_libhcs_log_bridge PRIVATE -flto)
+  endif()
+  ament_target_dependencies(test_libhcs_log_bridge hcs_executor hcs_base)
+
+  # 射击控制器：热量、摩擦轮（缓启停 / 出弹 / 卡住）、17 mm 与 42 mm 拨弹（卡弹退弹）、
+  # 推杆（复位 / 上膛 / 发射）、弹速统计与记录。组件接进小图逐拍跑，参数走参数文件。
+  ament_add_gtest(test_shooting test/test_shooting.cpp)
+  target_include_directories(test_shooting PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+  ament_target_dependencies(
+    test_shooting
+    hcs_executor hcs_base hcs_msgs rclcpp pluginlib)
 
   # 平衡组件图：假硬件 + 全部平衡组件 link + 空跑，参数文件挂给 rclcpp::init。
   ament_add_gtest(test_balance_graph test/test_balance_graph.cpp)

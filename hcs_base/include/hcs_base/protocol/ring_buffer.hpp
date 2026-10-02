@@ -18,7 +18,7 @@
 namespace hcs_utility {
 
 // Lock-free Single-Producer/Single-Consumer (SPSC) ring buffer
-// Inspired by Linux kfifo.
+// 做法参考了 Linux 的 kfifo。
 template <typename T>
 class RingBuffer {
 public:

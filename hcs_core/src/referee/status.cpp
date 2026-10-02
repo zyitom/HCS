@@ -23,8 +23,7 @@ public:
     Status()
         : Node{
               get_component_name(),
-              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)}
-        , logger_(get_logger()) {
+              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)} {
         register_input("/referee/serial", serial_);
 
         register_output("/referee/game/stage", game_stage_, hcs_msgs::GameStage::UNKNOWN);
@@ -118,9 +117,10 @@ public:
             // 最大 65535,而 frame_ 是定长的。不钳制,一个 CRC 恰好合法的超长帧
             // 就会让 read 直接写出 frame_ 的边界。
             if (frame_size > sizeof(frame_)) {
-                RCLCPP_WARN(
-                    logger_, "Frame data_length %u out of range, dropped",
-                    static_cast<unsigned>(frame_.header.data_length));
+                if (const auto count = oversized_frames_.hit())
+                    logger().rt().warn(
+                        "Frame data_length {} out of range, dropped ({} so far)",
+                        static_cast<unsigned>(frame_.header.data_length), *count);
                 cache_size_ = 0;
             } else {
                 cache_size_ += serial_->read(
@@ -131,8 +131,8 @@ public:
                     cache_size_ = 0;
                     if (hcs_utility::dji_crc::verify_crc16(&frame_, frame_size)) {
                         process_frame();
-                    } else {
-                        RCLCPP_WARN(logger_, "Body crc16 invalid");
+                    } else if (const auto count = body_crc_errors_.hit()) {
+                        logger().rt().warn("Body crc16 invalid ({} so far)", *count);
                     }
                 }
             }
@@ -143,24 +143,26 @@ public:
                     return hcs_utility::dji_crc::verify_crc8(header);
                 });
             if (result == hcs_utility::ReceiveResult::HEADER_INVALID) {
-                RCLCPP_WARN(logger_, "Header start invalid");
+                if (const auto count = header_start_errors_.hit())
+                    logger().rt().warn("Header start invalid ({} so far)", *count);
             } else if (result == hcs_utility::ReceiveResult::VERIFY_INVALID) {
-                RCLCPP_WARN(logger_, "Header crc8 invalid");
+                if (const auto count = header_crc_errors_.hit())
+                    logger().rt().warn("Header crc8 invalid ({} so far)", *count);
             }
         }
 
         if (game_status_watchdog_.tick()) {
-            RCLCPP_INFO(logger_, "Game status receiving timeout. Set stage to unknown.");
+            logger().rt().info("Game status receiving timeout. Set stage to unknown.");
             *game_stage_ = hcs_msgs::GameStage::UNKNOWN;
         }
         if (robot_status_watchdog_.tick()) {
-            RCLCPP_ERROR(logger_, "Robot status receiving timeout. Set to safe indicators.");
+            logger().rt().error("Robot status receiving timeout. Set to safe indicators.");
             *robot_shooter_cooling_ = safe_shooter_cooling;
             *robot_shooter_heat_limit_ = safe_shooter_heat_limit;
             *robot_chassis_power_limit_ = safe_chassis_power_limit;
         }
         if (power_heat_data_watchdog_.tick()) {
-            RCLCPP_ERROR(logger_, "Power heat data receiving timeout. Set to initial values.");
+            logger().rt().error("Power heat data receiving timeout. Set to initial values.");
             *robot_chassis_power_ = 0.0;
             *robot_buffer_energy_ = 60.0;
         }
@@ -309,9 +311,10 @@ private:
 
     void update_map_command() {
         if (frame_.header.data_length < sizeof(MapCommand)) {
-            RCLCPP_WARN(
-                logger_, "Map command length invalid: %u",
-                static_cast<unsigned>(frame_.header.data_length));
+            if (const auto count = short_map_commands_.hit())
+                logger().rt().warn(
+                    "Map command length invalid: {} ({} so far)",
+                    static_cast<unsigned>(frame_.header.data_length), *count);
             return;
         }
 
@@ -352,7 +355,12 @@ private:
     // Chassis: Health priority with level 1
     static constexpr double safe_chassis_power_limit = 45;
 
-    rclcpp::Logger logger_;
+    // 线路一坏，下面这些错每拍都会来。按 1、2、4、8… 次稀释着报，而不是每拍一条。
+    hcs_log::Backoff oversized_frames_;
+    hcs_log::Backoff body_crc_errors_;
+    hcs_log::Backoff header_start_errors_;
+    hcs_log::Backoff header_crc_errors_;
+    hcs_log::Backoff short_map_commands_;
 
     InputInterface<hcs_msgs::SerialInterface> serial_;
     Frame frame_;

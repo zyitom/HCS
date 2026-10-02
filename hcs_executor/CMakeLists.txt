@@ -96,6 +96,11 @@ if(BUILD_TESTING)
   target_include_directories(test_wiring PRIVATE ${PROJECT_SOURCE_DIR}/include)
   target_link_libraries(test_wiring ${PROJECT_NAME}_lib)
   ament_target_dependencies(test_wiring hcs_base)
+
+  # 日志的 rclcpp 输出端：哪些名字上得了 /rosout（本进程内一发一收，要 rclcpp::init）。
+  find_package(rcl_interfaces REQUIRED)
+  ament_add_gtest(test_rclcpp_log_sink test/test_rclcpp_log_sink.cpp TIMEOUT 120)
+  ament_target_dependencies(test_rclcpp_log_sink hcs_base rclcpp rcl_interfaces)
 endif()
 
 set_property(TARGET ${PROJECT_NAME}_lib PROPERTY OUTPUT_NAME ${PROJECT_NAME})

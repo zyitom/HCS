@@ -2,6 +2,8 @@
 //   - 新固件把错误码放在 DATA[7]，旧固件该字节为 null（0），两者都解成 kNone
 //   - 手册列出的码原样解出，手册没列的码（6、9 以上）不被折成某个已知码
 //   - 错误码不影响同帧其余字段的解码
+//
+// 驱动只有协议：帧直接交给 on_frame()。跨线程交接与掉线计数在端口包装层，测在 test_board。
 
 #include <array>
 #include <cstddef>
@@ -19,6 +21,7 @@
 
 namespace {
 
+using hcs_core::hardware::device::CanPacket8;
 using hcs_core::hardware::device::DjiMotor;
 using hcs_executor::Component;
 
@@ -37,20 +40,14 @@ struct Bench {
     }
 
     // DJI 反馈：角度/转速/电流为大端 int16，DATA[6] 温度，DATA[7] 错误码
-    void store(std::uint16_t angle, std::int16_t rpm, std::uint8_t temperature,
-               std::uint8_t error) {
+    void receive(std::uint16_t angle, std::int16_t rpm, std::uint8_t temperature,
+                 std::uint8_t error) {
         const auto speed = static_cast<std::uint16_t>(rpm);
         const std::array<std::uint8_t, 8> frame{
             static_cast<std::uint8_t>(angle >> 8), static_cast<std::uint8_t>(angle),
             static_cast<std::uint8_t>(speed >> 8), static_cast<std::uint8_t>(speed),
             0, 0, temperature, error};
-        motor.store_status(std::as_bytes(std::span{frame}));
-    }
-
-    void receive(std::uint16_t angle, std::int16_t rpm, std::uint8_t temperature,
-                 std::uint8_t error) {
-        store(angle, rpm, temperature, error);
-        motor.update_status();
+        motor.on_frame(CanPacket8{std::as_bytes(std::span{frame})});
     }
 
     std::shared_ptr<Host> host;
@@ -58,46 +55,6 @@ struct Bench {
 };
 
 } // namespace
-
-TEST(DjiMotor, NothingDecodedBeforeFirstFrame) {
-    Bench bench;
-    for (int i = 0; i < 5; ++i)
-        bench.motor.update_status();
-    EXPECT_FALSE(bench.motor.received());
-    EXPECT_FALSE(bench.motor.online());
-    EXPECT_DOUBLE_EQ(bench.motor.velocity(), 0.0);
-}
-
-// 电调 1 kHz 自发反馈，与控制拍不同源：有的拍收到两帧、有的拍一帧都没有。
-// 看门狗只数"连续没有新帧的拍"，零星的空拍不算掉线。
-TEST(DjiMotor, FreeRunningFeedbackJitterStaysOnline) {
-    Bench bench;
-    bench.receive(0, 0, 30, 0);
-    for (int cycle = 0; cycle < 1000; ++cycle) {
-        if (cycle % 7 == 3)
-            ; // 这一拍没收到
-        else if (cycle % 11 == 5) {
-            bench.store(0, 0, 30, 0); // 这一拍收到两帧
-            bench.store(0, 0, 30, 0);
-        } else
-            bench.store(0, 0, 30, 0);
-        bench.motor.update_status();
-        ASSERT_TRUE(bench.motor.online()) << "cycle " << cycle;
-    }
-}
-
-TEST(DjiMotor, GoesOfflineAfterTimeoutAndBack) {
-    Bench bench;
-    bench.receive(0, 0, 30, 0);
-    for (int i = 0; i < 99; ++i)
-        bench.motor.update_status();
-    EXPECT_TRUE(bench.motor.online());
-    bench.motor.update_status();
-    EXPECT_FALSE(bench.motor.online());
-
-    bench.receive(0, 0, 30, 0);
-    EXPECT_TRUE(bench.motor.online());
-}
 
 TEST(DjiMotor, OverheatWarnsButIsNotAFault) {
     Bench bench;

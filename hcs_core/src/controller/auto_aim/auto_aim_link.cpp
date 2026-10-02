@@ -116,15 +116,16 @@ private:
 
         auto listener = hcs_link::Listener::bind(endpoint_);
         if (!listener) {
-            RCLCPP_ERROR(get_logger(), "auto-aim link disabled, cannot listen on '@%s': %s",
-                         endpoint_.c_str(), listener.error().message().c_str());
+            logger().error(
+                "auto-aim link disabled, cannot listen on '@{}': {}", endpoint_,
+                listener.error().message());
             return;
         }
 
         hcs_link::UniqueFd session;
         while (!stop.stop_requested()) {
             if (session && hcs_link::peer_closed(session.get())) {
-                RCLCPP_WARN(get_logger(), "vision disconnected");
+                logger().warn("vision disconnected");
                 session.reset();
                 install(nullptr);
             }
@@ -132,33 +133,34 @@ private:
             auto peer = listener->accept(std::chrono::milliseconds{100});
             if (!peer) {
                 if (peer.error().code != hcs_link::ErrorCode::kTimeout)
-                    RCLCPP_WARN(get_logger(), "accept: %s", peer.error().message().c_str());
+                    logger().warn("accept: {}", peer.error().message());
                 continue;
             }
 
             const std::array fds{state_->fd()};
             auto received = hcs_link::exchange(peer->get(), fds, std::chrono::seconds{1});
             if (!received || received->count != 1) {
-                RCLCPP_WARN(get_logger(), "handshake failed: %s",
-                            received ? "vision sent no command channel" : received.error().message().c_str());
+                logger().warn(
+                    "handshake failed: {}",
+                    received ? "vision sent no command channel" : received.error().message());
                 continue;
             }
 
             auto reader = CommandReader::attach(std::move(received->fds[0]));
             if (!reader) {
-                RCLCPP_WARN(get_logger(), "rejected the command channel: %s", reader.error().message().c_str());
+                logger().warn("rejected the command channel: {}", reader.error().message());
                 continue;
             }
 
             install(std::make_unique<CommandReader>(std::move(*reader)));
             session = std::move(*peer);
-            RCLCPP_INFO(get_logger(), "vision connected on '@%s'", endpoint_.c_str());
+            logger().info("vision connected on '@{}'", endpoint_);
         }
     }
 
     void install(std::unique_ptr<CommandReader> reader) {
         if (!commands_.replace(std::move(reader), std::chrono::milliseconds{200}))
-            RCLCPP_WARN(get_logger(), "control loop is not ticking; the previous command channel is leaked");
+            logger().warn("control loop is not ticking; the previous command channel is leaked");
     }
 
     std::string endpoint_;

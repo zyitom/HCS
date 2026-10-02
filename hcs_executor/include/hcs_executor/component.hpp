@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <hcs_base/channel/tick.hpp>
+#include <hcs_base/logging/logger.hpp>
 #include <hcs_base/raw_storage.hpp>
 #include <hcs_base/thread/rt_attributes.hpp>
 
@@ -34,6 +35,13 @@ namespace detail {
 /// 见 Component::NameScope。定义在 component.cpp 里。
 std::string& pending_component_name();
 } // namespace detail
+
+/// 进程里唯一的日志后端（队列 + 日志线程 + 输出端）。
+///
+/// 定义在 component.cpp 里，也就是在 libhcs_executor.so 里只有一份：executor 自己、
+/// 以及每一个被 pluginlib dlopen 进来的组件库，拿到的都是同一个对象。
+/// 输出端默认是 stderr；hcs_executor 的 main 在 rclcpp 起来之后把它换成 rclcpp 的。
+[[nodiscard]] hcs_log::Backend& process_log_backend();
 
 class Component {
 public:
@@ -282,6 +290,17 @@ public:
 
     [[nodiscard]] const std::string& get_component_name() const { return component_name_; }
 
+    /// 这个组件的日志口，名字就是组件名。不需要继承 rclcpp::Node 也能打日志。
+    ///
+    ///     logger().warn("accept: {}", error.message());      // 尽力域（构造、定时器、工作线程）
+    ///     logger().rt().warn("crc invalid, {} so far", n);   // update() 和 IO 回调里
+    ///
+    /// 两种都只是把一条记录放进无锁队列，真正的输出在日志线程上；区别在 rt() 那一套
+    /// 不格式化、不分配，标了 nonblocking。见 hcs_base/logging/logger.hpp。
+    [[nodiscard]] const hcs_log::Logger& logger() const noexcept HCS_NONBLOCKING {
+        return logger_;
+    }
+
     /// 由 create_partner_component 创建的伙伴组件。调度器要递归把它们也纳入管理，
     /// 失效隔离要按整组停。公开出来是为了让"收集组件"这件事不必是 friend。
     [[nodiscard]] const std::vector<std::shared_ptr<Component>>& partner_components() const {
@@ -517,6 +536,7 @@ private:
     }
 
     std::string component_name_;
+    hcs_log::Logger logger_{process_log_backend(), component_name_};
 
     struct InputDeclaration {
         const std::type_info& type;

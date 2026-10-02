@@ -17,7 +17,6 @@
 #include <libhcs/board/hpm5321.hpp>
 #include <libhcs/data/datas.hpp>
 
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
@@ -75,9 +74,8 @@ public:
             bool_parameter("dangerously_skip_version_checks", skip_version_checks_);
 
         if (!sender_.thread_config_error().empty())
-            RCLCPP_WARN(
-                get_logger(), "[%s] tx thread config: %s", get_component_name().c_str(),
-                sender_.thread_config_error().c_str());
+            logger().warn(
+                "[{}] tx thread config: {}", get_component_name(), sender_.thread_config_error());
 
         // 板卡在构造期就可能开始收发，早到的回调不许依赖"构造函数体后面还没跑完"的状态。
         // 所以放最后，且成员声明顺序上
@@ -93,12 +91,10 @@ public:
 
         report_timer_ = create_wall_timer(std::chrono::seconds{1}, [this] { report(); });
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] CAN2.0+UART RTT probe on libhcs Hpm5321 (serial_filter='%s'): "
-            "tx_id=0x%03X rx_id=0x%03X imu_baud=%u",
-            get_component_name().c_str(), serial_filter_.c_str(), can_id_, response_can_id_,
-            kImuBaudrate);
+        logger().info(
+            "[{}] CAN2.0+UART RTT probe on libhcs Hpm5321 (serial_filter='{}'): "
+            "tx_id=0x{:03X} rx_id=0x{:03X} imu_baud={}",
+            get_component_name(), serial_filter_, can_id_, response_can_id_, kImuBaudrate);
     }
 
     ~CanRttProbe() override = default;
@@ -369,10 +365,10 @@ private:
 
             if (!imu_logged_once_) {
                 imu_logged_once_ = true;
-                RCLCPP_INFO(
-                    get_logger(), "[%s] first HI91 frame parsed: t=%ums gyro=(% .2f % .2f % .2f)deg/s",
-                    get_component_name().c_str(), sample.system_time_ms, sample.gyro[0],
-                    sample.gyro[1], sample.gyro[2]);
+                // 这里是板卡的 IO 回调：走延迟格式化那一套，不在这条线程上格式化、不碰输出。
+                logger().rt().info(
+                    "first HI91 frame parsed: t={}ms gyro=({: .2f} {: .2f} {: .2f})deg/s",
+                    sample.system_time_ms, sample.gyro[0], sample.gyro[1], sample.gyro[2]);
             }
         }
 
@@ -457,12 +453,11 @@ private:
             return std::chrono::duration<double, std::micro>(c.max_age).count();
         };
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] t=+%llus ticks=%llu | motor(0x%03X<-0x%03X) miss=%.2f%% late=%.2f%% "
-            "age(mean/max)=%.0f/%.0fus tx_err=%llu | "
-            "imu(HI91) miss=%.2f%% late=%.2f%% age(mean/max)=%.0f/%.0fus crc_err=%llu",
-            get_component_name().c_str(), static_cast<unsigned long long>(report_count_),
+        logger().info(
+            "[{}] t=+{}s ticks={} | motor(0x{:03X}<-0x{:03X}) miss={:.2f}% late={:.2f}% "
+            "age(mean/max)={:.0f}/{:.0f}us tx_err={} | "
+            "imu(HI91) miss={:.2f}% late={:.2f}% age(mean/max)={:.0f}/{:.0f}us crc_err={}",
+            get_component_name(), static_cast<unsigned long long>(report_count_),
             static_cast<unsigned long long>(s.ticks), can_id_, response_can_id_,
             pct(s.motor.misses, s.ticks), pct(s.motor.late, s.ticks), mean_us(s.motor),
             max_us(s.motor), static_cast<unsigned long long>(tx_exceptions_delta),
@@ -478,20 +473,19 @@ private:
                                        : 0.0;
         const double skew_stddev_us = skew_var_us2 > 0.0 ? std::sqrt(skew_var_us2) : 0.0;
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] 错相: both_miss=%.2f%% motor_only=%.2f%% imu_only=%.2f%% | "
-            "skew(motor.age-imu.age) mean=%.0fus stddev=%.0fus max|.|=%.0fus (n=%llu)",
-            get_component_name().c_str(), pct(s.both_miss, s.ticks), pct(s.motor_only_miss, s.ticks),
+        logger().info(
+            "[{}] 错相: both_miss={:.2f}% motor_only={:.2f}% imu_only={:.2f}% | "
+            "skew(motor.age-imu.age) mean={:.0f}us stddev={:.0f}us max|.|={:.0f}us (n={})",
+            get_component_name(), pct(s.both_miss, s.ticks), pct(s.motor_only_miss, s.ticks),
             pct(s.imu_only_miss, s.ticks), skew_mean_us, skew_stddev_us, s.skew_abs_max_us,
             static_cast<unsigned long long>(s.skew_samples));
 
         // 一发一收本身的往返时间：send_command() 交出帧到 can_receive 落地。
         const double rtt_mean_us =
             s.rtt_samples != 0 ? s.rtt_sum_us / static_cast<double>(s.rtt_samples) : 0.0;
-        RCLCPP_INFO(
-            get_logger(), "[%s] CAN一发一收 rtt(mean/min/max)=%.0f/%.0f/%.0fus (n=%llu)",
-            get_component_name().c_str(), rtt_mean_us, std::max(s.rtt_min_us, 0.0), s.rtt_max_us,
+        logger().info(
+            "[{}] CAN一发一收 rtt(mean/min/max)={:.0f}/{:.0f}/{:.0f}us (n={})",
+            get_component_name(), rtt_mean_us, std::max(s.rtt_min_us, 0.0), s.rtt_max_us,
             static_cast<unsigned long long>(s.rtt_samples));
 
         // IMU 内部时钟跟主机时钟对表：IMU 自报的时间流逝速度，跟主机实测的流逝速度
@@ -507,11 +501,10 @@ private:
             if (host_elapsed_s >= 5.0) {
                 const double drift_ms = (imu_elapsed_s - host_elapsed_s) * 1000.0;
                 const double ppm = (imu_elapsed_s - host_elapsed_s) / host_elapsed_s * 1e6;
-                RCLCPP_INFO(
-                    get_logger(),
-                    "[%s] IMU时钟核对: 基线=%.1fs IMU侧流逝-主机侧流逝=%.1fms (%.1fppm，"
+                logger().info(
+                    "[{}] IMU时钟核对: 基线={:.1f}s IMU侧流逝-主机侧流逝={:.1f}ms ({:.1f}ppm，"
                     "正值=IMU自认为的时间比主机实测的走得快)",
-                    get_component_name().c_str(), host_elapsed_s, drift_ms, ppm);
+                    get_component_name(), host_elapsed_s, drift_ms, ppm);
             }
         }
     }

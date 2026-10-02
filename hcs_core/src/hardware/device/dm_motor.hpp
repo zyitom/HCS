@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -10,7 +9,6 @@
 #include <format>
 #include <limits>
 #include <optional>
-#include <span>
 #include <string>
 #include <utility>
 
@@ -21,49 +19,46 @@
 
 namespace hcs_core::hardware::device {
 
+/// DM（达妙）电机，MIT 控制帧。只写协议：除 accepts() 之外全部成员都在控制线程上，
+/// 整帧由端口包装层（board::Can<DmMotor>）交进来；掉线计数和健康输出也在包装层。
 class DmMotor {
 public:
-    /// The bus this driver speaks: classic CAN 2.0, 8-byte frames, at the motor's factory
-    /// 1 Mbps. A bus declared otherwise is refused when the motor is attached to it.
+    /// 这个驱动要的总线：经典 CAN 2.0，8 字节帧，电机出厂的 1 Mbps。
+    /// 总线声明成别的，电机往上接的时候就会被拒绝。
     static constexpr std::uint32_t kCanBitrate = 1'000'000;
     static constexpr bool kCanFd = false;
 
-    /// The MIT mapping range stored in THIS motor's registers PMAX (0x15) / VMAX (0x16) /
-    /// TMAX (0x17). The position, velocity and torque fields of both the command and the
-    /// feedback frame are integers scaled onto [-max, +max] by these three, so they must equal
-    /// what the motor actually holds: a mismatch scales everything and reports no error.
+    /// **这一台**电机的寄存器 PMAX (0x15) / VMAX (0x16) / TMAX (0x17) 里存的 MIT 映射范围。
+    /// 指令帧和反馈帧里的位置、速度、力矩字段都是按这三个量线性映射到 [-max, +max] 上的整数，
+    /// 所以它们必须和电机里实际存的一致：不一致的话所有量都会被按比例缩放，而且不报任何错。
     ///
-    /// They are writable registers (DMTool rewrites them), so they belong to the individual
-    /// motor, not to its model: two J4310 on one robot can differ. Hence one per motor, required,
-    /// with no model default to fall back on. Read them back at bring-up (0x7FF, read command
-    /// 0x33, RID 0x15 / 0x16 / 0x17) to prove the copy here is right.
+    /// 它们是可写的寄存器（DMTool 能改），所以属于单台电机而不属于型号：同一台车上的两个 J4310
+    /// 可以不一样。因此每台电机各写一份、必填，没有型号默认值可退。上车调试时把它们读回来
+    /// （0x7FF，读命令 0x33，RID 0x15 / 0x16 / 0x17），证明这里抄的是对的。
     struct MitRange {
         double position_max; // rad
         double velocity_max; // rad/s
         double torque_max;   // N*m
     };
 
-    /// A J4310 as shipped. Only for motors whose registers were never rewritten, and only when
-    /// named explicitly.
+    /// 出厂状态的 J4310。只给寄存器从没被改过的电机用，而且要显式写出名字才用。
     static constexpr MitRange kJ4310Factory{12.5, 30.0, 10.0};
 
-    /// Which MIT shape this motor runs. Chosen in the config, never inferred from wiring: the
-    /// driver registers only the inputs its mode uses, so an upstream signal that happens to
-    /// share a name (a cascade writing /control_velocity for its own velocity loop) can no
-    /// longer switch on an inner loop inside the motor.
-    enum class ControlMode : uint8_t {
-        /// /control_torque only; kp = kd = 0. The host closes every loop.
+    /// 这台电机跑哪一种 MIT 形态。在配置里选定，绝不从接线推断：驱动只注册所选模式用到的输入，
+    /// 所以上游某个恰好同名的信号（串级控制器为自己的速度环写的 /control_velocity）
+    /// 不可能再把电机里面的内环打开。
+    enum class ControlMode : std::uint8_t {
+        /// 只用 /control_torque；kp = kd = 0。所有的环都由上位机闭。
         kTorque,
-        /// /control_velocity, with /control_torque as feed forward; kp = 0, kd from
-        /// /control_kd or the config.
+        /// /control_velocity，/control_torque 作前馈；kp = 0，kd 取自 /control_kd 或配置。
         kVelocity,
-        /// /control_angle, with /control_velocity and /control_torque as feed forward; kp and
-        /// kd from /control_kp, /control_kd or the config.
+        /// /control_angle，/control_velocity 和 /control_torque 作前馈；kp 和 kd 取自
+        /// /control_kp、/control_kd 或配置。
         kPosition,
     };
 
-    /// Motor status, carried in the high nibble of feedback D[0].
-    enum class Error : uint8_t {
+    /// 电机状态，在反馈帧 D[0] 的高 4 位里。
+    enum class Error : std::uint8_t {
         kDisabled            = 0x0,
         kEnabled             = 0x1,
         kOverVoltage         = 0x8,
@@ -75,9 +70,8 @@ public:
         kOverload            = 0xE,
     };
 
-    /// An aggregate, so a wiring table names what it sets. The four fields up to mit_range are
-    /// required (util::Required): leaving one out must not compile, rather than quietly picking
-    /// a mode or a mapping range for you.
+    /// 聚合类型：接线表里写了什么一目了然。到 mit_range 为止的四个字段必填（util::Required）：
+    /// 漏写一个就编不过，而不是悄悄替你挑一个模式或映射范围。
     struct Config {
         Config& set_gain(double kp_value, double kd_value) {
             return kp = kp_value, kd = kd_value, *this;
@@ -90,52 +84,47 @@ public:
         Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
         Config& set_error_retry_interval(int value) { return error_retry_interval = value, *this; }
 
-        /// Fixed at construction of the motor: it decides which inputs exist.
+        /// 电机构造时就定死：它决定有哪些输入。
         util::Required<ControlMode> control_mode;
 
-        /// Receive id of the driver (register ESC_ID 0x08). MIT control frames are sent to this
-        /// id with no offset. The other three modes add 0x100 / 0x200 / 0x300 and are not
-        /// implemented here.
+        /// 驱动的接收 id（寄存器 ESC_ID 0x08）。MIT 控制帧就发到这个 id，不加偏移。
+        /// 另外三种模式要加 0x100 / 0x200 / 0x300，这里没有实现。
         util::Required<std::uint32_t> esc_id;
-        /// Feedback id of the driver (register MST_ID 0x07). Must be unique per motor, and must
-        /// not collide with the DJI feedback range (0x201~0x20B) on the same bus. A collision
-        /// produces no error, only silence.
+        /// 驱动的反馈 id（寄存器 MST_ID 0x07）。每台电机必须各不相同，也不能和同一路总线上
+        /// DJI 的反馈段（0x201~0x20B）撞。撞了不会报错，只会没有声音。
         util::Required<std::uint32_t> master_id;
 
-        /// This motor's PMAX / VMAX / TMAX. See MitRange.
+        /// 这台电机的 PMAX / VMAX / TMAX。见 MitRange。
         util::Required<MitRange> mit_range;
 
-        /// Default MIT gains, used when /control_kp and /control_kd have no provider.
-        /// Protocol range is kp in [0, 500] and kd in [0, 5].
+        /// MIT 增益的默认值，/control_kp 和 /control_kd 没有人提供时用它。
+        /// 协议允许的范围是 kp ∈ [0, 500]、kd ∈ [0, 5]。
         double kp = 0.0;
         double kd = 0.0;
 
-        /// Raw feedback value treated as zero angle. The default trusts the zero point stored
-        /// in the driver itself, i.e. the result of the "save zero position" frame.
+        /// 当作零角度的反馈原始值。默认值是相信驱动自己存的零点，
+        /// 也就是"保存零点"那一帧的结果。
         int encoder_zero_point = kRawAngleZero;
 
-        /// Zero as an angle in the driver's own position frame (rad, as the feedback frame
-        /// decodes it: before reversed and reduction_ratio). Takes precedence over
-        /// encoder_zero_point. The raw position is scaled by position_max, so the same physical
-        /// zero is a different raw count under a different PMAX; giving it as an angle keeps it
-        /// valid when position_max is corrected to match a re-flashed register.
+        /// 用角度给零点，取驱动自己的位置坐标（rad，即反馈帧解出来的值：还没算 reversed 和
+        /// reduction_ratio）。优先于 encoder_zero_point。位置的原始值是按 position_max 缩放的，
+        /// 所以同一个物理零点在不同的 PMAX 下是不同的原始计数；用角度给，position_max 改成和重新
+        /// 刷过的寄存器一致之后它仍然有效。
         std::optional<double> zero_angle = std::nullopt;
 
-        /// External gearbox only. The 10:1 stage inside a J4310 is already accounted for by the
-        /// driver, whose feedback is output shaft referred. Note that kp / kd are driver side
-        /// gains and are NOT scaled by this.
+        /// 只指外加的减速箱。J4310 里面那一级 10:1 驱动已经算进去了，它的反馈是折算到输出轴的。
+        /// 注意 kp / kd 是驱动侧的增益，**不**随这个量缩放。
         double reduction_ratio = 1.0;
 
         bool reversed = false;
-        /// Off: angle is what the driver reports, spanning +-position_max (about +-4 turns).
-        /// On: the wrap at +-position_max is accumulated and angle grows without bound.
+        /// 关：角度就是驱动报的值，范围 ±position_max（大约 ±4 圈）。
+        /// 开：在 ±position_max 处的回绕被累加起来，角度无界增长。
         bool multi_turn_angle_enabled = false;
 
-        /// Update cycles without new feedback before the motor is considered offline.
+        /// 连续多少拍没有新反馈算掉线。
         int offline_timeout = 100;
-        /// Update cycles between two "clear error" frames. The protections (over temperature,
-        /// over voltage, over current) all need time to recover, so retrying at the loop rate
-        /// only fights the protection logic.
+        /// 两次"清错"帧之间隔多少拍。各种保护（过温、过压、过流）都需要时间恢复，
+        /// 按控制频率去重试只是在和保护逻辑对着干。
         int error_retry_interval = 500;
     };
 
@@ -151,10 +140,10 @@ public:
         status_component.register_output(
             name_prefix + "/temperature_mos", temperature_mos_output_, 0.0);
         status_component.register_output(name_prefix + "/max_torque", max_torque_output_, 0.0);
-        status_component.register_output(name_prefix + "/error_code", error_code_output_, uint8_t{0});
-        status_component.register_output(name_prefix + "/online", online_output_, false);
+        status_component.register_output(
+            name_prefix + "/error_code", error_code_output_, std::uint8_t{0});
 
-        // Only what the mode uses. All optional: an unwired input reads as NaN, never as 0.
+        // 只注册所选模式用到的。全部是可选输入：没接线的输入读出来是 NaN，绝不是 0。
         command_component.register_input( //
             name_prefix + "/control_torque", control_torque_, false);
         if (control_mode_ != ControlMode::kTorque) {
@@ -180,111 +169,26 @@ public:
 
     ~DmMotor() = default;
 
-    /// Re-applies everything but the control mode, which the constructor fixed.
-    void configure(const Config& config) {
-        esc_id_    = config.esc_id;
-        master_id_ = config.master_id;
-        mit_range_ = config.mit_range;
-
-        // Inverse of the DM decode angle = raw * 2PMAX / 65535 - PMAX, so the driver's own
-        // position zero_angle lands exactly on raw zero here.
-        const double position_max = config.mit_range->position_max;
-        const int encoder_zero_point =
-            config.zero_angle ? static_cast<int>(std::lround(
-                                    (*config.zero_angle + position_max) * kRawAngleMax
-                                    / (2 * position_max)))
-                              : config.encoder_zero_point;
-        encoder_zero_point_ = encoder_zero_point & (kRawAngleModulus - 1);
-
-        multi_turn_angle_enabled_ = config.multi_turn_angle_enabled;
-        multi_turn_encoder_count_ = 0;
-        last_raw_angle_           = encoder_zero_point_;
-
-        const double sign            = config.reversed ? -1 : 1;
-        const double reduction_ratio = config.reduction_ratio;
-
-        raw_angle_to_angle_coefficient_ =
-            sign / reduction_ratio * (2 * config.mit_range->position_max) / kRawAngleMax;
-        angle_to_raw_angle_coefficient_ = 1 / raw_angle_to_angle_coefficient_;
-
-        raw_velocity_to_velocity_coefficient_ =
-            sign / reduction_ratio * (2 * config.mit_range->velocity_max) / kRawVelocityMax;
-        velocity_to_raw_velocity_coefficient_ = 1 / raw_velocity_to_velocity_coefficient_;
-
-        raw_torque_to_torque_coefficient_ =
-            sign * reduction_ratio * (2 * config.mit_range->torque_max) / kRawTorqueMax;
-        torque_to_raw_torque_coefficient_ = 1 / raw_torque_to_torque_coefficient_;
-
-        // Note: unlike LkMotor, max_torque_ here is NOT the datasheet peak torque (11 N*m at 0.8
-        // over current, 12.5 N*m at 0.98, rated 3.5 N*m for a J4310). It is the largest torque the
-        // MIT frame can actually express, which is TMAX. A controller saturating against the
-        // datasheet number would just be clipped again by the protocol.
-        max_torque_ = config.mit_range->torque_max * reduction_ratio;
-
-        kp_ = config.kp;
-        kd_ = config.kd;
-
-        offline_timeout_      = config.offline_timeout;
-        error_retry_interval_ = config.error_retry_interval;
-
-        // A DM feedback frame of all zero bytes decodes to (-PMAX, -VMAX, -TMAX), i.e. full
-        // negative torque at the negative position limit. Never decode before the first frame
-        // has actually arrived.
-        received_       = false;
-        error_          = Error::kDisabled;
-        online_         = false;
-        offline_count_  = 0;
-        error_retry_countdown_ = 0;
-        last_sequence_  = sequence_.load(std::memory_order::relaxed);
-
-        angle_           = 0.0;
-        velocity_        = 0.0;
-        torque_          = 0.0;
-        temperature_     = 0.0;
-        temperature_mos_ = 0.0;
-
-        *max_torque_output_ = max_torque();
-    }
-
-    void store_status(std::span<const std::byte> can_data) {
-        if (can_data.size() != 8) [[unlikely]]
-            return;
-
-        // The fixed extent overload is noexcept; the dynamic one throws. This runs on the
-        // transport thread, where nothing may throw. Release pairs with the acquire in
-        // update_status(): a new sequence must never be seen ahead of the packet it counts.
-        can_packet_.store(CanPacket8{can_data.first<8>()}, std::memory_order::relaxed);
-        sequence_.fetch_add(1, std::memory_order::release);
-    }
-
     auto id() const noexcept -> std::uint32_t { return esc_id_; }
-    auto recv_id() const noexcept -> std::uint32_t { return master_id_; }
-    auto send_id() const noexcept -> std::uint32_t { return esc_id_; }
+    [[nodiscard]] std::uint32_t feedback_id() const noexcept { return master_id_; }
+    [[nodiscard]] std::uint32_t command_id() const noexcept { return esc_id_; }
 
-    bool match_then_store_status(std::uint32_t can_id, std::span<const std::byte> can_data) {
-        if (can_id != recv_id())
-            return false;
-        // Claimed even when rejected below: the frame id is ours, no other device on this bus
-        // may decode it either.
-        if (can_data.size() == 8 && !feedback_from_this_motor(can_data[0])) [[unlikely]] {
-            foreign_frame_count_.fetch_add(1, std::memory_order::relaxed);
-            return true;
-        }
-        store_status(can_data);
-        return true;
+    /// 落在我们反馈 id 上的这一帧是不是真的属于这台电机。D[0] 是 ID | ERR << 4：手册说 ID 是
+    /// "CAN_ID 的低 8 位"，但 ERR 占了同一个字节的高 4 位，所以 id 只剩下低 4 位；就比这么多，
+    /// 不多比。电机在这里报的是 ESC_ID，不是 MST_ID。
+    ///
+    /// 对不上说明有两个驱动的 MST_ID 寄存器相同：它们的反馈在这个 id 上交错出现，不检查的话
+    /// 角度会在两台电机之间来回跳，而且不报任何错。被拒的帧不解码，也不算反馈，见 take_problem()。
+    ///
+    /// @note 唯一运行在传输线程上的成员：它只许读 esc_id_（configure() 定死之后不再变），
+    /// 别的都不许读。
+    [[nodiscard]] bool accepts(CanPacket8 frame) const noexcept {
+        return (std::to_integer<std::uint32_t>(frame.as_bytes()[0]) & 0x0F) == (esc_id_ & 0x0F);
     }
 
-    /// Frames that arrived on our feedback id but carried another motor's id in D[0]. Nonzero
-    /// means two drivers share one MST_ID register: their feedback interleaves on this id, and
-    /// without the check the angle would jump between two motors with no error at all.
-    std::uint32_t foreign_frame_count() const {
-        return foreign_frame_count_.load(std::memory_order::relaxed);
-    }
-
-    /// One line for the bring-up log: ids and the MIT range this driver assumes, against the
-    /// J4310 factory values. A range that differs means the registers were rewritten, and the copy
-    /// in the wiring table has to be proven by reading them back (0x7FF, read command 0x33,
-    /// RID 0x15 / 0x16 / 0x17): a wrong copy scales every command and feedback silently.
+    /// 上线日志里的那一行：id，以及这个驱动假定的 MIT 范围，对照 J4310 的出厂值。
+    /// 范围不同说明寄存器被改写过，这时接线表里抄的那份必须读回来核对
+    /// （0x7FF，读命令 0x33，RID 0x15 / 0x16 / 0x17）：抄错了会悄悄地缩放每一条指令和反馈。
     std::string describe() const {
         constexpr auto factory = kJ4310Factory;
         const auto differs = [](double a, double b) { return std::abs(a - b) > 1e-9; };
@@ -300,10 +204,10 @@ public:
                       : " (factory values)");
     }
 
-    /// Best effort (1 Hz, never in the cycle): what went wrong since the last call, or nothing.
-    /// Reports each rise of foreign_frame_count() once.
-    std::optional<std::string> take_problem() {
-        const auto count = foreign_frame_count();
+    /// 尽力域（1 Hz，绝不在拍内）：自上次调用以来出了什么问题，没有则为空。
+    /// accepts() 拒掉的帧数每涨一次报一次。
+    /// @param count accepts() 至今拒掉的帧数，由端口包装层数
+    std::optional<std::string> take_problem(std::uint32_t count) {
         if (count == reported_foreign_frames_)
             return std::nullopt;
         reported_foreign_frames_ = count;
@@ -313,78 +217,67 @@ public:
             count, master_id_);
     }
 
-    /// Must be called once per control cycle: the offline watchdog and the clear error backoff
-    /// are both counted in calls.
-    void update_status() {
-        const auto sequence = sequence_.load(std::memory_order::acquire);
-        if (sequence != last_sequence_) {
-            last_sequence_ = sequence;
-            received_      = true;
-            offline_count_ = offline_timeout_;
-        } else if (offline_count_ > 0)
-            --offline_count_;
-        online_ = offline_count_ > 0;
-
+    /// 每拍一次，不管有没有新帧：清错的退避是按调用次数数的。
+    void on_tick(bool /*online*/) {
         if (error_retry_countdown_ > 0)
             --error_retry_countdown_;
+    }
 
-        if (received_) [[likely]] {
-            const struct [[gnu::packed]] {
-                uint8_t id_and_error;
-                uint8_t angle_high;
-                uint8_t angle_low;
-                uint8_t velocity_high;
-                uint8_t velocity_low_and_torque_high;
-                uint8_t torque_low;
-                uint8_t temperature_mos;
-                uint8_t temperature_rotor;
-            } feedback alignas(CanPacket8) =
-                std::bit_cast<decltype(feedback)>(can_packet_.load(std::memory_order::relaxed));
+    /// 一帧新的反馈。全零字节的 DM 帧会解成 (-PMAX, -VMAX, -TMAX)，也就是负向位置极限处的
+    /// 满额负力矩，所以真正的帧到来之前什么都不解：在那之前每个输出都保持初值。
+    void on_frame(CanPacket8 frame) {
+        const struct [[gnu::packed]] {
+            std::uint8_t id_and_error;
+            std::uint8_t angle_high;
+            std::uint8_t angle_low;
+            std::uint8_t velocity_high;
+            std::uint8_t velocity_low_and_torque_high;
+            std::uint8_t torque_low;
+            std::uint8_t temperature_mos;
+            std::uint8_t temperature_rotor;
+        } feedback alignas(CanPacket8) = std::bit_cast<decltype(feedback)>(frame);
 
-            error_ = static_cast<Error>(feedback.id_and_error >> 4);
+        error_ = static_cast<Error>(feedback.id_and_error >> 4);
 
-            // Angle unit: rad. Position is 16 bits, velocity and torque 12 bits each, all mapped
-            // linearly onto [-max, +max], so raw zero is the negative limit and not the origin.
-            const int raw_angle = (int{feedback.angle_high} << 8) | feedback.angle_low;
-            auto calibrated_raw_angle = raw_angle - encoder_zero_point_;
-            if (!multi_turn_angle_enabled_) {
-                // Normalize into (-modulus/2, modulus/2]. The DM position wraps at +-PMAX,
-                // which is about four turns, so there is no single turn range to fold into.
-                calibrated_raw_angle =
-                    ((calibrated_raw_angle + kRawAngleModulus / 2) & (kRawAngleModulus - 1))
-                    - kRawAngleModulus / 2;
-                multi_turn_encoder_count_ = calibrated_raw_angle;
-            } else {
-                // Same minimal difference trick as LkMotor, valid because the modulus is a
-                // power of two. Doing this in the raw domain is what keeps the wrap worth
-                // 2*PMAX instead of one revolution.
-                auto diff =
-                    (calibrated_raw_angle - multi_turn_encoder_count_) & (kRawAngleModulus - 1);
-                if (diff > (kRawAngleModulus >> 1))
-                    diff -= kRawAngleModulus;
-                multi_turn_encoder_count_ += diff;
-            }
-            last_raw_angle_ = raw_angle;
-            angle_ =
-                raw_angle_to_angle_coefficient_ * static_cast<double>(multi_turn_encoder_count_);
-
-            // Velocity unit: rad/s
-            const int raw_velocity = (int{feedback.velocity_high} << 4)
-                                   | (feedback.velocity_low_and_torque_high >> 4);
-            velocity_ = raw_velocity_to_velocity_coefficient_
-                      * (static_cast<double>(raw_velocity) - kRawVelocityZero);
-
-            // Torque unit: N*m
-            const int raw_torque = (int{feedback.velocity_low_and_torque_high & 0x0F} << 8)
-                                 | feedback.torque_low;
-            torque_ = raw_torque_to_torque_coefficient_
-                    * (static_cast<double>(raw_torque) - kRawTorqueZero);
-
-            // Temperature unit: celsius. The rotor coil is the one the over temperature
-            // protection actually watches.
-            temperature_     = static_cast<double>(feedback.temperature_rotor);
-            temperature_mos_ = static_cast<double>(feedback.temperature_mos);
+        // 角度，单位 rad。位置 16 位，速度和力矩各 12 位，都线性映射到 [-max, +max] 上，
+        // 所以原始值 0 是负向极限而不是原点。
+        const int raw_angle = (int{feedback.angle_high} << 8) | feedback.angle_low;
+        auto calibrated_raw_angle = raw_angle - encoder_zero_point_;
+        if (!multi_turn_angle_enabled_) {
+            // 归一化到 (-模/2, 模/2]。DM 的位置在 ±PMAX 处回绕，那是大约四圈，
+            // 所以没有"一圈"的范围可以折进去。
+            calibrated_raw_angle =
+                ((calibrated_raw_angle + kRawAngleModulus / 2) & (kRawAngleModulus - 1))
+                - kRawAngleModulus / 2;
+            multi_turn_encoder_count_ = calibrated_raw_angle;
+        } else {
+            // 和 LkMotor 一样的最小差值技巧，因为模是 2 的幂所以成立。在原始值域里做这件事，
+            // 回绕才值 2*PMAX 而不是一圈。
+            auto diff =
+                (calibrated_raw_angle - multi_turn_encoder_count_) & (kRawAngleModulus - 1);
+            if (diff > (kRawAngleModulus >> 1))
+                diff -= kRawAngleModulus;
+            multi_turn_encoder_count_ += diff;
         }
+        last_raw_angle_ = raw_angle;
+        angle_ =
+            raw_angle_to_angle_coefficient_ * static_cast<double>(multi_turn_encoder_count_);
+
+        // 速度，单位 rad/s
+        const int raw_velocity = (int{feedback.velocity_high} << 4)
+                               | (feedback.velocity_low_and_torque_high >> 4);
+        velocity_ = raw_velocity_to_velocity_coefficient_
+                  * (static_cast<double>(raw_velocity) - kRawVelocityZero);
+
+        // 力矩，单位 N*m
+        const int raw_torque = (int{feedback.velocity_low_and_torque_high & 0x0F} << 8)
+                             | feedback.torque_low;
+        torque_ = raw_torque_to_torque_coefficient_
+                * (static_cast<double>(raw_torque) - kRawTorqueZero);
+
+        // 温度，单位摄氏度。过温保护实际盯的是转子线圈这一个。
+        temperature_     = static_cast<double>(feedback.temperature_rotor);
+        temperature_mos_ = static_cast<double>(feedback.temperature_mos);
 
         *angle_output_           = angle();
         *raw_angle_output_       = last_raw_angle();
@@ -392,8 +285,7 @@ public:
         *torque_output_          = torque();
         *temperature_output_     = temperature();
         *temperature_mos_output_ = temperature_mos();
-        *error_code_output_      = static_cast<uint8_t>(error());
-        *online_output_          = online();
+        *error_code_output_      = static_cast<std::uint8_t>(error());
     }
 
     int calibrate_zero_point() {
@@ -413,40 +305,35 @@ public:
 
     Error error() const { return error_; }
     bool enabled() const { return error_ == Error::kEnabled; }
-    bool online() const { return online_; }
-    /// True once any feedback frame has been decoded.
-    bool received() const { return received_; }
-    /// A reported fault, as opposed to the two plain enable states. The driver keeps clearing it
-    /// on its own (see generate_command()); whether that is allowed to put torque back on the
-    /// joint is the caller's decision, which is why this is exposed at all.
+    /// 电机报了故障，区别于两个普通的使能状态。驱动自己会一直去清它（见 generate_command()）；
+    /// 清掉之后许不许把力矩重新加回关节上，是调用方的决定，所以才把它暴露出来。
     bool faulted() const { return error_ != Error::kDisabled && error_ != Error::kEnabled; }
 
-    /// @brief Bring the motor out of the power-on default state. Until this is acknowledged the
-    /// driver ignores every control frame, so it is the first thing any DM motor needs.
+    /// @brief 让电机离开上电默认状态。在这一帧被确认之前驱动不理任何控制帧，
+    /// 所以它是每台 DM 电机要做的第一件事。
     constexpr static CanPacket8 generate_enable_command() { return generate_control_frame(0xFC); }
 
-    /// @brief Return the motor to the disabled state. Also the safest thing to put on the bus
-    /// when there is nothing to command: feedback is poll driven, so a bus that goes quiet stops
-    /// reporting status altogether.
+    /// @brief 让电机回到失能状态。没有指令可发的时候，往总线上放这一帧也是最安全的：
+    /// 反馈是问一句答一句的，总线一旦安静下来，状态也就不再上报了。
     constexpr static CanPacket8 generate_disable_command() { return generate_control_frame(0xFD); }
 
-    /// @brief Clear a latched fault (over temperature and friends).
+    /// @brief 清除锁存的故障（过温之类）。
     constexpr static CanPacket8 generate_clear_error_command() {
         return generate_control_frame(0xFB);
     }
 
-    /// @brief Set the current output shaft position as the driver's zero, and zero the position
-    /// setpoint with it.
-    /// @note This is a control frame addressed to the motor id, not a 0x7FF register write.
-    constexpr static CanPacket8 generate_save_zero_command() { return generate_control_frame(0xFE); }
+    /// @brief 把输出轴当前的位置设为驱动的零点，位置给定也随之归零。
+    /// @note 这是一帧发给电机 id 的控制帧，不是 0x7FF 的寄存器写。
+    constexpr static CanPacket8 generate_save_zero_command() {
+        return generate_control_frame(0xFE);
+    }
 
-    /// @brief The host sends this command to drive the motor with the MIT law
-    /// tau = kp * (angle - angle_measured) + kd * (velocity - velocity_measured) + torque.
-    /// @note Each parameter is clamped into the mapped range before being quantized. Without the
-    /// clamp an out of range setpoint wraps around the fixed point field and comes out as the
-    /// opposite extreme, which for the 16 bit position field means a full swing command.
-    /// @note NaN means "not commanded" and drops the matching gain, so an unwired position input
-    /// cannot be mistaken for a command to drive to the zero point.
+    /// @brief 上位机用这一帧按 MIT 控制律驱动电机：
+    /// tau = kp * (angle - angle_measured) + kd * (velocity - velocity_measured) + torque。
+    /// @note 每个参数在量化之前先限到映射范围里。不限的话，超范围的给定会在定点字段里绕回去，
+    /// 出来的是相反方向的极值——对 16 位的位置字段来说就是一条满行程的指令。
+    /// @note NaN 表示"没有给定"，对应的增益随之置零，所以没接线的位置输入不可能被当成
+    /// "转到零点"的指令。
     CanPacket8 generate_mit_command(
         double control_angle, double control_velocity, double control_torque, double kp,
         double kd) const {
@@ -469,22 +356,21 @@ public:
         const int raw_kp       = to_raw(kp, 0, kKpMax, kRawGainMax);
         const int raw_kd       = to_raw(kd, 0, kKdMax, kRawGainMax);
 
-        // Five parameters bit packed into eight bytes, so a byte array says it better than a
-        // struct of bit fields would.
-        const std::array<uint8_t, 8> command{
-            static_cast<uint8_t>(raw_angle >> 8),
-            static_cast<uint8_t>(raw_angle),
-            static_cast<uint8_t>(raw_velocity >> 4),
-            static_cast<uint8_t>(((raw_velocity & 0x0F) << 4) | (raw_kp >> 8)),
-            static_cast<uint8_t>(raw_kp),
-            static_cast<uint8_t>(raw_kd >> 4),
-            static_cast<uint8_t>(((raw_kd & 0x0F) << 4) | (raw_torque >> 8)),
-            static_cast<uint8_t>(raw_torque)};
+        // 五个参数按位挤在八个字节里，所以用字节数组比用位域结构体说得更清楚。
+        const std::array<std::uint8_t, 8> command{
+            static_cast<std::uint8_t>(raw_angle >> 8),
+            static_cast<std::uint8_t>(raw_angle),
+            static_cast<std::uint8_t>(raw_velocity >> 4),
+            static_cast<std::uint8_t>(((raw_velocity & 0x0F) << 4) | (raw_kp >> 8)),
+            static_cast<std::uint8_t>(raw_kp),
+            static_cast<std::uint8_t>(raw_kd >> 4),
+            static_cast<std::uint8_t>(((raw_kd & 0x0F) << 4) | (raw_torque >> 8)),
+            static_cast<std::uint8_t>(raw_torque)};
 
         return std::bit_cast<CanPacket8>(command);
     }
 
-    /// @brief The MIT frame of the configured mode, from the wired inputs.
+    /// @brief 所配置模式的 MIT 帧，取自接了线的输入。
     CanPacket8 generate_mit_command() const {
         switch (control_mode_) {
         case ControlMode::kTorque:
@@ -500,11 +386,9 @@ public:
         return generate_disable_command();
     }
 
-    /// @brief The frame to put on the bus this cycle: enable, clear error, or the MIT frame of
-    /// the configured mode.
-    /// @note The enable and clear error frames return early, before the MIT frame is built. A
-    /// state machine that builds the control frame first and then overwrites it hides from the
-    /// caller that no command went out this cycle.
+    /// @brief 这一拍要放到总线上的帧：使能、清错，或者所配置模式的 MIT 帧。
+    /// @note 使能帧和清错帧是提前返回的，在 MIT 帧构造之前。先构造控制帧、再把它覆盖掉的状态机，
+    /// 会让调用方看不出这一拍其实没有指令发出去。
     CanPacket8 generate_command() {
         if (error_ == Error::kDisabled)
             return generate_enable_command();
@@ -519,27 +403,25 @@ public:
         return generate_mit_command();
     }
 
-    /// @brief What this motor sends this cycle, with the safety rule applied: a safe cycle, or a
-    /// NaN on the mode's own setpoint (controller disabled, fallen, isolated), puts the motor
-    /// in the disabled state (0xFD) instead of commanding it.
+    /// @brief 这台电机这一拍发什么，安全规则已经套上：安全拍，或者所选模式自己的给定是 NaN
+    /// （控制器被禁用、倒地、被隔离），就让电机进失能状态（0xFD），而不是给它指令。
     CanPacket8 command_frame(bool safe) {
         if (safe || std::isnan(setpoint()))
             return generate_disable_command();
         return generate_command();
     }
 
-    /// @brief Hand this cycle's frame to the bus it sits on. One frame per motor.
+    /// @brief 把这一拍的帧交给所在的总线。一台电机一帧。
     template <class BusFrames>
     void append_command(BusFrames& bus, bool safe) {
-        bus.push(send_id(), command_frame(safe));
+        bus.push(command_id(), command_frame(safe));
     }
 
     ControlMode control_mode() const noexcept { return control_mode_; }
 
     double control_angle() const {
-        // has_provider(), not ready(): an optional input with nobody upstream is bound to a
-        // default constructed 0.0 and reads as ready, which would turn "unwired" into "commanded
-        // to the zero point".
+        // 用 has_provider() 而不是 ready()：上游没人的可选输入绑的是一个默认构造的 0.0，
+        // 读起来是 ready 的，那样"没接线"就变成了"命令转到零点"。
         if (control_angle_.has_provider()) [[likely]]
             return *control_angle_;
         else
@@ -575,7 +457,64 @@ public:
     }
 
 private:
-    /// The input the mode is built around: NaN there means "do not command this motor".
+    /// 应用配置。只由构造函数调一次：驱动接到端口上之后不再重新配置。
+    void configure(const Config& config) {
+        esc_id_    = config.esc_id;
+        master_id_ = config.master_id;
+        mit_range_ = config.mit_range;
+
+        // DM 解码 angle = raw * 2PMAX / 65535 - PMAX 的逆运算，
+        // 所以驱动自己坐标里的 zero_angle 在这里正好落在原始零点上。
+        const double position_max = config.mit_range->position_max;
+        const int encoder_zero_point =
+            config.zero_angle ? static_cast<int>(std::lround(
+                                    (*config.zero_angle + position_max) * kRawAngleMax
+                                    / (2 * position_max)))
+                              : config.encoder_zero_point;
+        encoder_zero_point_ = encoder_zero_point & (kRawAngleModulus - 1);
+
+        multi_turn_angle_enabled_ = config.multi_turn_angle_enabled;
+        multi_turn_encoder_count_ = 0;
+        last_raw_angle_           = encoder_zero_point_;
+
+        const double sign            = config.reversed ? -1 : 1;
+        const double reduction_ratio = config.reduction_ratio;
+
+        raw_angle_to_angle_coefficient_ =
+            sign / reduction_ratio * (2 * config.mit_range->position_max) / kRawAngleMax;
+        angle_to_raw_angle_coefficient_ = 1 / raw_angle_to_angle_coefficient_;
+
+        raw_velocity_to_velocity_coefficient_ =
+            sign / reduction_ratio * (2 * config.mit_range->velocity_max) / kRawVelocityMax;
+        velocity_to_raw_velocity_coefficient_ = 1 / raw_velocity_to_velocity_coefficient_;
+
+        raw_torque_to_torque_coefficient_ =
+            sign * reduction_ratio * (2 * config.mit_range->torque_max) / kRawTorqueMax;
+        torque_to_raw_torque_coefficient_ = 1 / raw_torque_to_torque_coefficient_;
+
+        // 注意：和 LkMotor 不同，这里的 max_torque_ **不是**手册上的峰值力矩（J4310 在 0.8 过流系数下
+        // 11 N*m，0.98 下 12.5 N*m，额定 3.5 N*m）。它是 MIT 帧实际能表达的最大力矩，也就是 TMAX。
+        // 控制器按手册上的数字去限幅，只会被协议再截一次。
+        max_torque_ = config.mit_range->torque_max * reduction_ratio;
+
+        kp_ = config.kp;
+        kd_ = config.kd;
+
+        error_retry_interval_ = config.error_retry_interval;
+
+        error_                 = Error::kDisabled;
+        error_retry_countdown_ = 0;
+
+        angle_           = 0.0;
+        velocity_        = 0.0;
+        torque_          = 0.0;
+        temperature_     = 0.0;
+        temperature_mos_ = 0.0;
+
+        *max_torque_output_ = max_torque();
+    }
+
+    /// 所选模式围绕的那个输入：它是 NaN 就表示"不要给这台电机指令"。
     double setpoint() const {
         switch (control_mode_) {
         case ControlMode::kTorque: return control_torque();
@@ -585,18 +524,11 @@ private:
         return kNan;
     }
 
-    /// D[0] is ID | ERR << 4. The manual calls ID "the low 8 bits of CAN_ID", but ERR takes the
-    /// high nibble of the same byte, so only the low nibble of the id survives; compare that
-    /// much and no more. ESC_ID is what the motor reports here, not MST_ID.
-    bool feedback_from_this_motor(std::byte d0) const {
-        return (std::to_integer<std::uint32_t>(d0) & 0x0F) == (esc_id_ & 0x0F);
-    }
-
-    /// Enable, disable, clear error and save zero all share this shape.
-    constexpr static CanPacket8 generate_control_frame(uint8_t id) {
+    /// 使能、失能、清错、保存零点都是这个形状。
+    constexpr static CanPacket8 generate_control_frame(std::uint8_t id) {
         const struct [[gnu::packed]] {
-            uint8_t placeholder[7];
-            uint8_t id;
+            std::uint8_t placeholder[7];
+            std::uint8_t id;
         } command alignas(CanPacket8){
             .placeholder = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, .id = id};
         return std::bit_cast<CanPacket8>(command);
@@ -622,19 +554,19 @@ private:
             kRawTorqueZero + torque_to_raw_torque_coefficient_ * torque, kRawTorqueMax);
     }
 
-    /// Guards NaN before the cast: std::clamp passes NaN straight through and casting it to int
-    /// is undefined. Callers filter NaN for meaning, this filters it for safety.
+    /// 在转换之前先挡住 NaN：std::clamp 会把 NaN 原样放过去，而把它转成 int 是未定义行为。
+    /// 调用方滤 NaN 是为了语义，这里滤是为了安全。
     static int clamp_raw(double raw, int raw_max) {
         if (std::isnan(raw)) [[unlikely]]
             return 0;
         return static_cast<int>(std::round(std::clamp(raw, 0.0, static_cast<double>(raw_max))));
     }
 
-    // Limits
+    // 限值
     static constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
 
-    // DM maps position onto 16 bits and velocity, torque, kp and kd onto 12 bits each. The
-    // modulus is what the counter wraps on, the max is what the linear map spans.
+    // DM 把位置映射到 16 位上，速度、力矩、kp、kd 各映射到 12 位上。
+    // "模"是计数器回绕的地方，"最大值"是线性映射跨过的范围。
     static constexpr int kRawAngleModulus = 1 << 16;
     static constexpr int kRawAngleMax     = kRawAngleModulus - 1;
     static constexpr int kRawAngleZero    = kRawAngleModulus / 2;
@@ -642,8 +574,8 @@ private:
     static constexpr int kRawTorqueMax    = (1 << 12) - 1;
     static constexpr int kRawGainMax      = (1 << 12) - 1;
 
-    // Constants
-    // kp and kd ranges are fixed by the protocol, not by the motor, so they are not configurable.
+    // 常量
+    // kp 和 kd 的范围是协议定死的，不由电机决定，所以不可配置。
     static constexpr double kKpMax = 500.0;
     static constexpr double kKdMax = 5.0;
 
@@ -653,28 +585,20 @@ private:
     ControlMode control_mode_;
     std::uint32_t esc_id_ = 0, master_id_ = 0;
     MitRange mit_range_{};
-    std::uint32_t reported_foreign_frames_ = 0; ///< best effort side only, see take_problem()
+    std::uint32_t reported_foreign_frames_ = 0; /// 只在尽力域碰，见 take_problem()
 
     bool multi_turn_angle_enabled_;
     int encoder_zero_point_;
 
     double kp_ = 0.0, kd_ = 0.0;
 
-    // Coefficients
+    // 系数
     double raw_angle_to_angle_coefficient_, angle_to_raw_angle_coefficient_;
     double raw_velocity_to_velocity_coefficient_, velocity_to_raw_velocity_coefficient_;
     double raw_torque_to_torque_coefficient_, torque_to_raw_torque_coefficient_;
 
-    // Status
-    std::atomic<CanPacket8> can_packet_;
-    std::atomic<std::uint32_t> sequence_ = 0;
-    std::uint32_t last_sequence_ = 0;
-    std::atomic<std::uint32_t> foreign_frame_count_ = 0;
-
-    bool received_ = false;
+    // 状态
     Error error_ = Error::kDisabled;
-    bool online_ = false;
-    int offline_count_ = 0, offline_timeout_ = 0;
     int error_retry_countdown_ = 0, error_retry_interval_ = 0;
 
     std::int64_t multi_turn_encoder_count_ = 0;
@@ -688,14 +612,13 @@ private:
     double temperature_mos_;
 
     hcs_executor::Component::OutputInterface<double> angle_output_;
-    hcs_executor::Component::OutputInterface<int64_t> raw_angle_output_;
+    hcs_executor::Component::OutputInterface<std::int64_t> raw_angle_output_;
     hcs_executor::Component::OutputInterface<double> velocity_output_;
     hcs_executor::Component::OutputInterface<double> torque_output_;
     hcs_executor::Component::OutputInterface<double> temperature_output_;
     hcs_executor::Component::OutputInterface<double> temperature_mos_output_;
     hcs_executor::Component::OutputInterface<double> max_torque_output_;
-    hcs_executor::Component::OutputInterface<uint8_t> error_code_output_;
-    hcs_executor::Component::OutputInterface<bool> online_output_;
+    hcs_executor::Component::OutputInterface<std::uint8_t> error_code_output_;
 
     hcs_executor::Component::InputInterface<double> control_angle_;
     hcs_executor::Component::InputInterface<double> control_velocity_;

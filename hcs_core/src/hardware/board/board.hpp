@@ -150,6 +150,37 @@ private:
     SerialDevice* device_ = nullptr;
 };
 
+/// 板载 IMU：板子自己焊着的那一颗（BMI088），加速度计和陀螺仪的样本经 USB 直接上来。
+/// 一块板只有一个，也只接一个设备。它没有可配置的线路参数，所以不出现在 EP0 配置里。
+class ImuPort {
+public:
+    template <class Sdk>
+    explicit ImuPort(Board<Sdk>& board)
+        : ImuPort(static_cast<BoardCore&>(board)) {}
+
+    ImuPort(const ImuPort&) = delete;
+    ImuPort& operator=(const ImuPort&) = delete;
+
+    [[nodiscard]] BoardCore& board() const noexcept { return board_; }
+    /// "gimbal_board/imu"
+    [[nodiscard]] std::string label() const;
+    [[nodiscard]] ImuDevice* device() const noexcept { return device_; }
+
+    void attach(ImuDevice& device);
+
+    /// libhcs IO 线程（事件域）。
+    void receive(const device::ImuSample& sample) noexcept HCS_NONBLOCKING {
+        if (device_)
+            device_->receive(sample);
+    }
+
+private:
+    explicit ImuPort(BoardCore& board);
+
+    BoardCore& board_;
+    ImuDevice* device_ = nullptr;
+};
+
 /// 板组件与型号无关的部分：生命周期、参数、周期域的收发、尽力域的上报。
 ///
 /// 生命周期：构造（端口、设备登记）→ before_updating()（读参数、打开板卡、登记到发送线程）
@@ -204,14 +235,17 @@ protected:
     [[nodiscard]] SerialPort* serial_port(std::size_t index) const noexcept HCS_NONBLOCKING {
         return index < serial_by_index_.size() ? serial_by_index_[index] : nullptr;
     }
+    [[nodiscard]] ImuPort* imu_port() const noexcept HCS_NONBLOCKING { return imu_port_; }
 
 private:
     friend class CanBus;
     friend class SerialPort;
+    friend class ImuPort;
     class Command;
 
     void add(CanBus& bus);
     void add(SerialPort& port);
+    void add(ImuPort& port);
     void leave_transmitter() noexcept;
 
     [[nodiscard]] libhcs::board::hcs::Configuration configuration() const;
@@ -234,17 +268,21 @@ private:
     std::vector<SerialPort*> serial_ports_;
     std::array<CanBus*, 8> can_by_index_{};        ///< 下标 = 板型端口表下标
     std::array<SerialPort*, 8> serial_by_index_{}; ///< 同上（EP0 配置最多 8 路）
+    ImuPort* imu_port_ = nullptr;                  ///< 板载 IMU，一块板至多一个
     std::vector<Device*> devices_;                 ///< before_updating() 时收齐
 
     std::shared_ptr<util::SharedTransmitter> transmitter_ref_; ///< 打开之后持有，关闭时还要用
     util::SharedTransmitter::Lane* lane_ = nullptr;             ///< 打开之后才有
     std::uint32_t batch_sequence_ = 0;              ///< 指令侧批次序号（周期域）
     rclcpp::TimerBase::SharedPtr report_timer_;
+    /// "链路断了"在不退出的配置下每 5 秒提醒一次，只在 report() 里用（spin 线程）。
+    hcs_log::Throttle link_fault_report_{std::chrono::seconds{5}};
 };
 
 /// 一块 libhcs 板。Sdk 是 libhcs 的板卡类（libhcs::board::Hpm5321、Mc02……）：
 /// 构造 (callback, serial_filter, options, configuration)，Callback 以描述符回调
 /// （can_receive_callback(Spec::Can, ...) / uart_receive_callback(Spec::Uart, ...)），
+/// 板载 IMU 走 accelerometer_receive_callback / gyroscope_receive_callback，
 /// 另有 link_state()、interface()、can_status()、start_transmit().can_transmit()。
 template <class Sdk>
 class Board : public BoardCore {
@@ -331,6 +369,29 @@ private:
             [[maybe_unused]] const hcs_utility::RealtimeScope realtime_scope;
             if (auto* port = board_.serial_port(Spec::kUarts.index_of(uart)))
                 port->receive(data.uart_data);
+        }
+
+        void accelerometer_receive_callback(
+            const libhcs::data::ImuAccelerometerDataView& data) override {
+            [[maybe_unused]] const hcs_utility::RealtimeScope realtime_scope;
+            if (auto* port = board_.imu_port())
+                port->receive(
+                    {.kind = device::ImuSample::Kind::kAccelerometer,
+                     .x = data.x,
+                     .y = data.y,
+                     .z = data.z,
+                     .timestamp_quarter_us = data.timestamp_quarter_us});
+        }
+
+        void gyroscope_receive_callback(const libhcs::data::ImuGyroscopeDataView& data) override {
+            [[maybe_unused]] const hcs_utility::RealtimeScope realtime_scope;
+            if (auto* port = board_.imu_port())
+                port->receive(
+                    {.kind = device::ImuSample::Kind::kGyroscope,
+                     .x = data.x,
+                     .y = data.y,
+                     .z = data.z,
+                     .timestamp_quarter_us = data.timestamp_quarter_us});
         }
 
     private:

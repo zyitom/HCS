@@ -13,3 +13,15 @@ std::string& pending_component_name() {
 }
 
 } // namespace hcs_executor::detail
+
+namespace hcs_executor {
+
+/// 函数局部静态：第一次有人要日志时才建（连同它的日志线程），进程退出时析构，
+/// 析构里会把队列里剩下的写完。第一次调用发生在主线程构造第一个组件 / Executor 的时候，
+/// 远在控制线程启动之前——"建线程"这件事不会落到周期域里。
+hcs_log::Backend& process_log_backend() {
+    static hcs_log::Backend backend;
+    return backend;
+}
+
+} // namespace hcs_executor

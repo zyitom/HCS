@@ -31,7 +31,7 @@ class TwoAxisGimbalSolver {
         virtual PitchLink::DirectionVector update(TwoAxisGimbalSolver& super) const
             HCS_NONBLOCKING = 0;
         // Modifies super.control_enabled_ in the method.
-        // Returns the new control direction (in PitchLink) to be used for control.
+        // 返回新的控制方向（在 PitchLink 系下），供控制使用。
     };
 
 public:

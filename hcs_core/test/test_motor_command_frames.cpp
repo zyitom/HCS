@@ -2,7 +2,7 @@
 //
 // 期望字节全部录自重构前的实际输出（同样的电机配置照抄 balance_infantry.cpp 的接线表，
 // 按改造前 BalanceInfantry::pack_frames 的规则：DM 力矩 NaN 或 safe 发 0xFD、否则
-// generate_command()；LK 走 generate_torque_command()；DJI 同 send_id 合帧）。
+// generate_command()；LK 走 generate_torque_command()；DJI 同 command_id 合帧）。
 // 唯一有意的差异是 pitch：它的 /control_velocity 上游是角度环输出，改造前 DM 驱动见它接了
 // 就按"速度形状"编 MIT 帧（kd = 0 时物理上无效，但字段里带着速度）；力矩模式下不再注册
 // 这个输入，速度字段回到中点。
@@ -77,7 +77,7 @@ Bytes single_frame(Motor& motor, bool safe) {
     motor.append_command(bus, safe);
     frames.flush();
     EXPECT_EQ(batch.frame_count, 1U);
-    EXPECT_EQ(batch.frames[0].can_id, motor.send_id());
+    EXPECT_EQ(batch.frames[0].can_id, motor.command_id());
     return bytes_of(CanPacket8{std::span<const std::byte, 8>{batch.frames[0].data}});
 }
 
@@ -95,12 +95,16 @@ DmMotor::Config pitch(DmMotor::ControlMode mode = DmMotor::ControlMode::kTorque)
         .set_reversed();
 }
 
+/// 一帧 DM 反馈，走端口包装层的那几步：按 id 查到这台电机 → accepts() → on_frame() → on_tick()。
 void dm_feedback(DmMotor& motor, std::uint32_t esc_id, std::uint32_t master_id, std::uint8_t err) {
     const std::array<std::uint8_t, 8> frame{
         static_cast<std::uint8_t>((esc_id & 0x0F) | (err << 4)), 0x80, 0x00, 0x80, 0x07, 0xFF, 30,
         30};
-    motor.match_then_store_status(master_id, std::as_bytes(std::span{frame}));
-    motor.update_status();
+    ASSERT_EQ(master_id, motor.feedback_id()) << "the bus would not have routed this frame here";
+    const CanPacket8 packet{std::as_bytes(std::span{frame})};
+    ASSERT_TRUE(motor.accepts(packet));
+    motor.on_frame(packet);
+    motor.on_tick(true);
 }
 
 constexpr Bytes kDmEnable{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc};
@@ -272,12 +276,12 @@ TEST(CommandFrames, ExclusiveFramesFirstThenSharedPerBus) {
     leg.append_command(can1, false);
     b.append_command(can1, false);
     yaw.append_command(can2, false);
-    c.append_command(can2, false); // 同 send_id，不同总线：另起一帧
+    c.append_command(can2, false); // 同 command_id，不同总线：另起一帧
     frames.flush();
 
     ASSERT_EQ(batch.frame_count, 4U);
-    EXPECT_EQ(batch.frames[0].can_id, leg.send_id());
-    EXPECT_EQ(batch.frames[1].can_id, yaw.send_id());
+    EXPECT_EQ(batch.frames[0].can_id, leg.command_id());
+    EXPECT_EQ(batch.frames[1].can_id, yaw.command_id());
     EXPECT_EQ(batch.frames[2].can_id, 0x200U);
     EXPECT_EQ(batch.frames[2].port, static_cast<std::uint8_t>(CanPort::kCan1));
     EXPECT_EQ(batch.frames[3].can_id, 0x200U);

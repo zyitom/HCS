@@ -18,7 +18,6 @@
 #include <libhcs/board/mc02.hpp>
 #include <libhcs/data/datas.hpp>
 
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
@@ -185,20 +184,18 @@ public:
         slow_rtt_threshold_ns_ = int_parameter("slow_rtt_threshold_us", 500) * 1000;
 
         if (!sender_.thread_config_error().empty())
-            RCLCPP_WARN(
-                get_logger(), "[%s] tx thread config: %s", get_component_name().c_str(),
-                sender_.thread_config_error().c_str());
+            logger().warn(
+                "[{}] tx thread config: {}", get_component_name(), sender_.thread_config_error());
 
         // 配置漂移防护：IO 线程留在普通核上就是 SCHED_OTHER，桌面负载下尾部实测到过
         // 毫秒级（绑隔离核 + FIFO 后 giveback -> 回调 < 15 us）。这板子是辅助低速件
         // 也要先知道代价再决定，而不是从日志里猜。
         if (io_thread_cpu < 0)
-            RCLCPP_WARN(
-                get_logger(),
-                "[%s] io_thread_cpu=-1: the USB event thread runs unpinned under SCHED_OTHER; "
+            logger().warn(
+                "[{}] io_thread_cpu=-1: the USB event thread runs unpinned under SCHED_OTHER; "
                 "its rtt tail is then at the mercy of CFS load (measured up to tens of ms). "
                 "Pin it to an isolated core with an RT priority for deterministic tails.",
-                get_component_name().c_str());
+                get_component_name());
 
         // 板卡在构造期就可能开始回调，所以放在所有它会碰的数据都就位之后。
         // io_thread_cpu 设了之后，libhcs 的保活线程会跟到同一组核、低一级实时优先级。
@@ -224,23 +221,21 @@ public:
         const bool board_can1_is_fd =
             hpm5321_ ? hpm5321_->can1_is_fd() : (mc02_ ? mc02_->can1_is_fd() : fdcan_);
         if (board_can1_is_fd != fdcan_)
-            RCLCPP_WARN(
-                get_logger(),
-                "[%s] yaml fdcan=%s but the board reports CAN1 %s (EP0); the board wins",
-                get_component_name().c_str(), fdcan_ ? "true" : "false",
+            logger().warn(
+                "[{}] yaml fdcan={} but the board reports CAN1 {} (EP0); the board wins",
+                get_component_name(), fdcan_ ? "true" : "false",
                 board_can1_is_fd ? "FD" : "classic");
 
         last_report_ = hcs_sync::Clock::now();
         report_timer_ = create_wall_timer(
             std::chrono::milliseconds{report_period_ms}, [this] { report(); });
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] link probe: board=%s serial_filter='%s' can_id=0x%03X %s send_every=%llu "
-            "burst=%u burst_on_ms=%lld burst_off_ms=%lld "
-            "io_thread_cpu=%lld io_thread_rt_priority=%lld slow_rtt_threshold_us=%lld "
-            "inline_submit=%d",
-            get_component_name().c_str(), board_type_.c_str(), serial_filter_.c_str(), can_id_,
+        logger().info(
+            "[{}] link probe: board={} serial_filter='{}' can_id=0x{:03X} {} send_every={} "
+            "burst={} burst_on_ms={} burst_off_ms={} "
+            "io_thread_cpu={} io_thread_rt_priority={} slow_rtt_threshold_us={} "
+            "inline_submit={}",
+            get_component_name(), board_type_, serial_filter_, can_id_,
             fdcan_ ? "fd" : "classic", static_cast<unsigned long long>(send_every_), burst_,
             static_cast<long long>(burst_on_ns_ / 1'000'000),
             static_cast<long long>(burst_off_ns_ / 1'000'000),
@@ -495,14 +490,14 @@ private:
         // 同一条时间轴。满了丢新并计数（EventQueue 的显式策略），这里只报累计丢弃数。
         link_probe::SlowRtt slow;
         while (slow_rtts_.try_pop(slow))
-            RCLCPP_INFO(
-                get_logger(), "[%s] slow rtt: arrival=%lld ns rtt=%.1f us seq=%u",
-                get_component_name().c_str(), static_cast<long long>(slow.arrival_ns),
-                static_cast<double>(slow.rtt_ns) / 1e3, slow.sequence);
+            logger().info(
+                "[{}] slow rtt: arrival={} ns rtt={:.1f} us seq={}", get_component_name(),
+                static_cast<long long>(slow.arrival_ns), static_cast<double>(slow.rtt_ns) / 1e3,
+                slow.sequence);
         if (const auto dropped = slow_rtts_.dropped(); dropped != slow_dropped_reported_) {
-            RCLCPP_WARN(
-                get_logger(), "[%s] slow rtt ring overflow: dropped=%llu total",
-                get_component_name().c_str(), static_cast<unsigned long long>(dropped));
+            logger().warn(
+                "[{}] slow rtt ring overflow: dropped={} total", get_component_name(),
+                static_cast<unsigned long long>(dropped));
             slow_dropped_reported_ = dropped;
         }
 
@@ -523,7 +518,7 @@ private:
                                const std::vector<std::uint64_t>& tx,
                                const std::vector<std::uint64_t>& cmd, bool cumulative) {
             const auto rtt_summary = link_probe::summarize(rtt);
-            const auto line = std::format(
+            logger().info(
                 "[{}] {} ticks={} sent={} recv={} lost={} miss={} stray={} tx_exc={} | "
                 "rtt p50/p99/p99.9/max={} >=1ms={} | tx={} | cmd={}",
                 get_component_name(), label, c.ticks, c.sent, c.received,
@@ -532,7 +527,6 @@ private:
                 format_latency(rtt_summary, rtt_.max_ns(), cumulative), rtt_summary.over_1ms,
                 format_latency(link_probe::summarize(tx), tx_.max_ns(), cumulative),
                 format_latency(link_probe::summarize(cmd), cmd_.max_ns(), cumulative));
-            RCLCPP_INFO(get_logger(), "%s", line.c_str());
         };
 
         const Counters window_counters{

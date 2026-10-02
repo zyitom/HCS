@@ -118,7 +118,7 @@ public:
         return {};
     }
 
-    /// The other half: scheduling policy, realtime priority, nice. See above for why it is last.
+    /// 另一半：调度策略、实时优先级、nice。为什么它排在最后，见上面。
     auto apply_scheduling_to_current_thread() const -> std::expected<void, std::string> {
         if (policy_) {
             sched_param param{};
@@ -250,9 +250,8 @@ private:
         return cpus;
     }
 
-    /// CPUs this kernel is configured for. Deliberately *not* sched_getaffinity: on a machine
-    /// with `isolcpus`, the isolated CPUs are absent from the default mask, and pinning to one
-    /// of them is exactly what we want to allow.
+    /// 这个内核配置了多少个 CPU。故意**不**用 sched_getaffinity：在带 isolcpus 的机器上，
+    /// 被隔离的 CPU 不在默认掩码里，而绑到其中一个上恰恰是我们要允许的事。
     static int configured_cpu_count() {
         const long count = ::sysconf(_SC_NPROCESSORS_CONF);
         return count > 0 ? static_cast<int>(count) : 0;
@@ -264,10 +263,9 @@ private:
         if (last_cpu >= CPU_SETSIZE)
             throw_invalid_spec("cpu index exceeds CPU_SETSIZE", spec);
 
-        // A mask naming CPUs this machine does not have used to pass silently: as long as one
-        // listed CPU exists, pthread_setaffinity_np succeeds and the kernel drops the rest.
-        // That is how a config written for a 20-CPU machine kept "working" on an 8-CPU one
-        // while quietly meaning something else.
+        // 掩码里写了这台机器没有的 CPU，以前是不出声地通过的：只要列出来的 CPU 里有一个存在，
+        // pthread_setaffinity_np 就成功，内核把其余的丢掉。给 20 核机器写的配置就是这样在 8 核
+        // 机器上"照常工作"的，而实际意思已经悄悄变了。
         if (const int configured = configured_cpu_count(); configured > 0 && last_cpu >= configured)
             throw_invalid_spec(
                 std::format(

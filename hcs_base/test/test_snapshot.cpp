@@ -2,12 +2,14 @@
 // 这里的重点是撕裂：单字段类型永远测不出"字段来自两次 publish 的组合"，所以用多字段探针。
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <thread>
 
 #include <gtest/gtest.h>
 
+#include <hcs_base/cache_line.hpp>
 #include <hcs_base/channel/snapshot.hpp>
 
 namespace {
@@ -271,3 +273,22 @@ TEST(Snapshot, NextSequenceSkipsZeroOnWrap) {
 }
 
 } // namespace
+
+// ── 布局 ────────────────────────────────────────────────────────────────────
+
+// 一条 cache line 只许有一个写者：三个槽位、共享的交换字、写者私有状态、读者私有状态
+// 各占自己的行。这里钉的是总尺寸——少一行就说明有两样东西又挤到一起了，
+// 那是伪共享，跑起来只表现为"慢一点"，没有任何测试会红。
+TEST(Snapshot, EachRoleOwnsWholeCacheLines) {
+    constexpr std::size_t line = hcs_utility::kCacheLine;
+
+    // 载荷不足一行：3 格 + 交换字 + 写者 + 读者 = 6 行。
+    EXPECT_EQ(alignof(Snapshot<char>), line);
+    EXPECT_EQ(sizeof(Snapshot<char>), 6 * line);
+
+    // 载荷跨行时每格向上取整到整数行，格与格之间仍然不共行。
+    struct Wide {
+        std::byte bytes[100];
+    };
+    EXPECT_EQ(sizeof(Snapshot<Wide>), (3 * 2 + 3) * line);
+}
