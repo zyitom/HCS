@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -27,8 +28,8 @@ public:
         /// 接收信号要不要在板上取反。DBUS 在线上是反相的；板上已经带了硬件反相器（c_board）
         /// 就不设，由板卡决定；没有的（mc02 的 DBUS 口靠寄存器取反）设 true。待上台架核对。
         std::optional<bool> rx_inverted = std::nullopt;
-        /// 连续多少拍没有帧算失联。DR16 每 14 ms 发一帧，500 拍即 1 kHz 回路下的 500 ms。
-        int offline_timeout = 500;
+        /// 连续多久没有帧算失联。DR16 每 14 ms 发一帧。
+        std::chrono::milliseconds offline_timeout{500};
     };
 
     Dr16Remote(hcs_executor::Component& status_component, const std::string&, const Config& config)

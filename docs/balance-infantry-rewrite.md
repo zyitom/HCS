@@ -21,8 +21,8 @@
    yaml 里用 Helios 的参数起步。
 4. **发射、裁判系统（含超电、UI、底盘功率限制）这次不做。** 做到那一步时**停下来问用户**（§6 阶段 4）。
 5. `hcs_core` 里这几个目录是用户故意留着的 rmcs 遗留，**一个字都不许改**：
-   `controller/shooting/`、`referee/`、`broadcaster/`，以及 `hardware/device/fake_motor.hpp`、
-   `hardware/deprecated_reference_rmcs_real_car.cpp`。
+   `controller/shooting/`、`referee/`、`broadcaster/`，以及 `hardware/device/fake_motor.hpp`
+   （原先还有 `hardware/deprecated_reference_rmcs_real_car.cpp`，2026-10-07 经用户同意删除，git 历史里可查）。
 6. **`hardware/device/` 下的驱动是 HCS 已有的驱动，直接用**（DM/LK/DJI/Hipnuc/VT13/CanPacket 等）。
    它们只是 include 和命名空间还写成 rmcs 的，所以现在编不进来。**只允许做这一处机械替换**，驱动逻辑不改：
    - `rmcs_executor/component.hpp` → `hcs_executor/component.hpp`，`rmcs_executor::` → `hcs_executor::`
@@ -81,7 +81,8 @@
 | `hcs_balance/`（含 PORTING.md） | **阶段 2 结束后**再删，在那之前它是 Helios 行为事实的参考 |
 
 **不要删**：`hcs_executor/`、`hcs_sync/`、`hcs_utility/`、`hcs_msgs/`、`fast_tf/`、`hcs_core/src/libhcs/`（子模块）、
-两个探针（`can_rtt_probe.cpp`、`hcs_link_probe.cpp`）及其 yaml、`demo_board.cpp` + `demo.yaml`、`controller/pid/`，以及 §1-5 列出的遗留。
+两个探针（`can_rtt_probe.cpp`、`hcs_link_probe.cpp`）及其 yaml、`controller/pid/`，以及 §1-5 列出的遗留。
+（原先这里还有 `demo_board.cpp` + `demo.yaml`：`demo_board.cpp` 已在 `58df7c7` 删除，`demo.yaml` 2026-10-07 经用户同意删除。）
 
 ## 4. 目标架构
 

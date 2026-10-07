@@ -1,17 +1,17 @@
 """hcs_gdbstub 的 gdb 端辅助：`target remote` 之后 `source hcs_gdb.py`。
 
   hcs-components   找出所有存活的 hcs_executor::Component，按 yaml 实例名绑定成
-                   gdb 变量：`print *$demo_hardware`，或在 VS Code Watch 里写 `*$demo_hardware`
+                   gdb 变量：`print *$gimbal_board`，或在 VS Code Watch 里写 `*$gimbal_board`
   hcs-find TYPE    列出动态类型为 TYPE 的存活对象
   $hcs("name")     gdb 函数：按 yaml 实例名返回组件指针，第一次调用时才扫描并缓存。
                    任何 gdb 会话（包括 Cortex-Debug 的 Live Watch 那个）只要加载了本脚本
-                   就能用：Live Watch 里写 `*$hcs("demo_hardware")`
+                   就能用：Live Watch 里写 `*$hcs("gimbal_board")`
 
 同时注册 pretty printer：OutputInterface<T> / InputInterface<T> / DelayedInput<T>
 直接显示值，而不是底层存储字节。
 
 对象是按虚表指针扫可写内存找到的，程序里不需要登记任何东西；代价是
-hcs-components 连上时要扫一遍堆（demo 上约 5 秒）。
+hcs-components 连上时要扫一遍堆（当年在 demo 配置上实测约 5 秒）。
 """
 
 import re

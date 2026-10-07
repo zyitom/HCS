@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include <hcs_base/channel/byte_tunnel.hpp>
@@ -29,7 +30,9 @@
 #include "hardware/device/hipnuc.hpp"
 #include "hardware/device/imu_sample.hpp"
 #include "hardware/device/lk_motor.hpp"
+#include "hardware/device/serial_stream.hpp"
 #include "hardware/device/vt13_remote.hpp"
+#include "hardware/util/board_transmitter.hpp"
 
 namespace hcs_core::hardware::board {
 
@@ -45,7 +48,11 @@ namespace hcs_core::hardware::board {
 //                               串口：ByteTunnel，字节按序全留
 //                               板载 IMU：EventQueue，样本按序全留
 //   周期域（控制线程）        包装层取出来交给驱动 on_frame() / on_bytes() / on_sample()，
-//                             推进掉线计数，写 <名字>/online 与 <名字>/health
+//                             推进掉线计时，写 <名字>/online 与 <名字>/health；CAN 与板载 IMU
+//                             另写 <名字>/time（SDK 在 IO 线程算好的样本时刻，随数据一起过线程）；
+//                             拍尾再让驱动 append_command()：CAN 帧进这一拍的批次，
+//                             串口字节进包装层的发件箱（SerialOutbox，字节按序全留）
+//   发送域（发送线程）        板组件发这一拍的批次时，把发件箱里的字节一并取走发出去
 //
 //   DmMotor pitch{can2, "/gimbal/pitch", {.control_mode = ..., ...}};
 //
@@ -55,7 +62,7 @@ namespace hcs_core::hardware::board {
 /// CAN 上的一种协议：一帧反馈进，一帧指令出。
 ///
 /// 必须有：
-///   Config                      配置（聚合），含 offline_timeout：连续多少拍没有反馈算掉线
+///   Config                      配置（聚合），含 offline_timeout：连续多久没有反馈算掉线（时长）
 ///   D(status, command, name, config)
 ///                               状态输出注册在 status 上，指令输入注册在 command 上
 ///   kCanBitrate / kCanFd        对总线的要求；与总线声明的不符，登记时拒绝
@@ -86,23 +93,29 @@ concept CanDriver =
         util::CommandFrames::Bus& bus, bool safe) {
            { D::kCanBitrate } -> std::convertible_to<std::uint32_t>;
            { D::kCanFd } -> std::convertible_to<bool>;
-           { config.offline_timeout } -> std::convertible_to<int>;
+           { config.offline_timeout } -> std::convertible_to<hcs_sync::Duration>;
            { const_driver.feedback_id() } -> std::convertible_to<std::uint32_t>;
            { const_driver.command_id() } -> std::convertible_to<std::uint32_t>;
            driver.on_frame(frame);
            driver.append_command(bus, safe);
        };
 
-/// 串口上的一种协议：字节流进。
+/// 串口上的一种协议：字节流进，可以有字节流出。
 ///
 /// 必须有：
 ///   Config                      配置（聚合），含 offline_timeout
 ///   D(status, name, config)     状态输出注册在 status 上
 ///   serial_line() const         设备要求的串口设置（速率、帧格式）
 ///   on_bytes(bytes) -> bool     周期域：按到达顺序喂一段字节，帧边界不保证——半帧要自己留着。
-///                               返回这一段里有没有解出至少一帧有效数据（掉线计数只认它）
+///                               返回这一段里有没有解出至少一帧有效数据（掉线计时只认它）
 ///
-/// 可以有：on_tick(online)、faulted()、describe()、take_problem()，含义同 CanDriver。
+/// 可以有：
+///   append_command(out, safe)   周期域，拍尾：把这一拍要发的字节按序写给这路串口（见
+///                               util::SerialWriter）。有它，这台设备才往线上发东西；只收不发的
+///                               驱动不写它。safe 的含义同 CanDriver：这一拍只许发不让东西动的。
+///                               与 CAN 不同的一点：字节流没有预存的"失能批次"，板组件被隔离后
+///                               这路串口只是不再发——接会动的串口设备之前先想清楚这一条
+///   on_tick(online)、faulted()、describe()、take_problem()，含义同 CanDriver。
 template <class D>
 concept SerialDriver =
     requires { typename D::Config; }
@@ -111,10 +124,17 @@ concept SerialDriver =
     && requires(
         D driver, const D const_driver, const typename D::Config config,
         std::span<const std::byte> bytes) {
-           { config.offline_timeout } -> std::convertible_to<int>;
+           { config.offline_timeout } -> std::convertible_to<hcs_sync::Duration>;
            { const_driver.serial_line() } -> std::same_as<device::SerialLine>;
            { driver.on_bytes(bytes) } -> std::convertible_to<bool>;
        };
+
+/// 往线上发字节的串口驱动：有 append_command(out, safe) 的那些。
+template <class D>
+concept TransmittingSerialDriver =
+    SerialDriver<D> && requires(D driver, util::SerialWriter& out, bool safe) {
+        driver.append_command(out, safe);
+    };
 
 /// 板载 IMU 上的一种解算：加速度计与陀螺仪的原始样本进。
 ///
@@ -122,7 +142,7 @@ concept SerialDriver =
 ///   Config                      配置（聚合），含 offline_timeout
 ///   D(status, name, config)     状态输出注册在 status 上
 ///   on_sample(sample) -> bool   周期域：按到达顺序喂一个样本（加速度计或陀螺仪）。
-///                               返回这个样本算不算一次有效的反馈（掉线计数只认它）
+///                               返回这个样本算不算一次有效的反馈（掉线计时只认它）
 ///
 /// 可以有：on_tick(online)、faulted()、describe()、take_problem()，含义同 CanDriver。
 template <class D>
@@ -131,7 +151,8 @@ concept ImuDriver =
     && std::constructible_from<
         D, hcs_executor::Component&, const std::string&, const typename D::Config&>
     && requires(D driver, const typename D::Config config, device::ImuSample sample) {
-           { config.offline_timeout } -> std::convertible_to<int>;
+           { D::kSetup } -> std::convertible_to<device::ImuSetup>;
+           { config.offline_timeout } -> std::convertible_to<hcs_sync::Duration>;
            { driver.on_sample(sample) } -> std::convertible_to<bool>;
        };
 
@@ -177,8 +198,9 @@ public:
     [[nodiscard]] bool fd() const noexcept override { return Driver::kCanFd; }
 
     /// 事件域：过滤，然后把这一帧放进通道。驱动的状态这里一个字节都不碰。
-    void receive(std::uint32_t, std::span<const std::byte> data) noexcept
-        HCS_NONBLOCKING override {
+    void receive(
+        std::uint32_t, std::span<const std::byte> data,
+        libhcs::time::SampleTime time) noexcept HCS_NONBLOCKING override {
         if (data.size() != sizeof(Frame)) [[unlikely]]
             return;
         Frame frame;
@@ -194,18 +216,21 @@ public:
             }
         }
 
-        // 这条线程上不许读时钟（nonblocking），CAN 帧自己也不带到达时刻：
-        // 读侧只看 Reading::fresh，不看 age。
-        inbox_.publish(frame, hcs_sync::Timestamp{});
+        // 这条线程上不许读时钟（nonblocking）：时刻由 SDK 在解码时算好，原样跟着
+        // 帧放进通道，周期域直接读。
+        inbox_.publish(Received{.frame = frame, .time = time}, hcs_sync::Timestamp{});
     }
 
     /// 周期域：有新帧就交给驱动，然后是所有设备都一样的那几步。
-    void update_status(const hcs_sync::Tick&) HCS_NONBLOCKING override {
+    void update_status(const hcs_sync::Tick& tick) HCS_NONBLOCKING override {
         const auto reading = inbox_.read(hcs_sync::Timestamp{});
-        if (reading.fresh)
-            Driver::on_frame(device::CanPacket8{std::span<const std::byte, 8>{reading.value}});
+        if (reading.fresh) {
+            stamp(reading.value.time);
+            Driver::on_frame(
+                device::CanPacket8{std::span<const std::byte, 8>{reading.value.frame}});
+        }
 
-        [[maybe_unused]] const bool online = watch(reading.fresh);
+        [[maybe_unused]] const bool online = watch(reading.fresh, tick);
         if constexpr (requires(Driver& d) { d.on_tick(online); })
             Driver::on_tick(online);
         publish_health(detail::faulted_of<Driver>(*this));
@@ -239,9 +264,13 @@ public:
 private:
     /// 经典 CAN 的 8 字节。存成字节数组而不是 CanPacket8：通道里的格子要能值初始化。
     using Frame = std::array<std::byte, 8>;
+    struct Received {
+        Frame frame{};
+        libhcs::time::SampleTime time; ///< SDK 算好的样本时刻，原样带过来
+    };
 
-    hcs_sync::Snapshot<Frame> inbox_;                ///< 事件域发布，周期域读：只留最新一帧
-    std::atomic<std::uint32_t> rejected_frames_{0};  ///< 事件域写，尽力域读
+    hcs_sync::Snapshot<Received> inbox_;            ///< 事件域发布，周期域读：只留最新一帧
+    std::atomic<std::uint32_t> rejected_frames_{0}; ///< 事件域写，尽力域读
 };
 
 /// 串口上的一台设备。
@@ -261,14 +290,31 @@ public:
     [[nodiscard]] device::SerialLine serial_line() const noexcept override {
         return Driver::serial_line();
     }
+    [[nodiscard]] bool transmits() const noexcept override { return kTransmits; }
 
     /// 事件域：字节原样搬过去，不解析。放不下的部分丢弃并计数（见 take_problem()）。
     void receive(std::span<const std::byte> data) noexcept HCS_NONBLOCKING override {
         tunnel_.write(data);
     }
 
+    /// 周期域，拍尾：驱动把这一拍要发的字节写进发件箱。驱动看到的只是一个写口。
+    void append_command([[maybe_unused]] bool safe) HCS_NONBLOCKING override {
+        if constexpr (kTransmits) {
+            util::SerialWriter out{outbox_};
+            Driver::append_command(out, safe);
+        }
+    }
+
+    /// 发送域：发件箱里的字节原样取走，不解析。
+    std::size_t take_transmit([[maybe_unused]] std::span<std::byte> out) noexcept override {
+        if constexpr (kTransmits)
+            return outbox_.take(out);
+        else
+            return 0;
+    }
+
     /// 周期域：把攒下的字节按序喂给驱动，然后是所有设备都一样的那几步。
-    void update_status(const hcs_sync::Tick&) HCS_NONBLOCKING override {
+    void update_status(const hcs_sync::Tick& tick) HCS_NONBLOCKING override {
         bool fresh = false;
         std::array<std::byte, kChunkBytes> chunk;
         // 一拍最多搬一整条通道的量：对端写得再快，这一拍的工作量也有上界。
@@ -281,7 +327,7 @@ public:
             budget -= count;
         }
 
-        [[maybe_unused]] const bool online = watch(fresh);
+        [[maybe_unused]] const bool online = watch(fresh, tick);
         if constexpr (requires(Driver& d) { d.on_tick(online); })
             Driver::on_tick(online);
         publish_health(detail::faulted_of<Driver>(*this));
@@ -294,30 +340,47 @@ public:
             return std::format("serial device at {} baud", serial_line().baudrate);
     }
 
-    /// 尽力域：驱动自己的问题优先；其次是通道溢出（事件域只计数，那里不许打日志）。
+    /// 尽力域：驱动自己的问题优先；其次是两个方向上通道放不下的字节（事件域和周期域
+    /// 只计数，那里不许打日志）。一次报一条，剩下的留给下一次。
     std::optional<std::string> take_problem() override {
         if constexpr (requires(Driver& d) { d.take_problem(); })
             if (auto problem = Driver::take_problem())
                 return problem;
 
-        const auto overrun = tunnel_.overrun_bytes();
-        if (overrun == reported_overrun_)
-            return std::nullopt;
-        const auto more = overrun - reported_overrun_;
-        reported_overrun_ = overrun;
-        return std::format(
-            "serial input overran: {} more byte(s) dropped, {} in total; update() is not "
-            "draining the stream fast enough",
-            more, overrun);
+        if (const auto overrun = tunnel_.overrun_bytes(); overrun != reported_overrun_) {
+            const auto more = overrun - reported_overrun_;
+            reported_overrun_ = overrun;
+            return std::format(
+                "serial input overran: {} more byte(s) dropped, {} in total; update() is not "
+                "draining the stream fast enough",
+                more, overrun);
+        }
+
+        if constexpr (kTransmits)
+            if (const auto refused = outbox_.refused_bytes(); refused != reported_refused_) {
+                const auto more = refused - reported_refused_;
+                reported_refused_ = refused;
+                return std::format(
+                    "serial output overran: {} more byte(s) refused, {} in total; the driver "
+                    "writes faster than the transmit thread takes them away",
+                    more, refused);
+            }
+        return std::nullopt;
     }
 
 private:
+    static constexpr bool kTransmits = TransmittingSerialDriver<Driver>;
+    struct NoOutbox {}; ///< 只收不发的设备不带发件箱
+
     /// 921600 波特率满速约 92 字节/毫秒：2048 字节能扛住控制线程 20 ms 不来取。
     static constexpr std::size_t kTunnelBytes = 2048;
     static constexpr std::size_t kChunkBytes = 256;
 
     hcs_sync::ByteTunnel<kTunnelBytes> tunnel_; ///< 事件域写，周期域读：字节按序全留
-    std::uint64_t reported_overrun_ = 0;        ///< 只在尽力域碰
+    /// 周期域写，发送域读：字节按序全留
+    [[no_unique_address]] std::conditional_t<kTransmits, util::SerialOutbox, NoOutbox> outbox_;
+    std::uint64_t reported_overrun_ = 0; ///< 只在尽力域碰
+    std::uint64_t reported_refused_ = 0; ///< 只在尽力域碰
 };
 
 /// 板载 IMU 上的一台设备。
@@ -334,20 +397,27 @@ public:
         port.attach(*this);
     }
 
+    [[nodiscard]] device::ImuSetup imu_setup() const noexcept override { return Driver::kSetup; }
+
     /// 事件域：样本原样放进队列，不解算。放不下的丢弃并计数（见 take_problem()）。
     void receive(const device::ImuSample& sample) noexcept HCS_NONBLOCKING override {
         (void)samples_.try_push(sample);
     }
 
     /// 周期域：把攒下的样本按序喂给驱动，然后是所有设备都一样的那几步。
-    void update_status(const hcs_sync::Tick&) HCS_NONBLOCKING override {
+    void update_status(const hcs_sync::Tick& tick) HCS_NONBLOCKING override {
         bool fresh = false;
+        bool popped = false;
         device::ImuSample sample;
         // 一拍最多取一整条队列的量：对端写得再快，这一拍的工作量也有上界。
-        for (std::size_t budget = kQueueSamples; budget != 0 && samples_.try_pop(sample); --budget)
+        for (std::size_t budget = kQueueSamples; budget != 0 && samples_.try_pop(sample); --budget) {
             fresh |= static_cast<bool>(Driver::on_sample(sample));
+            popped = true;
+        }
+        if (popped)
+            stamp(sample.time); // 这一拍取到的最后一个样本；它的 board 是板上 64 位时刻
 
-        [[maybe_unused]] const bool online = watch(fresh);
+        [[maybe_unused]] const bool online = watch(fresh, tick);
         if constexpr (requires(Driver& d) { d.on_tick(online); })
             Driver::on_tick(online);
         publish_health(detail::faulted_of<Driver>(*this));
@@ -392,6 +462,7 @@ using DjiMotor = Can<device::DjiMotor>;
 using Hipnuc = Serial<device::Hipnuc>;
 using Vt13Remote = Serial<device::Vt13Remote>;
 using Dr16Remote = Serial<device::Dr16Remote>;
+using SerialStream = Serial<device::SerialStream>;
 using Bmi088 = Imu<device::Bmi088>;
 using Bmi088Ekf = Imu<device::Bmi088Ekf>;
 

@@ -12,9 +12,10 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include <libhcs/board/hcs_can_port.hpp>
+#include <libhcs/data/datas.hpp>
 #include <libhcs/data/datas.hpp>
 
+#include <hcs_base/channel/byte_tunnel.hpp>
 #include <hcs_base/channel/snapshot.hpp>
 #include <hcs_base/channel/tick.hpp>
 #include <hcs_base/thread/doorbell.hpp>
@@ -43,11 +44,16 @@ namespace hcs_core::hardware::util {
 // 组件被隔离后门铃照常响，批次却不再更新。发送线程靠 Snapshot 的 age 识别
 // "门铃在响、批次已陈旧"，把预存的全失能批次**发一次**，然后保持静默——
 // 绝不重发最后一帧（最后一帧可能是让车冲出去的指令）。
+//
+// 串口的字节不进批次，另走 SerialOutbox：批次是状态（只留最新一份，丢一份无妨），
+// 字节流是事件（中间少一截对端就失步），两者要的通道不是一种。发送线程发一块板的批次时，
+// 顺手把这块板各串口发件箱里攒下的字节取走，塞进同一个发送缓冲。
 // ============================================================================
 
 /// 一帧：哪路总线、什么 id、什么内容。经典 CAN 2.0，8 字节。批次属于哪块板由批次本身决定。
+/// 端口身份就是 DataId（丝印号），没有任何板内位置编号。
 struct BoardFrame {
-    std::uint8_t port = 0; ///< libhcs::board::hcs::CanPort
+    libhcs::data::DataId port = libhcs::data::DataId::kExtend;
     std::uint32_t can_id = 0;
     std::array<std::byte, 8> data{};
 };
@@ -66,21 +72,21 @@ static_assert(std::is_trivially_copyable_v<TransmitBatch>);
 /// 装一帧。溢出是实现错误——每拍的帧数是构造期就确定的常数，放不下说明
 /// 这块板的设备清单写错了，debug 下断言挡住，release 下丢弃并停在最后一格。
 inline void push_frame(
-    TransmitBatch& batch, libhcs::board::hcs::CanPort port, std::uint32_t can_id,
+    TransmitBatch& batch, libhcs::data::DataId port, std::uint32_t can_id,
     const std::array<std::byte, 8>& data) noexcept {
     if (batch.frame_count >= TransmitBatch::kMaxFrames) [[unlikely]] {
         assert(false && "TransmitBatch overflow: kMaxFrames too small for this board");
         return;
     }
     auto& frame = batch.frames[batch.frame_count++];
-    frame.port   = static_cast<std::uint8_t>(port);
+    frame.port   = port;
     frame.can_id = can_id;
     frame.data   = data;
 }
 
 /// 同上，直接收设备生成的 CanPacket8。
 inline void push_frame(
-    TransmitBatch& batch, libhcs::board::hcs::CanPort port, std::uint32_t can_id,
+    TransmitBatch& batch, libhcs::data::DataId port, std::uint32_t can_id,
     device::CanPacket8 packet) noexcept {
     const auto bytes = packet.as_bytes();
     std::array<std::byte, 8> data{};
@@ -93,9 +99,14 @@ inline void push_frame(
 /// 两种帧：
 ///   push()          独占帧，一台电机一帧（DM、LK），立刻进批次；
 ///   shared_frame()  共享帧，几台电机合一帧（DJI 电调一帧带四台，各写自己的槽位），
-///                   同一路总线、同一 can_id 的合进同一帧，flush() 时按首次出现的
-///                   顺序进批次。
-/// 批次里的帧序因此是：独占帧按电机遍历顺序，共享帧排在最后——与改造前 pack_frames 一致。
+///                   同一路总线、同一 can_id 的合进同一帧，flush() 时进批次。
+///
+/// flush() 把整批按 can_id 从大到小排好：板子的发送是 FIFO（入队顺序即上线顺序），而且
+/// 单发、输了仲裁就丢。先发的帧触发的电机回复（DM 的 master id、LK 的 0x140+id）会和后面
+/// 的帧争总线；后面的帧 id 越小越赢。按原来"共享帧最后"的顺序，DJI 的 0x200 排在两条 DM
+/// 指令之后，DM 回复一就绪 0x200 就输掉——单板回环实测 0x200 送达率最低 0%，按 id 降序后
+/// 任何时刻都是 100%（数据见 libhcs firmware/hpm_board/PITFALLS.md 第 9 节）。不同总线各自
+/// 一个 FIFO，跨总线的先后无所谓。
 /// 周期域使用：不分配、不抛。
 class CommandFrames {
 public:
@@ -118,32 +129,42 @@ public:
 
     private:
         friend class CommandFrames;
-        Bus(CommandFrames& owner, libhcs::board::hcs::CanPort port) noexcept
+        Bus(CommandFrames& owner, libhcs::data::DataId port) noexcept
             : owner_(owner)
             , port_(port) {}
 
         CommandFrames& owner_;
-        libhcs::board::hcs::CanPort port_;
+        libhcs::data::DataId port_;
     };
 
-    Bus on(libhcs::board::hcs::CanPort port) noexcept { return Bus{*this, port}; }
+    Bus on(libhcs::data::DataId port) noexcept { return Bus{*this, port}; }
 
-    /// 共享帧进批次。每拍打包结束时调一次。
+    /// 共享帧进批次，再把整批按 can_id 降序排好（理由见类注释）。每拍打包结束时调一次。
     void flush() noexcept {
         for (const auto& frame : std::span{shared_}.first(shared_count_))
             push_frame(batch_, frame.port, frame.can_id, frame.packet);
         shared_count_ = 0;
+
+        // 插入排序：最多 kMaxFrames 帧；std::stable_sort 可能分配临时缓冲，周期域不许。
+        auto frames = std::span{batch_.frames}.first(batch_.frame_count);
+        for (std::size_t i = 1; i < frames.size(); ++i) {
+            const BoardFrame frame = frames[i];
+            std::size_t j = i;
+            for (; j > 0 && frames[j - 1].can_id < frame.can_id; --j)
+                frames[j] = frames[j - 1];
+            frames[j] = frame;
+        }
     }
 
 private:
     struct Shared {
-        libhcs::board::hcs::CanPort port;
+        libhcs::data::DataId port;
         std::uint32_t can_id;
         device::CanPacket8 packet;
     };
 
     device::CanPacket8& shared_frame(
-        libhcs::board::hcs::CanPort port, std::uint32_t can_id) noexcept {
+        libhcs::data::DataId port, std::uint32_t can_id) noexcept {
         for (auto& frame : std::span{shared_}.first(shared_count_))
             if (frame.port == port && frame.can_id == can_id)
                 return frame.packet;
@@ -163,6 +184,66 @@ private:
     device::CanPacket8 overflow_{std::uint64_t{0}}; ///< 溢出时的丢弃位，不进批次
 };
 
+/// 一路串口的发件箱：周期域写，发送线程取，字节按序、一个不丢地过线程。
+///
+/// 放不下的写入**整段拒收**并计数，而不是写进去半截：半帧发出去对端只能当噪声丢掉，
+/// 还会连累下一帧。拒收不是静默的——尽力域读 refused_bytes() 报出来。
+class SerialOutbox {
+public:
+    /// 发件箱的容量。裁判系统最长的帧约 1 KB，而 115200 波特率的线每毫秒只走得了不到
+    /// 12 字节：两整帧的余量，够发送线程偶尔晚来几拍。
+    static constexpr std::size_t kCapacity = 2048;
+
+    SerialOutbox() noexcept = default;
+    SerialOutbox(const SerialOutbox&) = delete;
+    SerialOutbox& operator=(const SerialOutbox&) = delete;
+
+    /// 周期域：此刻还能整段写进去多少字节（发送线程可能又取走了一些，只会偏小）。
+    [[nodiscard]] std::size_t writable() const noexcept { return tunnel_.writable(); }
+
+    /// 周期域：整段写进去，或者一个字节都不写。@return 写进去了没有
+    bool write(std::span<const std::byte> bytes) noexcept {
+        if (bytes.size() > tunnel_.writable()) [[unlikely]] {
+            refused_bytes_.fetch_add(bytes.size(), std::memory_order_relaxed);
+            return false;
+        }
+        tunnel_.write(bytes);
+        return true;
+    }
+
+    /// 发送线程：取走待发的字节，最多 out.size() 个。@return 取走的字节数
+    std::size_t take(std::span<std::byte> out) noexcept { return tunnel_.read(out); }
+
+    /// 至今拒收的字节数（尽力域读）。
+    [[nodiscard]] std::uint64_t refused_bytes() const noexcept {
+        return refused_bytes_.load(std::memory_order_relaxed);
+    }
+
+private:
+    hcs_sync::ByteTunnel<kCapacity> tunnel_;          ///< 周期域写，发送线程读
+    std::atomic<std::uint64_t> refused_bytes_{0};     ///< 周期域写，尽力域读
+};
+
+/// 一路串口这一拍的出口：串口驱动的 append_command() 经它把要发的字节交给自己所在的那路
+/// 串口，与 CommandFrames::Bus 之于 CAN 驱动是同一个位置。驱动只看得到"写"这一侧。
+/// 周期域使用：不分配、不抛。
+class SerialWriter {
+public:
+    explicit SerialWriter(SerialOutbox& outbox) noexcept
+        : outbox_(outbox) {}
+
+    /// 此刻还能整段写进去多少字节。
+    [[nodiscard]] std::size_t writable() const noexcept { return outbox_.writable(); }
+
+    /// 按序排到这路串口的待发字节后面。整段写进去，或者一个字节都不写（并计入拒收）：
+    /// 一次 write() 交一整帧，帧就不会被截断。
+    /// @return 写进去了没有
+    bool write(std::span<const std::byte> bytes) noexcept { return outbox_.write(bytes); }
+
+private:
+    SerialOutbox& outbox_;
+};
+
 /// 发送线程对一次唤醒该做什么（纯函数，gtest 直接覆盖）。
 enum class SenderAction { kIdle, kSend, kSafeSendOnce };
 
@@ -178,7 +259,7 @@ inline SenderAction plan_send(
     return SenderAction::kIdle;
 }
 
-/// 发送线程眼里的板卡：把一整批帧发出去。
+/// 发送线程眼里的板卡：把一整批帧发出去，连同这块板各串口发件箱里攒下的字节。
 class BatchSink {
 public:
     /// 发送线程调用。抛出的异常由 DoorbellWorker 计数（exceptions()），不终止进程。

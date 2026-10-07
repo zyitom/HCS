@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -59,7 +60,9 @@ public:
         Config& set_encoder_zero_point(int value) { return encoder_zero_point = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
-        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_offline_timeout(std::chrono::milliseconds value) {
+            return offline_timeout = value, *this;
+        }
 
         util::Required<Type> motor_type;
         /// 电机构造时就定死：它决定有哪些输入。
@@ -70,8 +73,8 @@ public:
         int encoder_zero_point = 0;
         bool reversed = false;
         bool multi_turn_angle_enabled = false;
-        /// 连续多少拍没有状态帧算掉线。
-        int offline_timeout = 100;
+        /// 连续多久没有状态帧算掉线。
+        std::chrono::milliseconds offline_timeout{100};
     };
 
     LkMotor(

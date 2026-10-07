@@ -13,9 +13,9 @@
 #include <vector>
 
 #include <libhcs/board/common.hpp>
-#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/hpm5321.hpp>
 #include <libhcs/data/datas.hpp>
+#include <libhcs/spec/hpm5321/ports.hpp>
 
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
@@ -83,10 +83,14 @@ public:
         // 析构逆序：sender_ 先停线程，然后 board_ 停传输，最后数据才消失。
         auto options = libhcs::board::AdvancedOptions{};
         options.dangerously_skip_version_checks = skip_version_checks_;
-        // 波特率走构造期 Configuration：会话前 apply + 读回校验，重连自动重发（EP0）。
-        // 只设 baudrate，其余字段留 0 = "改速率、沿用固件当前的成帧"。
+        // 用到的口走构造期 Configuration：会话前 apply + 读回校验，重连自动重发（EP0）。
+        // 配置即声明：没写在这里的口板子不启动，所以 CAN1（经典 CAN，电机）也要写。
+        // 串口声明要说全：速率加 8N1。
         libhcs::board::hcs::Configuration config;
-        config.uart[0] = libhcs::board::hcs::UartSetting{.baudrate = kImuBaudrate};
+        config.declare_can(libhcs::data::DataId::kCan1, libhcs::board::hcs::kClassic1M);
+        config.declare_uart(
+            libhcs::spec::hpm5321::Spec::Uarts::kUart0.data_id,
+            libhcs::board::hcs::uart_8n1(kImuBaudrate));
         board_ = std::make_unique<libhcs::board::Hpm5321>(*this, serial_filter_, options, config);
 
         report_timer_ = create_wall_timer(std::chrono::seconds{1}, [this] { report(); });
@@ -277,7 +281,7 @@ private:
             std::byte{0},    std::byte{0}, std::byte{0}, std::byte{0}};
 
         board_->start_transmit().can_transmit(
-            libhcs::board::hcs::CanPort::kCan1,
+            libhcs::spec::hpm5321::Spec::Cans::kCan1,
             libhcs::data::CanDataView{.can_id = can_id_, .can_data = kPayload});
         // 记在 transmit() 返回之后，而不是之前——这样它标的是"帧已经交出去"的时刻，
         // 不含 transmit() 自己排队/拿锁的耗时，can_receive 里配对出来的
@@ -286,10 +290,11 @@ private:
     }
 
     // 事件域：libhcs IO 线程回调，电机回帧到手就发布，不做任何等待。
-    // libhcs 的接收回调带端口参数，端口按外壳丝印编号（旧 SDK 的 can0 就是这里的 CAN1）。
-    void can_receive(
-        libhcs::board::hcs::CanPort port, const libhcs::data::CanDataView& data) override {
-        if (port != libhcs::board::hcs::CanPort::kCan1)
+    // 接收回调带端口描述符，身份就是丝印上的 DataId。
+    void can_receive_callback(
+        libhcs::spec::hpm5321::Spec::Can port, const libhcs::data::CanDataView& data,
+        const libhcs::time::SampleTime&) override {
+        if (port != libhcs::spec::hpm5321::Spec::Cans::kCan1)
             return;
         if (data.is_extended_can_id || data.is_remote_transmission)
             return;
@@ -313,7 +318,9 @@ private:
     }
 
     // 事件域：同一条传输线程回调，喂 HI91 定长二进制帧的字节流解析器。
-    void uart0_receive_callback(const libhcs::data::UartDataView& data) override {
+    void uart_receive_callback(
+        libhcs::spec::hpm5321::Spec::Uart, const libhcs::data::UartDataView& data,
+        const libhcs::time::SampleTime&) override {
         uart_rx_buffer_.insert(uart_rx_buffer_.end(), data.uart_data.begin(), data.uart_data.end());
 
         while (try_consume_one_hi91_frame()) {

@@ -13,10 +13,11 @@
 #include <vector>
 
 #include <libhcs/board/common.hpp>
-#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/hpm5321.hpp>
 #include <libhcs/board/mc02.hpp>
 #include <libhcs/data/datas.hpp>
+#include <libhcs/spec/hpm5321/ports.hpp>
+#include <libhcs/spec/mc02/ports.hpp>
 
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
@@ -206,11 +207,21 @@ public:
             options.set_io_thread_affinity(
                 static_cast<int>(io_thread_cpu), static_cast<int>(io_thread_rt_priority));
 
+        // 用到的总线要声明：libhcs 里配置即声明，没声明的口板子不启动。回环是 CAN1 发、CAN2 收。
+        libhcs::board::hcs::Configuration configuration;
+        configuration.declare_can(
+            libhcs::data::DataId::kCan1,
+            fdcan_ ? libhcs::board::hcs::kFd1M5M : libhcs::board::hcs::kClassic1M);
+        configuration.declare_can(
+            libhcs::data::DataId::kCan2,
+            fdcan_ ? libhcs::board::hcs::kFd1M5M : libhcs::board::hcs::kClassic1M);
+
         if (board_type_ == "hpm5321")
             hpm5321_ = std::make_unique<libhcs::board::Hpm5321>(
-                hpm5321_callback_, serial_filter_, options);
+                hpm5321_callback_, serial_filter_, options, configuration);
         else if (is_mc02)
-            mc02_ = std::make_unique<libhcs::board::Mc02>(mc02_callback_, serial_filter_, options);
+            mc02_ = std::make_unique<libhcs::board::Mc02>(
+                mc02_callback_, serial_filter_, options, configuration);
         else
             throw std::invalid_argument{
                 std::format("board must be hpm5321 or mc02, got '{}'", board_type_)};
@@ -219,7 +230,9 @@ public:
         // 总线的属性，由固件在初始化时定、经 EP0 上报。yaml 里的 fdcan 参数退化成
         // 交叉校验：和板子自报的不一致只警告不改行为——发什么帧型由板子说了算。
         const bool board_can1_is_fd =
-            hpm5321_ ? hpm5321_->can1_is_fd() : (mc02_ ? mc02_->can1_is_fd() : fdcan_);
+            hpm5321_
+                ? hpm5321_->handle(libhcs::spec::hpm5321::Spec::Cans::kCan1).is_fd()
+                : (mc02_ ? mc02_->handle(libhcs::spec::mc02::Spec::Cans::kCan1).is_fd() : fdcan_);
         if (board_can1_is_fd != fdcan_)
             logger().warn(
                 "[{}] yaml fdcan={} but the board reports CAN1 {} (EP0); the board wins",
@@ -277,9 +290,10 @@ private:
         explicit Hpm5321Callback(HcsLinkProbe& probe)
             : probe_(probe) {}
 
-        void can_receive(
-            libhcs::board::hcs::CanPort port, const libhcs::data::CanDataView& data) override {
-            if (port == libhcs::board::hcs::CanPort::kCan2)
+        void can_receive_callback(
+            libhcs::spec::hpm5321::Spec::Can port, const libhcs::data::CanDataView& data,
+            const libhcs::time::SampleTime&) override {
+            if (port == libhcs::spec::hpm5321::Spec::Cans::kCan2)
                 probe_.on_echo(data);
         }
 
@@ -292,7 +306,10 @@ private:
         explicit Mc02Callback(HcsLinkProbe& probe)
             : probe_(probe) {}
 
-        void can2_receive_callback(const libhcs::data::CanDataView& data) override {
+        void can_receive_callback(
+            libhcs::spec::mc02::Spec::Can port, const libhcs::data::CanDataView& data,
+            const libhcs::time::SampleTime&) override {
+            if (port == libhcs::spec::mc02::Spec::Cans::kCan2)
             probe_.on_echo(data);
         }
 
@@ -393,12 +410,12 @@ private:
             auto builder = hpm5321_->start_transmit();
             for (std::uint32_t i = 0; i < frames; ++i)
                 builder.can_transmit(
-                    libhcs::board::hcs::CanPort::kCan1, next_frame(payloads[i], start_ns));
+                    libhcs::spec::hpm5321::Spec::Cans::kCan1, next_frame(payloads[i], start_ns));
         } else if (mc02_) {
             auto builder = mc02_->start_transmit();
             for (std::uint32_t i = 0; i < frames; ++i)
                 builder.can_transmit(
-                    libhcs::board::hcs::CanPort::kCan1, next_frame(payloads[i], start_ns));
+                    libhcs::spec::mc02::Spec::Cans::kCan1, next_frame(payloads[i], start_ns));
         }
 
         const auto done_ns = to_ns(hcs_sync::Clock::now());

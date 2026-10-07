@@ -43,7 +43,7 @@ using hcs_executor::Linker;
 using hcs_executor::Wiring;
 
 /// 假硬件（状态侧）：注册整车硬件组件对外提供的全部反馈输出，没有输入
-/// ——与真实的三个板组件（gimbal/chassis/aux_board）合起来的图语义相同。
+/// ——与真实的三个板组件（gimbal/chassis/mc02_board）合起来的图语义相同。
 class FakeBalanceHardware : public Component {
 public:
     FakeBalanceHardware() {

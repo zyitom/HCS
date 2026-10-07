@@ -1,6 +1,7 @@
 # HCS 开机实时调优。安装：
 #   sudo cp hcs_rt_tune.sh /usr/local/sbin/
 #   sudo cp hcs_rt_tune.service /etc/systemd/system/
+#   机器相关设置（可选）：/etc/default/hcs_rt_tune，例如 XHCI_IRQ_CPU=1（见脚本开头）
 #   sudo systemctl daemon-reload && sudo systemctl enable --now hcs_rt_tune.service
 # 查看结果：journalctl -u hcs_rt_tune.service
 

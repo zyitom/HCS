@@ -13,13 +13,13 @@
 #   CPU 7（隔离核，USB 事件侧）
 #     IO-gimbal    FIFO 80   xHCI 中断（CPU 4）给回包后经 IPI 唤醒
 #     IO-chassis   FIFO 79
-#     IO-aux       FIFO 78   遥控接收机这路最不重要，排最后
+#     IO-mc02      FIFO 78   遥控接收机、裁判系统这路最不重要，排最后
 #     keepalive x3          libhcs 会话保活，自动跟各自事件线程同核、低一级
 #
 # 台架形态：三块板全部 enabled:false，设备保持离线（驱动状态机照常跑，
 # 只是板卡不打开、帧不出门）——缺板也能验证整条组件链路。
 #
-# 硬件是几个组件：每块板一个（gimbal_board / chassis_board / aux_board，各自收发），
+# 硬件是几个组件：每块板一个（两块 HPM5321：gimbal_board / chassis_board，一块 mc02：mc02_board，各自收发），
 # 三块板共用的发送线程（tx_balance），跨板的安全锁存（safety_latch）。
 #
 # 接线表（哪块板、哪条总线及其帧型速率、什么型号、CAN id、零点、方向、DM 寄存器镜像、
@@ -37,7 +37,7 @@ hcs_executor:
       - hcs_core::hardware::TransmitThread -> tx_balance
       - hcs_core::hardware::BalanceGimbalBoard -> gimbal_board
       - hcs_core::hardware::BalanceChassisBoard -> chassis_board
-      - hcs_core::hardware::BalanceAuxBoard -> aux_board
+      - hcs_core::hardware::BalanceMc02Board -> mc02_board
       - hcs_core::hardware::SafetyLatch -> safety_latch
       - hcs_core::controller::chassis::balance::BalanceChassisController -> balance_chassis_controller
       - hcs_core::controller::chassis::balance::BalanceStateEstimator -> balance_state_estimator
@@ -77,7 +77,7 @@ chassis_board:
     dangerously_skip_version_checks: true
     exit_on_board_fault: true
 
-aux_board:
+mc02_board:
   ros__parameters:
     enabled: false
     serial_filter: ""

@@ -13,6 +13,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -30,7 +31,7 @@ using namespace hcs_core::hardware::device;
 using hcs_core::hardware::util::CommandFrames;
 using hcs_core::hardware::util::TransmitBatch;
 using hcs_executor::Component;
-using libhcs::board::hcs::CanPort;
+using libhcs::data::DataId;
 using Bytes = std::array<std::uint8_t, 8>;
 
 constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
@@ -73,7 +74,7 @@ template <class Motor>
 Bytes single_frame(Motor& motor, bool safe) {
     TransmitBatch batch;
     CommandFrames frames{batch};
-    auto bus = frames.on(CanPort::kCan1);
+    auto bus = frames.on(DataId::kCan1);
     motor.append_command(bus, safe);
     frames.flush();
     EXPECT_EQ(batch.frame_count, 1U);
@@ -239,7 +240,7 @@ TEST(DjiCommand, SharedFrameMatchesPreRefactorFrames) {
     const auto pack = [](bool safe, auto&... motors) {
         TransmitBatch batch;
         CommandFrames frames{batch};
-        auto bus = frames.on(CanPort::kCan1);
+        auto bus = frames.on(DataId::kCan1);
         (motors.append_command(bus, safe), ...);
         frames.flush();
         EXPECT_EQ(batch.frame_count, 1U) << "same bus, same send id: one frame";
@@ -256,7 +257,7 @@ TEST(DjiCommand, SharedFrameMatchesPreRefactorFrames) {
     EXPECT_EQ(pack(false, friction_left, friction_right), (Bytes{}));
 }
 
-TEST(CommandFrames, ExclusiveFramesFirstThenSharedPerBus) {
+TEST(CommandFrames, EachBusSendsHighestIdFirst) {
     auto host = std::make_shared<Host>("host");
     auto producer = std::make_shared<Producer>();
     producer->add("/leg/control_torque");
@@ -270,8 +271,8 @@ TEST(CommandFrames, ExclusiveFramesFirstThenSharedPerBus) {
 
     TransmitBatch batch;
     CommandFrames frames{batch};
-    auto can1 = frames.on(CanPort::kCan1);
-    auto can2 = frames.on(CanPort::kCan2);
+    auto can1 = frames.on(DataId::kCan1);
+    auto can2 = frames.on(DataId::kCan2);
     a.append_command(can1, false);
     leg.append_command(can1, false);
     b.append_command(can1, false);
@@ -279,11 +280,13 @@ TEST(CommandFrames, ExclusiveFramesFirstThenSharedPerBus) {
     c.append_command(can2, false); // 同 command_id，不同总线：另起一帧
     frames.flush();
 
+    // 每路总线按 id 降序出帧（板子单发、FIFO：排在后面的帧要比前面帧触发的电机回复 id 小，
+    // 否则输掉仲裁被丢；见 board_transmitter.hpp 的 CommandFrames）。
     ASSERT_EQ(batch.frame_count, 4U);
-    EXPECT_EQ(batch.frames[0].can_id, leg.command_id());
-    EXPECT_EQ(batch.frames[1].can_id, yaw.command_id());
-    EXPECT_EQ(batch.frames[2].can_id, 0x200U);
-    EXPECT_EQ(batch.frames[2].port, static_cast<std::uint8_t>(CanPort::kCan1));
-    EXPECT_EQ(batch.frames[3].can_id, 0x200U);
-    EXPECT_EQ(batch.frames[3].port, static_cast<std::uint8_t>(CanPort::kCan2));
+    std::vector<std::uint32_t> on_can1, on_can2;
+    for (const auto& frame : std::span{batch.frames}.first(batch.frame_count))
+        (frame.port == DataId::kCan1 ? on_can1 : on_can2)
+            .push_back(frame.can_id);
+    EXPECT_EQ(on_can1, (std::vector<std::uint32_t>{0x200U, leg.command_id()}));
+    EXPECT_EQ(on_can2, (std::vector<std::uint32_t>{0x200U, yaw.command_id()}));
 }

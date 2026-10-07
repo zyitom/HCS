@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -81,7 +82,9 @@ public:
         Config& set_reduction_ratio(double value) { return reduction_ratio = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
-        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_offline_timeout(std::chrono::milliseconds value) {
+            return offline_timeout = value, *this;
+        }
         Config& set_error_retry_interval(int value) { return error_retry_interval = value, *this; }
 
         /// 电机构造时就定死：它决定有哪些输入。
@@ -121,8 +124,8 @@ public:
         /// 开：在 ±position_max 处的回绕被累加起来，角度无界增长。
         bool multi_turn_angle_enabled = false;
 
-        /// 连续多少拍没有新反馈算掉线。
-        int offline_timeout = 100;
+        /// 连续多久没有新反馈算掉线。
+        std::chrono::milliseconds offline_timeout{100};
         /// 两次"清错"帧之间隔多少拍。各种保护（过温、过压、过流）都需要时间恢复，
         /// 按控制频率去重试只是在和保护逻辑对着干。
         int error_retry_interval = 500;

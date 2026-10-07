@@ -13,23 +13,8 @@ namespace hcs_core::hardware::board {
 
 namespace {
 
-/// 串口按丝印叫：uart0、uart7、dbus。
-std::string uart_name(libhcs::data::DataId data_id) {
-    using libhcs::data::DataId;
-    switch (data_id) {
-    case DataId::kUartDbus: return "dbus";
-    case DataId::kUart0: return "uart0";
-    case DataId::kUart1: return "uart1";
-    case DataId::kUart2: return "uart2";
-    case DataId::kUart3: return "uart3";
-    case DataId::kUart7: return "uart7";
-    case DataId::kUart10: return "uart10";
-    default: return std::format("uart#{}", std::to_underlying(data_id));
-    }
-}
-
-/// 设备的串口要求 → EP0 下发的设置。帧格式每一项都写明：留 0 就是"沿用固件当前"，
-/// 而固件当前可能已被 CDC 改掉。
+/// 设备的串口要求 → EP0 下发的设置。声明必须说全（libhcs 拒绝缺项的声明）：速率、帧格式、
+/// 接收极性一项不落。
 libhcs::board::hcs::UartSetting to_uart_setting(const device::SerialLine& line) {
     namespace vc = libhcs::board::hcs::vc;
     using Parity = device::SerialLine::Parity;
@@ -40,10 +25,9 @@ libhcs::board::hcs::UartSetting to_uart_setting(const device::SerialLine& line) 
                 : line.parity == Parity::kOdd   ? vc::kUartParityOdd
                                                 : vc::kUartParityNone,
         .stop_bits = line.stop_bits == 2 ? vc::kUartStopBits2 : vc::kUartStopBits1,
+        .rx_polarity = line.rx_inverted.value_or(false) ? vc::kUartRxPolarityInverted
+                                                       : vc::kUartRxPolarityNormal,
     };
-    if (line.rx_inverted)
-        setting.rx_polarity =
-            *line.rx_inverted ? vc::kUartRxPolarityInverted : vc::kUartRxPolarityNormal;
     return setting;
 }
 
@@ -52,17 +36,18 @@ libhcs::board::hcs::UartSetting to_uart_setting(const device::SerialLine& line) 
 // ── CanBus ───────────────────────────────────────────────────────────────
 
 CanBus::CanBus(
-    BoardCore& board, std::size_t index, libhcs::board::hcs::CanPort port,
+    BoardCore& board, libhcs::data::DataId data_id,
     const libhcs::board::hcs::CanSetting& setting)
     : board_(board)
-    , index_(index)
-    , port_(port)
+    , data_id_(data_id)
     , setting_(setting) {
     board.add(*this);
 }
 
 std::string CanBus::label() const {
-    return std::format("{}/can{}", board_.get_component_name(), std::to_underlying(port_));
+    return std::format(
+        "{}/{}", board_.get_component_name(),
+        libhcs::spec::channel_name(data_id_));
 }
 
 void CanBus::attach(CanDevice& device) {
@@ -113,15 +98,14 @@ void CanBus::attach(CanDevice& device) {
 
 // ── SerialPort ───────────────────────────────────────────────────────────
 
-SerialPort::SerialPort(BoardCore& board, std::size_t index, libhcs::data::DataId data_id)
+SerialPort::SerialPort(BoardCore& board, libhcs::data::DataId data_id)
     : board_(board)
-    , index_(index)
     , data_id_(data_id) {
     board.add(*this);
 }
 
 std::string SerialPort::label() const {
-    return std::format("{}/{}", board_.get_component_name(), uart_name(data_id_));
+    return std::format("{}/{}", board_.get_component_name(), libhcs::spec::channel_name(data_id_));
 }
 
 std::optional<libhcs::board::hcs::UartSetting> SerialPort::setting() const {
@@ -136,6 +120,7 @@ void SerialPort::attach(SerialDevice& device) {
             "{}: {} and {} on one serial port; a byte stream has no id to tell them apart",
             label(), device_->name(), device.name()));
     device_ = &device;
+    transmits_ = device.transmits();
 }
 
 // ── ImuPort ──────────────────────────────────────────────────────────────
@@ -146,6 +131,19 @@ ImuPort::ImuPort(BoardCore& board)
 }
 
 std::string ImuPort::label() const { return std::format("{}/imu", board_.get_component_name()); }
+
+std::optional<libhcs::board::hcs::ImuSetting> ImuPort::setting() const {
+    if (!device_)
+        return std::nullopt;
+    const device::ImuSetup setup = device_->imu_setup();
+    return libhcs::board::hcs::ImuSetting{
+        .accelerometer_range_g = setup.accelerometer_range_g,
+        .accelerometer_rate_hz = setup.accelerometer_rate_hz,
+        .gyroscope_range_dps = setup.gyroscope_range_dps,
+        .gyroscope_rate_hz = setup.gyroscope_rate_hz,
+        .gyroscope_bandwidth_hz = setup.gyroscope_bandwidth_hz,
+    };
+}
 
 void ImuPort::attach(ImuDevice& device) {
     if (device_)
@@ -184,7 +182,8 @@ BoardCore::BoardCore()
         command_->register_input(safety, command_->safe);
 }
 
-// 这里不能调 close_sdk()（纯虚，派生部分已析构）：板卡由 BoardComponent<> 先关。
+// 到这里板卡早已由 BoardComponent<> 经 shutdown() 关掉；构造中途抛出时则根本没打开过。
+// 留着这一句只为了那条路径上定时器和 Lane 也确实是空的。
 BoardCore::~BoardCore() { leave_transmitter(); }
 
 hcs_executor::Component& BoardCore::command() noexcept { return *command_; }
@@ -203,7 +202,7 @@ std::vector<Device*> BoardCore::devices() const {
 
 // 端口是否属于这个板型由描述符的类型在编译期保证，这里只防同一个口声明两次。
 void BoardCore::add(CanBus& bus) {
-    auto& slot = can_by_index_.at(bus.index());
+    auto& slot = can_by_id_.at(std::to_underlying(bus.data_id()));
     if (slot)
         throw std::invalid_argument(std::format("{} declared twice", bus.label()));
     slot = &bus;
@@ -211,7 +210,7 @@ void BoardCore::add(CanBus& bus) {
 }
 
 void BoardCore::add(SerialPort& serial) {
-    auto& slot = serial_by_index_.at(serial.index());
+    auto& slot = serial_by_id_.at(std::to_underlying(serial.data_id()));
     if (slot)
         throw std::invalid_argument(std::format("{} declared twice", serial.label()));
     slot = &serial;
@@ -227,12 +226,16 @@ void BoardCore::add(ImuPort& imu) {
 libhcs::board::hcs::Configuration BoardCore::configuration() const {
     // 声明了的 CAN 口按声明的帧型与速率下发：板端重初始化控制器（经典即关掉 FD，2.0 总线上
     // 任何 FD 位都会让总线崩溃）并自己回读确认，不符即构造失败；重连自动重放。
-    // 挂了设备的串口按设备的要求下发。
+    // 挂了设备的串口、板载 IMU 按设备的要求下发。键是口的身份（DataId = 丝印号）。
     libhcs::board::hcs::Configuration config;
     for (const auto* bus : can_buses_)
-        config.can[bus->index()] = bus->setting();
+        config.declare_can(bus->data_id(), bus->setting());
     for (const auto* serial : serial_ports_)
-        config.uart[serial->index()] = serial->setting();
+        if (const auto setting = serial->setting())
+            config.declare_uart(serial->data_id(), *setting);
+    if (imu_port_)
+        if (const auto setting = imu_port_->setting())
+            config.declare_imu(*setting);
     return config;
 }
 
@@ -264,6 +267,10 @@ void BoardCore::open() {
 
     auto options = libhcs::board::AdvancedOptions{};
     options.dangerously_skip_version_checks = param<bool>("dangerously_skip_version_checks", false);
+    // 共享时间基准：写进声明（清单头的一位），板子接受了才开。开了之后 libhcs 每个保活周期带
+    // 一次对时，并去读这块板所在 USB 主机控制器的微帧计数器（读不了就退回按 USB 往返估计，
+    // 日志里有一行）。板子报告没有时间基准时构造即抛。
+    const bool time_sync = param<bool>("time_sync", false);
     const auto io_cpu = param<std::int64_t>("io_thread_cpu", -1);
     const auto io_priority = param<std::int64_t>("io_thread_rt_priority", 0);
     if (io_cpu >= 0)
@@ -272,20 +279,13 @@ void BoardCore::open() {
     // 构造期 Configuration：before-session 同步 apply 并由板端回读，被拒即在构造里抛；
     // 重连自动重放。板卡构造期就可能回调：所有设备此时都已登记。
     const auto serial_filter = param<std::string>("serial_filter", "");
-    open_sdk(serial_filter, options, configuration());
+    auto declaration = configuration();
+    declaration.enable_time_sync(time_sync);
+    open_sdk(serial_filter, options, declaration);
 
     if (link_faulted())
         throw std::runtime_error(
             std::format("{}: board faulted at construction", get_component_name()));
-
-    // 声明的 CAN 路数板上真有（单 CAN 与双 CAN 的 5321 是同一个固件）。
-    std::size_t need = 0;
-    for (const auto* bus : can_buses_)
-        need = std::max(need, bus->index() + 1);
-    if (const auto have = can_count(); have < need)
-        throw std::runtime_error(std::format(
-            "{}: the board carries {} CAN buses but the wiring declares {}", get_component_name(),
-            have, need));
 
     logger().info(
         "[{}] opened: serial_filter='{}' io_cpu={} io_prio={}", get_component_name(),
@@ -319,7 +319,7 @@ void BoardCore::leave_transmitter() noexcept {
 // ── 周期域 ───────────────────────────────────────────────────────────────
 
 void BoardCore::update(const hcs_sync::Tick& tick) HCS_NONBLOCKING {
-    // 回调线程只存原始帧，这里解成物理量写进输出
+    // 回调线程只存原始帧和 SDK 算好的样本时刻，这里解成物理量写进输出
     for (auto* device : devices_)
         device->update_status(tick);
 }
@@ -334,15 +334,20 @@ void BoardCore::command_update(const hcs_sync::Tick& tick) HCS_NONBLOCKING {
     util::TransmitBatch batch;
     batch.sequence = ++batch_sequence_;
     pack_frames(batch, safe);
+    // 串口的字节不进批次：各设备写进自己的发件箱，发送线程发这一拍的批次时一并取走。
+    for (const auto* serial : serial_ports_)
+        if (auto* device = serial->device())
+            device->append_command(safe);
     lane_->publish(batch, tick.scheduled);
 }
 
 // 怎么编码、失能帧长什么样、要不要几台合一帧，都是各驱动 append_command() 自己的事；
-// 这里只负责"哪台设备在哪路总线上"。
+// 这里只负责"哪台设备在哪路总线上"。只装 CAN 帧：它也用来拼预存的失能批次、估总线负载，
+// 那两处不许真的往串口发件箱里写东西。
 void BoardCore::pack_frames(util::TransmitBatch& batch, bool safe) HCS_NONBLOCKING {
     util::CommandFrames frames{batch};
     for (const auto* bus : can_buses_) {
-        auto frames_on_bus = frames.on(bus->port());
+        auto frames_on_bus = frames.on(bus->data_id());
         for (auto* device : bus->devices())
             device->append_command(frames_on_bus, safe);
     }
@@ -356,17 +361,107 @@ void BoardCore::report_bus_load() {
     util::TransmitBatch batch;
     pack_frames(batch, true);
     const double update_rate = param<double>("expected_update_rate", 1000.0);
-    std::string summary;
     for (const auto* bus : can_buses_) {
         unsigned frames = 0;
         for (const auto& frame : std::span{batch.frames}.first(batch.frame_count))
-            frames += frame.port == std::to_underlying(bus->port());
+            frames += frame.port == bus->data_id();
         const double load = frames * update_rate * 130e-6 * 100.0;
-        summary += std::format(" {}={:.0f}%", bus->label(), load);
+        logger().info(
+            "bus {} estimated load at {:.0f} Hz: {:.0f}%", bus->label(), update_rate, load);
         if (load > 70.0)
             logger().warn("bus {} at {:.0f}% estimated load (>70%)", bus->label(), load);
     }
-    logger().info("bus load estimate at {:.0f} Hz:{}", update_rate, summary);
+}
+
+namespace {
+
+// 板子的计数从上电起自由累加、线上按 2^16 回绕：相邻两次之差取模 2^16。板子每轮计数一动
+// 就报，一轮 250 ms 里动不了 65536 次，差不会有歧义；板子重启必然换 SDK 对象（链路先报
+// kFaulted），同一个基准不会跨过重启。
+std::uint32_t since(std::uint16_t now, std::uint16_t before) noexcept {
+    return static_cast<std::uint16_t>(now - before);
+}
+
+} // namespace
+
+// 端口健康检查（1 Hz）：只看接线表声明过的口——没声明的口板子不报，这层也不碰。读的是
+// 板子随 keepalive 推送的快照（不发 USB 请求，不会失败）；与上一秒比，有变化才打一行。
+// 总线状态的跳变（error-passive / bus-off）libhcs 收到时已经打过，这里报这一秒的增量。
+void BoardCore::report_port_health() {
+    if (!opened())
+        return;
+    // 链路本身：板子没能交付的下行记录（主机或固件的帧定界 bug，或往没有的口发了数据）。
+    // 逐条的 error 日志 libhcs 已经打过，这里报这一秒的增量。
+    {
+        const auto now = status<libhcs::data::LinkStatusView>(libhcs::data::DataId::kSession);
+        const auto before = std::exchange(link_status_seen_, now);
+        if (const auto errors = before ? since(now.downlink_errors, before->downlink_errors) : 0U)
+            logger().warn(
+                "{}: board failed to deliver {} downlink record(s) in the last second; last: {} "
+                "({})",
+                get_component_name(), errors, libhcs::spec::channel_name(now.last_field),
+                libhcs::data::downlink_error_name(now.last_reason));
+    }
+    for (auto* bus : can_buses_) {
+        const auto now = status<libhcs::data::CanStatusView>(bus->data_id());
+        const auto before = bus->exchange_status(now);
+        if (!before || now == *before)
+            continue;
+
+        // 单发：输了仲裁或出错的帧就此放弃，这种丢失不动 TEC/REC（三块板都计）。
+        if (const auto abandoned = since(now.tx_cancelled, before->tx_cancelled))
+            logger().warn(
+                "{}: {} frame(s) abandoned in the last second (single-shot: lost arbitration "
+                "or bus error)",
+                bus->label(), abandoned);
+        // 板子自己丢的：下行撞上发送队列满，上行撞上上行缓冲满。
+        const auto tx_dropped = since(now.tx_dropped, before->tx_dropped);
+        const auto rx_dropped = since(now.rx_dropped, before->rx_dropped);
+        if (tx_dropped != 0 || rx_dropped != 0)
+            logger().warn(
+                "{}: board dropped {} downlink / {} uplink frame(s) in the last second (buffer "
+                "full)",
+                bus->label(), tx_dropped, rx_dropped);
+        // 控制器的接收 FIFO 溢出：帧在控制器里就丢了，一次至少一帧。
+        if (const auto lost = since(now.rx_lost, before->rx_lost))
+            logger().warn(
+                "{}: receive FIFO overflowed {} time(s) in the last second (frames lost in the "
+                "controller)",
+                bus->label(), lost);
+        if (now.tec != before->tec || now.rec != before->rec || now.flags != before->flags
+            || now.last_error != before->last_error
+            || now.data_last_error != before->data_last_error)
+            logger().warn(
+                "{}: tec={} rec={} last={} data_last={} flags=0x{:02x}", bus->label(),
+                static_cast<unsigned>(now.tec), static_cast<unsigned>(now.rec),
+                libhcs::data::last_error_name(now.last_error),
+                libhcs::data::last_error_name(now.data_last_error),
+                static_cast<unsigned>(now.flags));
+    }
+    for (auto* port : serial_ports_) {
+        const auto now = status<libhcs::data::UartStatusView>(port->data_id());
+        const auto before = port->exchange_status(now);
+        if (!before || now == *before)
+            continue;
+
+        const auto overrun = since(now.overrun, before->overrun);
+        const auto parity = since(now.parity, before->parity);
+        const auto framing = since(now.framing, before->framing);
+        const auto noise = since(now.noise, before->noise);
+        const auto unattributed = since(now.unattributed, before->unattributed);
+        if (overrun != 0 || parity != 0 || framing != 0 || noise != 0 || unattributed != 0)
+            logger().warn(
+                "{}: receive errors in the last second: {} overrun, {} parity, {} framing, {} "
+                "noise, {} of unknown kind",
+                port->label(), overrun, parity, framing, noise, unattributed);
+        const auto tx_dropped = since(now.tx_dropped, before->tx_dropped);
+        const auto rx_dropped = since(now.rx_dropped, before->rx_dropped);
+        if (tx_dropped != 0 || rx_dropped != 0)
+            logger().warn(
+                "{}: board dropped {} downlink / {} uplink chunk(s) in the last second (buffer "
+                "full)",
+                port->label(), tx_dropped, rx_dropped);
+    }
 }
 
 void BoardCore::report() {
@@ -385,26 +480,7 @@ void BoardCore::report() {
                 "[{}] board faulted (link lost); its devices are offline", get_component_name());
         return;
     }
-    report_can_health();
-}
-
-void BoardCore::log_can_status(
-    libhcs::board::hcs::CanPort port, const libhcs::board::hcs::vc::CanStatusPayload& status) {
-    namespace vc = libhcs::board::hcs::vc;
-    const unsigned flags = status.flags;
-    const bool flagged = (flags & (vc::kCanErrorPassive | vc::kCanWarning | vc::kCanBusOff)) != 0;
-    if (!flagged && status.tec == 0 && status.rec == 0 && status.rx_fifo_level == 0)
-        return;
-    logger().warn(
-        "can{}: tec={} rec={} last={} flags=0x{:02x} rx_backlog={}", static_cast<unsigned>(port),
-        static_cast<unsigned>(status.tec), static_cast<unsigned>(status.rec),
-        libhcs::board::hcs::last_error_name(status.last_error), static_cast<unsigned>(flags),
-        static_cast<unsigned>(status.rx_fifo_level));
-}
-
-void BoardCore::log_can_status_failure(
-    libhcs::board::hcs::CanPort port, const std::exception& error) {
-    logger().warn("can{} status read failed: {}", static_cast<unsigned>(port), error.what());
+    report_port_health();
 }
 
 } // namespace hcs_core::hardware::board

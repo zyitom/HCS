@@ -42,11 +42,34 @@ class MyLaunchDescriptionEntity(LaunchDescriptionEntity):
             entities.append(LogInfo(msg=f"Machine config: machine/{machine_name}.yaml"))
         parameter_files.append(os.path.join(config_dir, robot_name + ".yaml"))
 
+        # 中间件：默认沿用环境（不设 = Jazzy 默认的 Fast DDS）。rmw:=zenoh 时本机起一个 zenoh 路由
+        # （监听 tcp/[::]:7447，笔记本的路由连它），executor 改用 rmw_zenoh_cpp。只影响话题、参数这些
+        # 非实时线程上的东西：控制线程不碰中间件，选哪个都一样。
+        rmw = LaunchConfiguration("rmw").perform(context)
+        executor_env = {}
+        if rmw == "zenoh":
+            executor_env["RMW_IMPLEMENTATION"] = "rmw_zenoh_cpp"
+            entities.append(LogInfo(msg="Middleware: rmw_zenoh_cpp, router on tcp/[::]:7447"))
+            entities.append(
+                Node(
+                    package="rmw_zenoh_cpp",
+                    executable="rmw_zenohd",
+                    name="zenoh_router",
+                    additional_env=executor_env,
+                    respawn=True,
+                    respawn_delay=1.0,
+                    output="log",
+                )
+            )
+        elif rmw != "default":
+            raise ValueError(f"rmw:={rmw} is not one of: default, zenoh")
+
         entities.append(
             Node(
                 package="hcs_executor",
                 executable="hcs_executor",
                 parameters=parameter_files,
+                additional_env=executor_env,
                 respawn=True,
                 respawn_delay=1.0,
                 output="log",  # stdout and stderr are logged to launch log file and stderr to the screen.
@@ -67,6 +90,12 @@ def generate_launch_description():
                 default_value="tl101",
                 description="config/machine/<machine>.yaml, loaded before the robot yaml; "
                 "'none' skips it",
+            ),
+            DeclareLaunchArgument(
+                "rmw",
+                default_value="default",
+                description="'default' keeps the environment's middleware; 'zenoh' starts a "
+                "zenoh router and runs the executor on rmw_zenoh_cpp (telemetry over Wi-Fi)",
             ),
             MyLaunchDescriptionEntity(),
         ]

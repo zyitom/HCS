@@ -33,26 +33,21 @@ message(STATUS "hcs_core: libhcs from ${_libhcs_source_dir}")
 # libhcs 的版本号取自 git tag；工作区里没有 tag 时它自己的 CMake 会直接 FATAL。
 # 这里先替它跑一次版本脚本，拿不到就退回 0.0.0（和本机固件构建用的覆盖值一致，
 # 这样主机与固件的版本门禁比的是同一个号）。显式传 -Dlibhcs_PROJECT_VERSION 时不动。
-foreach(_kind PROJECT DEBIAN)
-  if(NOT DEFINED libhcs_${_kind}_VERSION OR "${libhcs_${_kind}_VERSION}" STREQUAL "")
-    set(_format_args "")
-    if(_kind STREQUAL "DEBIAN")
-      set(_format_args --format debian)
-    endif()
-    execute_process(
-      COMMAND ".scripts/generate_version" ${_format_args}
-      WORKING_DIRECTORY "${_libhcs_source_dir}"
-      OUTPUT_VARIABLE _version
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      RESULT_VARIABLE _result
-      ERROR_QUIET)
-    if(NOT _result EQUAL 0 OR _version STREQUAL "")
-      set(_version "0.0.0")
-    endif()
-    set(libhcs_${_kind}_VERSION "${_version}")
+if(NOT DEFINED libhcs_PROJECT_VERSION OR "${libhcs_PROJECT_VERSION}" STREQUAL "")
+  execute_process(
+    COMMAND ".scripts/generate_version"
+    WORKING_DIRECTORY "${_libhcs_source_dir}"
+    OUTPUT_VARIABLE libhcs_PROJECT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _result
+    ERROR_QUIET)
+  if(NOT _result EQUAL 0 OR libhcs_PROJECT_VERSION STREQUAL "")
+    set(libhcs_PROJECT_VERSION "0.0.0")
   endif()
-endforeach()
+endif()
 
+# HCS 的组件与测试都按 LTO 链接（clang 下见下方各处补的 -flto），SDK 也编成 LTO。
+set(LIBHCS_LTO ON)
 add_subdirectory("${_libhcs_source_dir}/host" libhcs-sdk-build EXCLUDE_FROM_ALL)
 
 include(CheckCXXCompilerFlag)
@@ -200,11 +195,13 @@ if(BUILD_TESTING)
     ${PROJECT_SOURCE_DIR}/src)
   ament_target_dependencies(test_vt13 hcs_executor hcs_base hcs_msgs)
 
-  # 板载 BMI088 的两种解算（Mahony / 按时间戳的 EKF）与板上时钟展开：量程、收敛、积分、
-  # 时间戳跳变与回绕。
+  # 板载 BMI088 的两种解算（Mahony / 按板上时刻的 EKF）：量程、收敛、积分、
+  # 时刻跳变与跨过板上 32 位读数的回绕点。样本自带的 SampleTime 是 SDK 头里的
+  # 纯值类型，测试只链 SDK 拿头文件路径。
   ament_add_gtest(test_bmi088 test/test_bmi088.cpp)
   target_include_directories(test_bmi088 PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(test_bmi088 libhcs-sdk)
   ament_target_dependencies(test_bmi088 hcs_executor hcs_base hcs_msgs)
 
   # DR16 遥控（DBUS）：帧解码的方向与量程、靠空闲与合理性对齐、缓存不越界、拨轮回差、失联归零。
@@ -233,7 +230,8 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_safety_latch hcs_msgs)
 
   # 板组件：设备登记与分发、撞号与总线速率检查、共用发送线程、安全锁存组件（假 SDK）；
-  # 端口包装层 Can<> / Serial<>：跨线程交接、掉线计数、被拒帧计数、串口溢出上报；
+  # 端口包装层 Can<> / Serial<>：跨线程交接、按时间的掉线判定、被拒帧计数、串口溢出上报；
+  # 串口的发送方向与透传串口（SerialStream）：按序不丢、整段拒收并上报、与发送线程并发；
   # 真实平衡步兵三块板全禁用接进组件图空跑。
   ament_add_gtest(test_board test/test_board.cpp src/hardware/board/board.cpp)
   target_include_directories(test_board PRIVATE
@@ -258,6 +256,35 @@ if(BUILD_TESTING)
     target_link_options(test_libhcs_log_bridge PRIVATE -flto)
   endif()
   ament_target_dependencies(test_libhcs_log_bridge hcs_executor hcs_base)
+
+  # libhcs 自己的主机侧测试（不需要板子），编进 HCS 的测试里一起跑：libhcs 被当子目录引入时
+  # 它自己的测试目标不构建（见 libhcs host/CMakeLists.txt 的 LIBHCS_BUILD_TESTS），而 HCS 才是
+  # 每天都在构建的那个工程——接口一变，这里立刻编不过。
+  #   wire_protocol    数据流线格式：序列化什么，反序列化还原什么（主机与固件共用的那份代码）
+  #   ep0_declaration  EP0 握手：对着模拟板检查"配置即声明"的主机一侧
+  #   sof_stamp        帧上的时间戳：24 位格式与还原，板端把硬件锁存值换到微帧轴上的那段运算
+  #   time_axis        主机一侧：微帧轴 → CLOCK_MONOTONIC 的拟合、整数偏移的判定、无锁发布
+  #   board_ownership  板端：板子归 libhcs 还是归附加功能（DMTool、CDC 串口桥），交接顺序与握手时限
+  foreach(_libhcs_test wire_protocol ep0_declaration sof_stamp sof_timebase time_affine sample_time time_axis board_ownership session)
+    ament_add_gtest(test_libhcs_${_libhcs_test}
+      ${_libhcs_source_dir}/host/tests/${_libhcs_test}_test.cpp)
+    target_include_directories(test_libhcs_${_libhcs_test} PRIVATE ${_libhcs_source_dir})
+    target_link_libraries(test_libhcs_${_libhcs_test} libhcs-sdk)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang") # 真用到 SDK 符号：同主库，消费侧补 -flto
+      target_compile_options(test_libhcs_${_libhcs_test} PRIVATE -flto)
+      target_link_options(test_libhcs_${_libhcs_test} PRIVATE -flto)
+    endif()
+  endforeach()
+
+  # 上板测试：两块 HPM5321 对接，或一块 HPM5321 对一块 mc02（CAN1-CAN1、CAN2-CAN2、串口交叉），
+  # 真 USB、真总线。声明了的口通、没声明的口不上总线也不转发、换一次握手就换一组声明。
+  # 板子凑不成台架形态时全部 SKIPPED，不影响平时的 colcon test；说明见文件头。
+  ament_add_gtest(test_bench_boards test/test_bench_boards.cpp TIMEOUT 120)
+  target_link_libraries(test_bench_boards libhcs-sdk)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_bench_boards PRIVATE -flto)
+    target_link_options(test_bench_boards PRIVATE -flto)
+  endif()
 
   # 射击控制器：热量、摩擦轮（缓启停 / 出弹 / 卡住）、17 mm 与 42 mm 拨弹（卡弹退弹）、
   # 推杆（复位 / 上膛 / 发射）、弹速统计与记录。组件接进小图逐拍跑，参数走参数文件。

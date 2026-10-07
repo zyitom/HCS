@@ -1,13 +1,14 @@
-// 板载 BMI088 的两种解算，以及它们用到的板上时钟展开：
+// 板载 BMI088 的两种解算：
 //
-//   Bmi088（Mahony）   量程换算；有了重力参考才出姿态；静止不漂；倾斜能收敛；按样本的时间戳积分；
-//                      安装方向的换算；间隔过长的样本不用；32 位时间戳回绕不影响
-//   Bmi088Ekf          第一个加速度计样本定初始姿态；按样本自己的时间戳积分（与一拍里攒了几个无关）；
-//                      时间戳跳变、倒退的样本不用；32 位时间戳回绕不影响
-//   BoardClockLifter   回绕、早于 / 晚于时基的时间戳
+//   Bmi088（Mahony）   量程换算；有了重力参考才出姿态；静止不漂；倾斜能收敛；按样本的板上时刻积分；
+//                      安装方向的换算；间隔过长的样本不用；跨过板上 32 位读数的回绕点不影响
+//   Bmi088Ekf          第一个加速度计样本定初始姿态；按样本自己的板上时刻积分（与一拍里攒了几个无关）；
+//                      时刻跳变、倒退的样本不用；跨过回绕点不影响
 //
 // 驱动只有解算：样本按到达顺序交给 on_sample()，它运行在控制线程上，可以当单线程代码测。
 // 样本怎么从 IO 线程过来、多少拍没有样本算掉线，在端口包装层（board::Imu<>），测在 test_board。
+// 32 位读数的展开在 SDK 里（libhcs 的 host/tests/sample_time_test），这里的样本带的就是
+// 展开后的 64 位板上时刻——和真板从回调里拿到的一样。
 
 #include <cmath>
 #include <cstdint>
@@ -18,12 +19,13 @@
 
 #include <gtest/gtest.h>
 
+#include <libhcs/time/sample_time.hpp>
+
 #include <hcs_msgs/board_clock.hpp>
 #include <hcs_msgs/imu_snapshot.hpp>
 
 #include "hardware/device/bmi088.hpp"
 #include "hardware/device/bmi088_ekf.hpp"
-#include "hardware/device/board_clock_lifter.hpp"
 #include "hardware/device/imu_sample.hpp"
 #include "hcs_executor/component.hpp"
 #include "hcs_executor/wiring.hpp"
@@ -32,9 +34,9 @@ namespace {
 
 using hcs_core::hardware::device::Bmi088;
 using hcs_core::hardware::device::Bmi088Ekf;
-using hcs_core::hardware::device::BoardClockLifter;
 using hcs_core::hardware::device::ImuSample;
 using hcs_executor::Component;
+using BoardTime = libhcs::time::BoardClock::time_point;
 
 constexpr double kPi = std::numbers::pi;
 constexpr double kGravity = 9.80665;
@@ -43,27 +45,36 @@ constexpr double kGravity = 9.80665;
 constexpr double kRawPerG = 32767.0 / 6.0;
 constexpr double kRawPerRadPerSec = 32767.0 / (2000.0 * kPi / 180.0);
 
-/// 四分之一微秒。
-constexpr std::uint32_t quarter_us(double milliseconds) {
-    return static_cast<std::uint32_t>(milliseconds * 4000.0);
+/// 四分之一微秒（毫秒 × 4000）。
+constexpr std::uint64_t quarter_us(double milliseconds) {
+    return static_cast<std::uint64_t>(std::llround(milliseconds * 4000.0));
 }
 
-ImuSample accelerometer(double x_g, double y_g, double z_g, std::uint32_t timestamp = 0) {
+/// 板上时刻 = board_quarter_us（64 位，SDK 展开后的样子）；32 位读数是它的低 32 位。
+ImuSample accelerometer(double x_g, double y_g, double z_g, std::uint64_t board_quarter_us = 0) {
     return {
         .kind = ImuSample::Kind::kAccelerometer,
         .x = static_cast<std::int16_t>(std::lround(x_g * kRawPerG)),
         .y = static_cast<std::int16_t>(std::lround(y_g * kRawPerG)),
         .z = static_cast<std::int16_t>(std::lround(z_g * kRawPerG)),
-        .timestamp_quarter_us = timestamp};
+        .timestamp_quarter_us = static_cast<std::uint32_t>(board_quarter_us),
+        .time = {.host = hcs_sync::Clock::now(),
+            .source = libhcs::time::SampleTime::Source::kBoardStamp,
+            .board = BoardTime{libhcs::time::BoardClock::duration{
+                static_cast<std::int64_t>(board_quarter_us)}}}};
 }
 
-ImuSample gyroscope(double x, double y, double z, std::uint32_t timestamp = 0) {
+ImuSample gyroscope(double x, double y, double z, std::uint64_t board_quarter_us = 0) {
     return {
         .kind = ImuSample::Kind::kGyroscope,
         .x = static_cast<std::int16_t>(std::lround(x * kRawPerRadPerSec)),
         .y = static_cast<std::int16_t>(std::lround(y * kRawPerRadPerSec)),
         .z = static_cast<std::int16_t>(std::lround(z * kRawPerRadPerSec)),
-        .timestamp_quarter_us = timestamp};
+        .timestamp_quarter_us = static_cast<std::uint32_t>(board_quarter_us),
+        .time = {.host = hcs_sync::Clock::now(),
+            .source = libhcs::time::SampleTime::Source::kBoardStamp,
+            .board = BoardTime{libhcs::time::BoardClock::duration{
+                static_cast<std::int64_t>(board_quarter_us)}}}};
 }
 
 class Host : public Component {
@@ -108,15 +119,23 @@ struct Bench {
 
 Bmi088::Config mahony(double kp = 0.2) { return Bmi088::Config{}.set_gain(kp, 0.0); }
 
+/// 同一个样本、换一个板上时刻（64 位）。
+ImuSample at_board(const ImuSample& sample, std::uint64_t board_quarter_us) {
+    ImuSample retimed = sample;
+    retimed.timestamp_quarter_us = static_cast<std::uint32_t>(board_quarter_us);
+    retimed.time.board =
+        BoardTime{libhcs::time::BoardClock::duration{static_cast<std::int64_t>(board_quarter_us)}};
+    return retimed;
+}
+
 /// 给 Mahony 版喂一段恒定的输入：加速度计一个样本，然后 count 个陀螺仪样本，间隔 0.5 ms。
 /// 返回其中让姿态前进了一步的样本数。
-int feed(Bmi088& imu, const ImuSample& accel, ImuSample gyro, int count, std::uint32_t start = 0) {
+int feed(Bmi088& imu, const ImuSample& accel, const ImuSample& gyro, int count,
+    std::uint64_t start = 0) {
     imu.on_sample(accel);
     int produced = 0;
-    for (int i = 0; i < count; ++i) {
-        gyro.timestamp_quarter_us = start + quarter_us(0.5 * i);
-        produced += imu.on_sample(gyro);
-    }
+    for (int i = 0; i < count; ++i)
+        produced += imu.on_sample(at_board(gyro, start + quarter_us(0.5 * i)));
     return produced;
 }
 
@@ -135,8 +154,10 @@ TEST(Bmi088, ConvertsRawSamplesToPhysicalUnits) {
     EXPECT_NEAR(*bench.reader->yaw_rate, 0.3, 1e-3);
 
     // 满量程。
-    bench.imu.on_sample({ImuSample::Kind::kAccelerometer, 32767, 0, 0, 0});
-    bench.imu.on_sample({ImuSample::Kind::kGyroscope, 0, 0, -32767, quarter_us(1.0)});
+    bench.imu.on_sample({ImuSample::Kind::kAccelerometer, 32767, 0, 0, 0, {}});
+    bench.imu.on_sample(
+        {ImuSample::Kind::kGyroscope, 0, 0, -32767, static_cast<std::uint32_t>(quarter_us(1.0)),
+         {}});
     EXPECT_DOUBLE_EQ(bench.imu.acceleration_g().x(), 6.0);
     EXPECT_NEAR(bench.imu.angular_velocity().z(), -2000.0 * kPi / 180.0, 1e-12);
 }
@@ -234,35 +255,6 @@ TEST(Bmi088, KeepsIntegratingAcrossTheTimestampWrap) {
     EXPECT_NEAR(*bench.reader->yaw, 0.010, 1e-4);
 }
 
-// ── BoardClockLifter ───────────────────────────────────────────────────────
-
-TEST(BoardClockLifter, NothingCanBeLiftedBeforeTheTimebaseExists) {
-    BoardClockLifter clock;
-    EXPECT_FALSE(clock.timebase().has_value());
-    EXPECT_FALSE(clock.lift_timestamp(1234).has_value());
-
-    const auto first = clock.advance_timebase(1000);
-    EXPECT_EQ(first.time_since_epoch().count(), 1000);
-    EXPECT_EQ(clock.timebase(), first);
-}
-
-TEST(BoardClockLifter, CountsAcrossThe32BitWrap) {
-    BoardClockLifter clock;
-    const std::uint32_t near_the_end = 0xFFFF'FF00U;
-    const auto before = clock.advance_timebase(near_the_end);
-    const auto after = clock.advance_timebase(near_the_end + 0x200U); // 回绕到 0x100
-
-    EXPECT_EQ((after - before).count(), 0x200);
-    EXPECT_EQ(after.time_since_epoch().count(), std::int64_t{0xFFFF'FF00} + 0x200);
-
-    // 另一路的时间戳，回绕前后各一个：都展开到和时基同一圈。
-    const auto earlier = clock.lift_timestamp(0xFFFF'FFF0U);
-    const auto later = clock.lift_timestamp(0x180U);
-    ASSERT_TRUE(earlier && later);
-    EXPECT_EQ((after - *earlier).count(), 0x110);
-    EXPECT_EQ((*later - after).count(), 0x80);
-}
-
 // ── Bmi088Ekf ──────────────────────────────────────────────────────────────
 
 TEST(Bmi088Ekf, WaitsForAnAccelerometerSampleBeforeProducingAnything) {
@@ -339,12 +331,13 @@ TEST(Bmi088Ekf, ATimestampJumpIsSkippedNotIntegrated) {
 // 板上的时间戳是 32 位的，约 18 分钟绕一圈：跨过回绕点时积分照常。
 TEST(Bmi088Ekf, KeepsIntegratingAcrossTheTimestampWrap) {
     Bench<Bmi088Ekf> bench{Bmi088Ekf::Config{}};
-    const std::uint32_t start = 0xFFFF'FFFFU - quarter_us(2.0); // 离回绕还有 2 ms
+    // 64 位板上时刻跨过 2^32 继续走（SDK 展开的结果），低 32 位（线上的读数）回绕。
+    const std::uint64_t start = 0xFFFF'FFFFULL - quarter_us(2.0); // 离回绕还有 2 ms
     bench.imu.on_sample(accelerometer(0.0, 0.0, 1.0, start));
 
     int produced = 0;
     for (int i = 1; i <= 20; ++i) { // 10 ms，中途回绕
-        const std::uint32_t timestamp = start + quarter_us(0.5 * i);
+        const std::uint64_t timestamp = start + quarter_us(0.5 * i);
         if (i % 2 == 0)
             bench.imu.on_sample(accelerometer(0.0, 0.0, 1.0, timestamp));
         produced += bench.imu.on_sample(gyroscope(0.0, 0.0, 1.0, timestamp));

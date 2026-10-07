@@ -141,7 +141,7 @@ hcs_bringup     配置、launch、工具
 | 6 | 合并 `hcs_sync` + `hcs_utility`、删死代码 | **已合并成 `hcs_base`**（纯头文件、不依赖 ROS）：`thread/`（线程配置、实时武装、精确睡眠、门铃、门铃线程、RealtimeScope、RTSan 属性、futex、thread_assert）、`channel/`（Snapshot、EventQueue、ByteTunnel、DoubleBuffer、tick、time_base）、`protocol/`（dji_crc、endian_promise、package_receive、ring_buffer、Eigen 结构化绑定）、`check/`（MachineGuard），顶层放 cache_line / raw_storage / tick_timer / fps_counter。两份 `cache_line` 合成一份。`rt_sampler` 只有 executor 用，收进 `hcs_executor/src`（与 `tdigest` 一起私有）。**命名空间未改**（仍是 `hcs_sync::` / `hcs_utility::`）：改它要动 `referee/` 的函数体，用户这次只放开了锁定目录的 include 行；`referee/` 实际只改了 2 个文件的 5 行 include，`shooting/` 用的还是 `rmcs_*` 头、不在构建里，未动。死代码只删了 `rclcpp/node_mixin.hpp`；第 5 节的清单已过时：`csv_writer` / `memory_pool` / `pooled_shared_factory` 早已删除，`tick_timer` 被 `referee/` 用，`thread_assert` 被 `double_buffer` 用，`fps_counter` 留给以后移植 `shooting/` |
 
 顺带发现、未改：
-- `demo.yaml` 引用的 `DemoBoard` 组件源码已在 `58df7c7` 删除，这份配置本来就起不来。
+- `demo.yaml` 引用的 `DemoBoard` 组件源码已在 `58df7c7` 删除，这份配置本来就起不来。（2026-10-07 `demo.yaml` 也已删除。）
 - clang 下 `referee/status.cpp` 在周期域 `update()` 里打日志（`-Wfunction-effects` 报出），属锁定目录。
 - `hcs_link_probe.cpp:272` 的 `-Wfunction-effects`（拍内调用 `send`）是既存告警。
 - gcc 14 在 `referee/app/ui/shape/shape.hpp` 报 330 条 `-Wuninitialized`，属锁定目录。
@@ -263,7 +263,7 @@ DJI 合帧与槽位、跨总线帧序。唯一有意的差异是 pitch：力矩�
 
 还没统一的：
 - `hardware/deprecated_reference_rmcs_real_car.cpp` 是一整台 RMCS 车（变形步兵）的硬件文件，留作参考，
-  不在构建里。HCS 里没有它要的底盘控制器、超级电容驱动和状态监视器。
+  不在构建里。HCS 里没有它要的底盘控制器、超级电容驱动和状态监视器。（2026-10-07 已删除。）
 - 仍是英文注释的：`hcs_executor/src/tdigest.hpp`（源自 Apache-2.0 的第三方代码，保留上游注释）、
   `hcs_core/src/referee/`（约定不动的目录）、libhcs（它自己的规范要求英文）。
 - DR16、BMI088、射击控制器都没有接过真机，也没有哪一份车的配置用到它们。

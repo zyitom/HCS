@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <numbers>
 #include <span>
 #include <string>
@@ -66,16 +67,17 @@ public:
         /// - kNwu：机体系本来就是 FLU，原样通过。
         enum class ModuleFrame : std::uint8_t { kEnu, kNwu };
 
-        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_offline_timeout(std::chrono::milliseconds value) {
+            return offline_timeout = value, *this;
+        }
         Config& set_module_frame(ModuleFrame value) { return module_frame = value, *this; }
 
         /// 模块 flash 里设的串口速率（CONFIG SERIAL BAUD）。必填：它是这一个模块的属性，
         /// 不是这个型号的属性。
         util::Required<std::uint32_t> baudrate;
 
-        /// 连续多少拍没有新帧算掉线。1 kHz 的控制回路配默认 100 Hz 的 HI91 输出，
-        /// 每 10 拍应该来一帧。
-        int offline_timeout = 100;
+        /// 连续多久没有新帧算掉线。默认 100 Hz 的 HI91 输出每 10 ms 来一帧。
+        std::chrono::milliseconds offline_timeout{100};
 
         ModuleFrame module_frame = ModuleFrame::kEnu;
     };

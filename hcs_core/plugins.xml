@@ -3,7 +3,7 @@
   <class type="hcs_core::hardware::HcsLinkProbe"          base_class_type="hcs_executor::Component" />
   <class type="hcs_core::hardware::BalanceGimbalBoard"    base_class_type="hcs_executor::Component" />
   <class type="hcs_core::hardware::BalanceChassisBoard"   base_class_type="hcs_executor::Component" />
-  <class type="hcs_core::hardware::BalanceAuxBoard"       base_class_type="hcs_executor::Component" />
+  <class type="hcs_core::hardware::BalanceMc02Board"      base_class_type="hcs_executor::Component" />
   <class type="hcs_core::hardware::TransmitThread"        base_class_type="hcs_executor::Component" />
   <class type="hcs_core::hardware::SafetyLatch"           base_class_type="hcs_executor::Component" />
   <class type="hcs_core::controller::chassis::balance::BalanceChassisController" base_class_type="hcs_executor::Component" />

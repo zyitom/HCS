@@ -15,7 +15,7 @@ struct SerialLine {
     std::uint32_t baudrate;
     Parity parity = Parity::kNone;
     std::uint8_t stop_bits = 1;
-    /// 接收信号取反，仅在板子有这一位的端口上有效（mc02 的 DBUS）。不设：保持端口的默认。
+    /// 接收信号取反，仅在板子有这一位的端口上有效（mc02 的 DBUS）。不设 = 不取反。
     std::optional<bool> rx_inverted = std::nullopt;
 };
 

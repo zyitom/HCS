@@ -22,11 +22,11 @@ gdb 通过 `target remote` 连上来，内存从 /proc/PID/mem 直接读。目�
     (gdb) set language c++
     (gdb) source hcs_bringup/tools/hcs_gdb.py
     (gdb) hcs-components                 # 每个组件绑定成 $<yaml 实例名>
-    (gdb) print *$demo_hardware          # 整棵对象树：基类、成员、STL、接口值
-    (gdb) set var $demo_hardware->setpoint_amplitude_ = 5    # 需要 --allow-write
+    (gdb) print *$gimbal_board           # 整棵对象树：基类、成员、STL、接口值
+    (gdb) set var $gimbal_board->batch_sequence_ = 0          # 需要 --allow-write
 
 VS Code + Cortex-Debug（marus25.cortex-debug）launch.json：自动刷新的 Live Watch。
-在 Live Watch 面板里加表达式 `*$hcs("demo_hardware")` 即可展开整棵对象树：
+在 Live Watch 面板里加表达式 `*$hcs("gimbal_board")` 即可展开整棵对象树：
   {
     "name": "HCS live watch", "type": "cortex-debug", "request": "attach",
     "servertype": "external", "gdbTarget": "127.0.0.1:2345",

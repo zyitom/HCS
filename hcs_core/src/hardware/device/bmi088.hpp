@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <format>
@@ -17,7 +18,7 @@ namespace hcs_core::hardware::device {
 
 /// 板载 BMI088，姿态用 Mahony 互补滤波解算。
 ///
-/// 加速度计量程 ±6 g，陀螺仪量程 ±2000 °/s，都是 16 位有符号数满量程。
+/// 量程与速率是 kSetup 那一组（±6 g，±2000 °/s）：板子按它初始化传感器，这里按它换算。
 ///
 /// 只写协议与解算：全部成员都在控制线程上，样本由端口包装层（board::Imu<>）按到达顺序交进来；
 /// 掉线判定也在包装层。
@@ -36,7 +37,9 @@ public:
         Config& set_sensor_to_body(const Eigen::Matrix3d& value) {
             return sensor_to_body = value, *this;
         }
-        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_offline_timeout(std::chrono::milliseconds value) {
+            return offline_timeout = value, *this;
+        }
 
         /// Mahony 的比例与积分增益。kp 越大越信加速度计（收敛快、对线加速度敏感）；
         /// ki 用来吃掉陀螺仪零偏，0 表示不用。
@@ -46,9 +49,12 @@ public:
         /// 把传感器轴上的量转到机体系（FLU）：body = sensor_to_body * sensor。由板子怎么装决定。
         Eigen::Matrix3d sensor_to_body = Eigen::Matrix3d::Identity();
 
-        /// 连续多少拍没有样本算掉线。BMI088 每毫秒都有样本，100 拍已经很宽。
-        int offline_timeout = 100;
+        /// 连续多久没有样本算掉线。BMI088 每毫秒都有样本，100 ms 已经很宽。
+        std::chrono::milliseconds offline_timeout{100};
     };
+
+    /// 这个驱动要求板载 IMU 跑的量程与速率（见 device::ImuSetup）。
+    static constexpr ImuSetup kSetup = kBmi088Setup;
 
     Bmi088(hcs_executor::Component& status_component, const std::string& name, const Config& config)
         : outputs_(status_component, name)
@@ -74,10 +80,15 @@ public:
 
         angular_velocity_ = sensor_to_body_ * raw * kGyroscopeScale;
 
-        // 无符号相减：时间戳在 32 位上回绕时差值仍然是对的。
-        const std::uint32_t elapsed = sample.timestamp_quarter_us - last_gyroscope_timestamp_;
+        // 步长取相邻两个样本在板子自己的计时器上的间隔：64 位、不回绕，隔多久都是对的。
+        // 样本没带 64 位时刻（理论上不会发生：板上时间戳总在）才退回 32 位读数的
+        // 无符号相减；上一次退回了、这一次有，两次基准对不上，同样退回 32 位。
+        const std::uint32_t elapsed = sample.time.board && last_gyroscope_board_
+            ? static_cast<std::uint32_t>((*sample.time.board - *last_gyroscope_board_).count())
+            : sample.timestamp_quarter_us - last_gyroscope_timestamp_;
         const bool has_previous = gyroscope_received_;
         last_gyroscope_timestamp_ = sample.timestamp_quarter_us;
+        last_gyroscope_board_ = sample.time.board;
         gyroscope_received_ = true;
 
         // 没有重力方向就开始积分的话，姿态是从一个没有参考的状态起步的。
@@ -111,9 +122,9 @@ public:
     }
 
 private:
-    static constexpr double kAccelerometerScale = 6.0 / 32767.0; ///< 原始值 → g
+    static constexpr double kAccelerometerScale = kSetup.accelerometer_scale(); ///< 原始值 → g
     static constexpr double kGyroscopeScale =
-        2000.0 / 32767.0 * std::numbers::pi / 180.0;             ///< 原始值 → rad/s
+        kSetup.gyroscope_scale_dps() * std::numbers::pi / 180.0;                ///< 原始值 → rad/s
     static constexpr double kGravity = 9.80665;                  ///< m/s²
 
     static constexpr double kSecondsPerQuarterUs = 1.0 / 4'000'000.0;
@@ -172,6 +183,8 @@ private:
     bool accelerometer_received_ = false;
     bool gyroscope_received_ = false;
     std::uint32_t last_gyroscope_timestamp_ = 0; ///< 四分之一微秒，会回绕
+    /// 上一个陀螺仪样本的 64 位板上时刻；样本没带（理论不会发生）时为空。
+    std::optional<libhcs::time::BoardClock::time_point> last_gyroscope_board_;
 
     Eigen::Quaterniond quaternion_ = Eigen::Quaterniond::Identity();
     Eigen::Vector3d integral_feedback_ = Eigen::Vector3d::Zero(); ///< 已经乘过 ki 的积分误差

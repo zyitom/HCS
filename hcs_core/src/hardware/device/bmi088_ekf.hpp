@@ -10,23 +10,24 @@
 
 #include <eigen3/Eigen/Geometry>
 
+#include <libhcs/time/sample_time.hpp>
+
 #include <hcs_executor/component.hpp>
 #include <hcs_msgs/board_clock.hpp>
 #include <hcs_msgs/imu_snapshot.hpp>
 
 #include "filter/imu_ekf.hpp"
-#include "hardware/device/board_clock_lifter.hpp"
 #include "hardware/device/imu_outputs.hpp"
 #include "hardware/device/imu_sample.hpp"
 
 namespace hcs_core::hardware::device {
 
-/// 板载 BMI088，姿态用扩展卡尔曼滤波解算，**按样本自己的板上时间戳**逐个积分。
+/// 板载 BMI088，姿态用扩展卡尔曼滤波解算，**按样本自己的板上时刻**逐个积分。
 ///
 /// 和 Bmi088（Mahony，每拍一步、步长固定）的区别就在这里：陀螺仪每来一个样本就预测一步，
-/// 步长是相邻两个样本时间戳之差，所以控制线程偶尔晚了、一拍里攒了几个样本，姿态也不受影响。
-/// 输出里还多一个带板上时刻的快照（<名字>/snapshot），给要和同一块板上别的时间戳（相机触发）
-/// 对齐的消费者。
+/// 步长是相邻两个样本的板上时刻之差（64 位、不回绕，SDK 展开），所以控制线程偶尔晚了、
+/// 一拍里攒了几个样本，姿态也不受影响。输出里还多一个带板上时刻的快照（<名字>/snapshot），
+/// 给要和同一块板上别的时间戳（相机触发）对齐的消费者。
 ///
 /// 只写协议与解算：全部成员都在控制线程上，样本由端口包装层（board::Imu<>）按到达顺序交进来。
 ///
@@ -40,14 +41,19 @@ public:
         Config& set_body_to_sensor(const Eigen::Matrix3d& value) {
             return body_to_sensor = value, *this;
         }
-        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_offline_timeout(std::chrono::milliseconds value) {
+            return offline_timeout = value, *this;
+        }
 
         /// 机体系（FLU）到传感器轴的旋转：sensor = body_to_sensor * body。由板子怎么装决定。
         Eigen::Matrix3d body_to_sensor = Eigen::Matrix3d::Identity();
 
-        /// 连续多少拍没有解出新的姿态算掉线。
-        int offline_timeout = 100;
+        /// 连续多久没有解出新的姿态算掉线。
+        std::chrono::milliseconds offline_timeout{100};
     };
+
+    /// 这个驱动要求板载 IMU 跑的量程与速率（见 device::ImuSetup）。
+    static constexpr ImuSetup kSetup = kBmi088Setup;
 
     Bmi088Ekf(
         hcs_executor::Component& status_component, const std::string& name, const Config& config)
@@ -61,19 +67,21 @@ public:
 
     /// 周期域：一个原始样本，按到达顺序。
     ///
-    /// 加速度计的时间戳推进时基，陀螺仪的时间戳靠时基展开（见 BoardClockLifter）。
+    /// 两个样本的先后都用 sample.time.board（板上 64 位时刻，SDK 已把 32 位读数展开，
+    /// 不会回绕）：滤波器的状态、挂着的加速度计样本、输出的快照全在同一条板上时间轴上。
     /// @return 这个样本有没有让姿态前进一步。只有陀螺仪样本会；滤波器还没初始化、
-    ///         或者样本被丢掉（时间倒退、时间戳跳变）时返回 false
+    ///         或者样本被丢掉（时间倒退、时刻跳变）时返回 false
     bool on_sample(const ImuSample& sample) noexcept {
+        if (!sample.time.board)
+            return false; // 没有 64 位板上时刻（理论上不会发生），没法排时间轴
+        const auto sample_time = to_hcs_msgs(*sample.time.board);
+
         if (sample.kind == ImuSample::Kind::kAccelerometer) {
-            push_accelerometer(sample, clock_.advance_timebase(sample.timestamp_quarter_us));
+            push_accelerometer(sample, sample_time);
             return false;
         }
 
-        const auto time = clock_.lift_timestamp(sample.timestamp_quarter_us);
-        if (!time)
-            return false; // 还没有加速度计样本，时基没建立
-        const auto snapshot = update_with_gyroscope(sample, *time);
+        const auto snapshot = update_with_gyroscope(sample, sample_time);
         if (!snapshot)
             return false;
 
@@ -109,26 +117,35 @@ private:
         const Eigen::Vector3d raw{
             static_cast<double>(sample.x), static_cast<double>(sample.y),
             static_cast<double>(sample.z)};
-        return sensor_to_body_ * raw / 32767.0 * 6.0;
+        return sensor_to_body_ * raw / 32767.0 * kSetup.accelerometer_range_g;
     }
 
     [[nodiscard]] Eigen::Vector3d gyroscope_rad_per_sec(const ImuSample& sample) const noexcept {
         const Eigen::Vector3d raw{
             static_cast<double>(sample.x), static_cast<double>(sample.y),
             static_cast<double>(sample.z)};
-        return sensor_to_body_ * raw / 32767.0 * 2000.0 / 180.0 * std::numbers::pi;
+        return sensor_to_body_ * raw / 32767.0 * kSetup.gyroscope_range_dps / 180.0
+             * std::numbers::pi;
     }
 
     /// 陀螺仪有没有哪一轴打到了量程的 98%。
     /// 三个分量手写着比，不用 cwiseAbs().maxCoeff()：后者 clang 推不出"不阻塞"。
     [[nodiscard]] static bool is_saturated(const Eigen::Vector3d& gyro_rad_per_sec) noexcept {
-        constexpr double kLimit = 0.98 * 2000.0 / 180.0 * std::numbers::pi;
+        constexpr double kLimit = 0.98 * kSetup.gyroscope_range_dps / 180.0 * std::numbers::pi;
         return std::abs(gyro_rad_per_sec.x()) >= kLimit || std::abs(gyro_rad_per_sec.y()) >= kLimit
             || std::abs(gyro_rad_per_sec.z()) >= kLimit;
     }
 
     [[nodiscard]] static double seconds(hcs_msgs::BoardClock::duration duration) noexcept {
         return std::chrono::duration<double>{duration}.count();
+    }
+
+    /// 板上时刻在 SDK 的类型里（libhcs::time::BoardClock）与 hcs_msgs::BoardClock 是同一个
+    /// 计时器的两种标签（都是四分之一微秒的 64 位计数），输出的快照用后者。
+    [[nodiscard]] static hcs_msgs::BoardClock::time_point
+        to_hcs_msgs(libhcs::time::BoardClock::time_point when) noexcept {
+        return hcs_msgs::BoardClock::time_point{
+            hcs_msgs::BoardClock::duration{when.time_since_epoch().count()}};
     }
 
     /// 加速度计样本不立刻用：留着，等时间上跨过它的那个陀螺仪样本来了再做修正。
@@ -213,7 +230,6 @@ private:
     hcs_executor::Component::OutputInterface<Snapshot> snapshot_output_;
 
     Eigen::Matrix3d sensor_to_body_;
-    BoardClockLifter clock_;
 
     bool initialized_ = false;
     filter::ImuEkf ekf_;

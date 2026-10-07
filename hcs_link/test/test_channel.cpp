@@ -162,6 +162,26 @@ TEST(Channel, CursorFromOldestStartsAtTheRingTail) {
     EXPECT_EQ(cursor.next()->index, 0U);
 }
 
+TEST(Channel, CursorAccountsOnlyFromWhereItStarts) {
+    // 建游标之前写者已经跑了好几圈：游标从还留着的最老一条开始，
+    // 之前的那些不归它管——读到的加 lost 等于"建游标之后"的条数，不是总条数。
+    auto writer = make_writer(8);
+    const auto reader = open(writer);
+    for (std::uint64_t i = 0; i < 100; ++i)
+        writer.publish(Pattern::of(i));
+
+    auto cursor = reader.cursor_from_oldest();
+    EXPECT_EQ(cursor.position(), 93U);
+    for (std::uint64_t i = 100; i < 120; ++i)
+        writer.publish(Pattern::of(i));
+
+    std::uint64_t received = 0;
+    while (cursor.next())
+        ++received;
+    EXPECT_EQ(cursor.position(), 120U);
+    EXPECT_EQ(received + cursor.lost(), 120U - 93U);
+}
+
 TEST(Channel, ReaderOutlivesWriter) {
     std::optional<Reader<Pattern>> reader;
     {
@@ -323,6 +343,11 @@ TEST(Concurrency, ProcessesNeverSeeTornValues) {
     const auto reader = open(writer);
     constexpr std::uint64_t kCount = 2'000'000;
 
+    // 游标必须在 fork 之前建：fork 之后再建，父进程被调度晚了的话写者已经跑出去好几圈，
+    // 游标从当时的最老一条开始，之前那些既没读到也不算 lost（2026-10-06 check.sh 里少了 8.8 万条）。
+    auto cursor = reader.cursor_from_oldest();
+    ASSERT_EQ(cursor.position(), 0U);
+
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -332,7 +357,6 @@ TEST(Concurrency, ProcessesNeverSeeTornValues) {
         ::_exit(0);
     }
 
-    auto cursor = reader.cursor_from_oldest();
     std::uint64_t received = 0;
     std::uint64_t bad = 0;
     while (cursor.position() < kCount) {

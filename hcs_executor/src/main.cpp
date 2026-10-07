@@ -74,7 +74,7 @@ static void apply_process_affinity_from_environment() {
 /// 自己 prctl(PR_SET_PTRACER) 点头。只放开本进程、必须显式设环境变量才生效，
 /// 不影响正常部署。
 ///
-/// 用法：HCS_ALLOW_DEBUG_ATTACH=1 ros2 launch hcs_bringup hcs.launch.py robot:=demo
+/// 用法：HCS_ALLOW_DEBUG_ATTACH=1 ros2 launch hcs_bringup hcs.launch.py robot:=balance-infantry
 static void apply_debug_ptracer_grant_from_environment() {
     const char* spec = std::getenv("HCS_ALLOW_DEBUG_ATTACH");
     if (spec == nullptr || *spec == '\0' || *spec == '0')

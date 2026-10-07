@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -51,7 +52,9 @@ public:
         Config& set_reduction_ratio(double value) { return reduction_ratio = value, *this; }
         Config& set_reversed() { return reversed = true, *this; }
         Config& enable_multi_turn_angle() { return multi_turn_angle_enabled = true, *this; }
-        Config& set_offline_timeout(int value) { return offline_timeout = value, *this; }
+        Config& set_offline_timeout(std::chrono::milliseconds value) {
+            return offline_timeout = value, *this;
+        }
 
         util::Required<Type> motor_type;
         /// 电调 id，由拨码开关 / 指示灯闪烁次数设定（1..8）。
@@ -62,9 +65,9 @@ public:
         std::optional<double> reduction_ratio = std::nullopt;
         bool reversed = false;
         bool multi_turn_angle_enabled = false;
-        /// 连续多少拍没有反馈算掉线。电调和控制回路都跑在 1 kHz 左右，但时钟不同源，
-        /// 所以某一拍没有新帧（或者来了两帧）是正常的；连着这么多拍都没有才不正常。
-        int offline_timeout = 100;
+        /// 连续多久没有反馈算掉线。电调和控制回路都跑在 1 kHz 左右，但时钟不同源，
+        /// 所以某一拍没有新帧（或者来了两帧）是正常的；连着这么久都没有才不正常。
+        std::chrono::milliseconds offline_timeout{100};
     };
 
     static constexpr double default_reduction_ratio(Type type) {

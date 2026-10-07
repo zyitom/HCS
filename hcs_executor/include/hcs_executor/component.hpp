@@ -418,8 +418,8 @@ public:
 
         auto component = std::make_shared<T>(std::forward<Args>(args)...);
         // 伙伴组共用一个根。失效隔离要靠它把整组一起停掉：
-        // DemoBoard::Command::update() 里就是直接回调 board_.command_update()，
-        // 只隔离 DemoBoard 而放着它的 command partner 继续跑，等于没隔离。
+        // 板组件的 BoardCore::Command::update() 里就是直接回调 owner_.command_update()，
+        // 只隔离板组件而放着它的 command partner 继续跑，等于没隔离。
         component->partner_root_ = partner_root_ != nullptr ? partner_root_ : this;
         partner_component_list_.emplace_back(component);
 

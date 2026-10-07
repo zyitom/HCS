@@ -1,9 +1,11 @@
 #include <chrono>
 #include <cstdint>
+#include <span>
+#include <vector>
 
 #include <gtest/gtest.h>
 
-#include <libhcs/board/hcs_can_port.hpp>
+#include <libhcs/data/datas.hpp>
 
 #include <hcs_base/channel/snapshot.hpp>
 
@@ -28,11 +30,11 @@ TEST(board_transmitter, batch_packing) {
     auto packet =
         CanPacket8{CanPacket8::Quarter{0x1111}, CanPacket8::Quarter{0x2222},
                    CanPacket8::PaddingQuarter{}, CanPacket8::Quarter{0x4444}};
-    push_frame(batch, libhcs::board::hcs::CanPort::kCan2, 0x201, packet);
+    push_frame(batch, libhcs::data::DataId::kCan2, 0x201, packet);
 
     ASSERT_EQ(batch.frame_count, 1u);
     const auto& frame = batch.frames[0];
-    EXPECT_EQ(frame.port, static_cast<std::uint8_t>(libhcs::board::hcs::CanPort::kCan2));
+    EXPECT_EQ(frame.port, libhcs::data::DataId::kCan2);
     EXPECT_EQ(frame.can_id, 0x201u);
 
     const auto bytes = packet.as_bytes();
@@ -40,12 +42,38 @@ TEST(board_transmitter, batch_packing) {
 }
 
 TEST(board_transmitter, batch_capacity_matches_robot) {
-    // 批次按板：平衡步兵帧最多的一块板每拍 4 帧（云台、底盘各 4，aux 1），装得下。
+    // 批次按板：平衡步兵帧最多的一块板每拍 6 帧（底盘：四个 DM 各一帧、两路总线各一帧 3508 的
+    // 0x200；云台 4；mc02 上没有电机），装得下。
     TransmitBatch batch;
-    for (std::uint32_t index = 0; index < 4; ++index)
-        push_frame(batch, libhcs::board::hcs::CanPort::kCan1, 0x100 + index, CanPacket8{});
-    EXPECT_EQ(batch.frame_count, 4u);
+    for (std::uint32_t index = 0; index < 6; ++index)
+        push_frame(batch, libhcs::data::DataId::kCan1, 0x100 + index, CanPacket8{});
+    EXPECT_EQ(batch.frame_count, 6u);
     EXPECT_GE(TransmitBatch::kMaxFrames, batch.frame_count);
+}
+
+TEST(board_transmitter, frames_leave_highest_id_first) {
+    // 底盘一路总线的真实组合：两台 DM（esc 0x02、0x01，按电机遍历顺序 push）加一台 3508 的
+    // 共享帧 0x200。板子单发、FIFO：0x200 排在 DM 之后会输给 DM 的回复（0x05/0x06）而被丢，
+    // 所以出帧顺序必须是 id 从大到小。另一路总线的帧混在中间，各自也按降序。
+    using libhcs::data::DataId;
+    TransmitBatch batch;
+    hcs_core::hardware::util::CommandFrames frames{batch};
+    auto can1 = frames.on(DataId::kCan1);
+    auto can2 = frames.on(DataId::kCan2);
+    can1.push(0x02, CanPacket8{});
+    can1.push(0x01, CanPacket8{});
+    can2.push(0x04, CanPacket8{});
+    can1.shared_frame(0x200);
+    can2.shared_frame(0x200);
+    frames.flush();
+
+    ASSERT_EQ(batch.frame_count, 5u);
+    std::vector<std::uint32_t> can1_order, can2_order;
+    for (const auto& frame : std::span{batch.frames}.first(batch.frame_count))
+        (frame.port == DataId::kCan1 ? can1_order : can2_order)
+            .push_back(frame.can_id);
+    EXPECT_EQ(can1_order, (std::vector<std::uint32_t>{0x200, 0x02, 0x01}));
+    EXPECT_EQ(can2_order, (std::vector<std::uint32_t>{0x200, 0x04}));
 }
 
 TEST(board_transmitter, plan_send_decisions) {

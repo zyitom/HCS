@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -27,8 +28,8 @@ public:
     struct Config {
         /// 接收机串口速率（待上台架核对）。
         std::uint32_t baudrate = 115200;
-        /// 连续多少拍没有遥控帧算失联。500 拍即 1 kHz 回路下的 500 ms。
-        int offline_timeout = 500;
+        /// 连续多久没有遥控帧算失联。
+        std::chrono::milliseconds offline_timeout{500};
     };
 
     Vt13Remote(hcs_executor::Component& status_component, const std::string&, const Config& config)
