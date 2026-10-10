@@ -13,23 +13,22 @@
 #include <vector>
 
 #include <libhcs/board/common.hpp>
-#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/hpm5321.hpp>
 #include <libhcs/data/datas.hpp>
+#include <libhcs/spec/hpm5321/ports.hpp>
 
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
 #include <hcs_executor/component.hpp>
-#include <hcs_sync/snapshot.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/doorbell.hpp>
-#include <hcs_utility/doorbell_worker.hpp>
-#include <hcs_utility/rt_attributes.hpp>
-#include <hcs_utility/thread_config.hpp>
+#include <hcs_base/channel/snapshot.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/doorbell.hpp>
+#include <hcs_base/thread/doorbell_worker.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
+#include <hcs_base/thread/thread_config.hpp>
 
-namespace hcs_demo::hardware {
+namespace hcs_core::hardware {
 
 // ============================================================================
 // 底层测试探针：CAN2.0 电机指令一发一收 + 串口 IMU（HI91 协议），会不会被拖过
@@ -75,9 +74,8 @@ public:
             bool_parameter("dangerously_skip_version_checks", skip_version_checks_);
 
         if (!sender_.thread_config_error().empty())
-            RCLCPP_WARN(
-                get_logger(), "[%s] tx thread config: %s", get_component_name().c_str(),
-                sender_.thread_config_error().c_str());
+            logger().warn(
+                "[{}] tx thread config: {}", get_component_name(), sender_.thread_config_error());
 
         // 板卡在构造期就可能开始收发，早到的回调不许依赖"构造函数体后面还没跑完"的状态。
         // 所以放最后，且成员声明顺序上
@@ -85,18 +83,22 @@ public:
         // 析构逆序：sender_ 先停线程，然后 board_ 停传输，最后数据才消失。
         auto options = libhcs::board::AdvancedOptions{};
         options.dangerously_skip_version_checks = skip_version_checks_;
-        board_ = std::make_unique<libhcs::board::Hpm5321>(*this, serial_filter_, options);
-        // libhcs 的串口配置走 EP0 控制传输，不再混在数据流里。
-        board_->configure_uart0(kImuBaudrate);
+        // 用到的口走构造期 Configuration：会话前 apply + 读回校验，重连自动重发（EP0）。
+        // 配置即声明：没写在这里的口板子不启动，所以 CAN1（经典 CAN，电机）也要写。
+        // 串口声明要说全：速率加 8N1。
+        libhcs::board::hcs::Configuration config;
+        config.declare_can(libhcs::data::DataId::kCan1, libhcs::board::hcs::kClassic1M);
+        config.declare_uart(
+            libhcs::spec::hpm5321::Spec::Uarts::kUart0.data_id,
+            libhcs::board::hcs::uart_8n1(kImuBaudrate));
+        board_ = std::make_unique<libhcs::board::Hpm5321>(*this, serial_filter_, options, config);
 
         report_timer_ = create_wall_timer(std::chrono::seconds{1}, [this] { report(); });
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] CAN2.0+UART RTT probe on libhcs Hpm5321 (serial_filter='%s'): "
-            "tx_id=0x%03X rx_id=0x%03X imu_baud=%u",
-            get_component_name().c_str(), serial_filter_.c_str(), can_id_, response_can_id_,
-            kImuBaudrate);
+        logger().info(
+            "[{}] CAN2.0+UART RTT probe on libhcs Hpm5321 (serial_filter='{}'): "
+            "tx_id=0x{:03X} rx_id=0x{:03X} imu_baud={}",
+            get_component_name(), serial_filter_, can_id_, response_can_id_, kImuBaudrate);
     }
 
     ~CanRttProbe() override = default;
@@ -279,7 +281,7 @@ private:
             std::byte{0},    std::byte{0}, std::byte{0}, std::byte{0}};
 
         board_->start_transmit().can_transmit(
-            libhcs::board::hcs::CanPort::kCan1,
+            libhcs::spec::hpm5321::Spec::Cans::kCan1,
             libhcs::data::CanDataView{.can_id = can_id_, .can_data = kPayload});
         // 记在 transmit() 返回之后，而不是之前——这样它标的是"帧已经交出去"的时刻，
         // 不含 transmit() 自己排队/拿锁的耗时，can_receive 里配对出来的
@@ -288,10 +290,11 @@ private:
     }
 
     // 事件域：libhcs IO 线程回调，电机回帧到手就发布，不做任何等待。
-    // libhcs 的接收回调带端口参数，端口按外壳丝印编号（旧 SDK 的 can0 就是这里的 CAN1）。
-    void can_receive(
-        libhcs::board::hcs::CanPort port, const libhcs::data::CanDataView& data) override {
-        if (port != libhcs::board::hcs::CanPort::kCan1)
+    // 接收回调带端口描述符，身份就是丝印上的 DataId。
+    void can_receive_callback(
+        libhcs::spec::hpm5321::Spec::Can port, const libhcs::data::CanDataView& data,
+        const libhcs::time::SampleTime&) override {
+        if (port != libhcs::spec::hpm5321::Spec::Cans::kCan1)
             return;
         if (data.is_extended_can_id || data.is_remote_transmission)
             return;
@@ -315,7 +318,9 @@ private:
     }
 
     // 事件域：同一条传输线程回调，喂 HI91 定长二进制帧的字节流解析器。
-    void uart0_receive_callback(const libhcs::data::UartDataView& data) override {
+    void uart_receive_callback(
+        libhcs::spec::hpm5321::Spec::Uart, const libhcs::data::UartDataView& data,
+        const libhcs::time::SampleTime&) override {
         uart_rx_buffer_.insert(uart_rx_buffer_.end(), data.uart_data.begin(), data.uart_data.end());
 
         while (try_consume_one_hi91_frame()) {
@@ -367,10 +372,10 @@ private:
 
             if (!imu_logged_once_) {
                 imu_logged_once_ = true;
-                RCLCPP_INFO(
-                    get_logger(), "[%s] first HI91 frame parsed: t=%ums gyro=(% .2f % .2f % .2f)deg/s",
-                    get_component_name().c_str(), sample.system_time_ms, sample.gyro[0],
-                    sample.gyro[1], sample.gyro[2]);
+                // 这里是板卡的 IO 回调：走延迟格式化那一套，不在这条线程上格式化、不碰输出。
+                logger().rt().info(
+                    "first HI91 frame parsed: t={}ms gyro=({: .2f} {: .2f} {: .2f})deg/s",
+                    sample.system_time_ms, sample.gyro[0], sample.gyro[1], sample.gyro[2]);
             }
         }
 
@@ -455,12 +460,11 @@ private:
             return std::chrono::duration<double, std::micro>(c.max_age).count();
         };
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] t=+%llus ticks=%llu | motor(0x%03X<-0x%03X) miss=%.2f%% late=%.2f%% "
-            "age(mean/max)=%.0f/%.0fus tx_err=%llu | "
-            "imu(HI91) miss=%.2f%% late=%.2f%% age(mean/max)=%.0f/%.0fus crc_err=%llu",
-            get_component_name().c_str(), static_cast<unsigned long long>(report_count_),
+        logger().info(
+            "[{}] t=+{}s ticks={} | motor(0x{:03X}<-0x{:03X}) miss={:.2f}% late={:.2f}% "
+            "age(mean/max)={:.0f}/{:.0f}us tx_err={} | "
+            "imu(HI91) miss={:.2f}% late={:.2f}% age(mean/max)={:.0f}/{:.0f}us crc_err={}",
+            get_component_name(), static_cast<unsigned long long>(report_count_),
             static_cast<unsigned long long>(s.ticks), can_id_, response_can_id_,
             pct(s.motor.misses, s.ticks), pct(s.motor.late, s.ticks), mean_us(s.motor),
             max_us(s.motor), static_cast<unsigned long long>(tx_exceptions_delta),
@@ -476,20 +480,19 @@ private:
                                        : 0.0;
         const double skew_stddev_us = skew_var_us2 > 0.0 ? std::sqrt(skew_var_us2) : 0.0;
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] 错相: both_miss=%.2f%% motor_only=%.2f%% imu_only=%.2f%% | "
-            "skew(motor.age-imu.age) mean=%.0fus stddev=%.0fus max|.|=%.0fus (n=%llu)",
-            get_component_name().c_str(), pct(s.both_miss, s.ticks), pct(s.motor_only_miss, s.ticks),
+        logger().info(
+            "[{}] 错相: both_miss={:.2f}% motor_only={:.2f}% imu_only={:.2f}% | "
+            "skew(motor.age-imu.age) mean={:.0f}us stddev={:.0f}us max|.|={:.0f}us (n={})",
+            get_component_name(), pct(s.both_miss, s.ticks), pct(s.motor_only_miss, s.ticks),
             pct(s.imu_only_miss, s.ticks), skew_mean_us, skew_stddev_us, s.skew_abs_max_us,
             static_cast<unsigned long long>(s.skew_samples));
 
         // 一发一收本身的往返时间：send_command() 交出帧到 can_receive 落地。
         const double rtt_mean_us =
             s.rtt_samples != 0 ? s.rtt_sum_us / static_cast<double>(s.rtt_samples) : 0.0;
-        RCLCPP_INFO(
-            get_logger(), "[%s] CAN一发一收 rtt(mean/min/max)=%.0f/%.0f/%.0fus (n=%llu)",
-            get_component_name().c_str(), rtt_mean_us, std::max(s.rtt_min_us, 0.0), s.rtt_max_us,
+        logger().info(
+            "[{}] CAN一发一收 rtt(mean/min/max)={:.0f}/{:.0f}/{:.0f}us (n={})",
+            get_component_name(), rtt_mean_us, std::max(s.rtt_min_us, 0.0), s.rtt_max_us,
             static_cast<unsigned long long>(s.rtt_samples));
 
         // IMU 内部时钟跟主机时钟对表：IMU 自报的时间流逝速度，跟主机实测的流逝速度
@@ -505,11 +508,10 @@ private:
             if (host_elapsed_s >= 5.0) {
                 const double drift_ms = (imu_elapsed_s - host_elapsed_s) * 1000.0;
                 const double ppm = (imu_elapsed_s - host_elapsed_s) / host_elapsed_s * 1e6;
-                RCLCPP_INFO(
-                    get_logger(),
-                    "[%s] IMU时钟核对: 基线=%.1fs IMU侧流逝-主机侧流逝=%.1fms (%.1fppm，"
+                logger().info(
+                    "[{}] IMU时钟核对: 基线={:.1f}s IMU侧流逝-主机侧流逝={:.1f}ms ({:.1f}ppm，"
                     "正值=IMU自认为的时间比主机实测的走得快)",
-                    get_component_name().c_str(), host_elapsed_s, drift_ms, ppm);
+                    get_component_name(), host_elapsed_s, drift_ms, ppm);
             }
         }
     }
@@ -550,8 +552,8 @@ private:
     rclcpp::TimerBase::SharedPtr report_timer_;
 };
 
-} // namespace hcs_demo::hardware
+} // namespace hcs_core::hardware
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(hcs_demo::hardware::CanRttProbe, hcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::hardware::CanRttProbe, hcs_executor::Component)

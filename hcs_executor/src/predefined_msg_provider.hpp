@@ -9,8 +9,8 @@
 #include <chrono>
 #include <cstddef>
 
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include "hcs_executor/component.hpp"
 

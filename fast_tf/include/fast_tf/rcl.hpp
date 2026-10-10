@@ -1,36 +1,19 @@
 #pragma once
 
+#include <cstddef>
+#include <utility>
+#include <vector>
+
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp/node.hpp>
+#include <rclcpp/time.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "fast_tf/impl/joint.hpp"
+#include "fast_tf/impl/pose.hpp"
 
 namespace fast_tf {
-
-namespace internal {
-
-template <internal::is_transform TransformT>
-inline std::tuple<Eigen::Translation3d, Eigen::Quaterniond>
-    extract_translation_rotation(const TransformT& transform) {
-    return {
-        static_cast<Eigen::Translation3d>(transform.translation()),
-        static_cast<Eigen::Quaterniond>(transform.linear())};
-}
-
-template <internal::is_translation TranslationT>
-inline std::tuple<Eigen::Translation3d, Eigen::Quaterniond>
-    extract_translation_rotation(const TranslationT& translation) {
-    return {static_cast<Eigen::Translation3d>(translation), Eigen::Quaterniond::Identity()};
-}
-
-template <internal::is_rotation RotationT>
-inline std::tuple<Eigen::Translation3d, Eigen::Quaterniond>
-    extract_translation_rotation(const RotationT& rotation) {
-    return {Eigen::Translation3d::Identity(), static_cast<Eigen::Quaterniond>(rotation)};
-}
-
-} // namespace internal
 
 namespace rcl {
 
@@ -99,6 +82,52 @@ inline void broadcast_all_modified(const JointCollectionT& collection) {
     collection.for_each_modified(
         [&collection]<typename From, typename To>() { broadcast<From, To>(collection); });
 }
+
+/// 把整棵关节树作为一条 tf 消息广播出去。
+///
+/// 上面那几个自由函数是每个关节发一条消息、经一个隐藏的节点，而且每次调用都要重拼 frame id
+/// 的字符串。这个类是给周期性广播用的：frame id 在构造时填好一次，广播时只改写数字，
+/// 整棵树在调用方已有的节点上一次 publish 发出去。
+///
+/// 它收的是取好的位姿而不是 JointCollection 本身，所以取位姿可以在一条线程上做
+/// （capture() 是实时安全的），发布在另一条线程上做。
+template <internal::is_joint_collection JointCollectionT>
+class Broadcaster {
+public:
+    /// @param node tf2_ros::TransformBroadcaster 收什么它就收什么：节点的指针或引用。
+    template <typename NodeT>
+    explicit Broadcaster(NodeT&& node)
+        : broadcaster_(std::forward<NodeT>(node)) {
+        messages_.reserve(joint_count<JointCollectionT>);
+        JointCollectionT::for_each([this]<typename From, typename To>() {
+            auto& message           = messages_.emplace_back();
+            message.header.frame_id = From::name;
+            message.child_frame_id  = To::name;
+        });
+    }
+
+    /// @param stamp 位姿是什么时候取的，不是什么时候发的。
+    void broadcast(const JointPoses<JointCollectionT>& poses, const rclcpp::Time& stamp) {
+        for (std::size_t i = 0; i < poses.size(); ++i) {
+            auto& message        = messages_[i];
+            message.header.stamp = stamp;
+
+            message.transform.translation.x = poses[i].translation[0];
+            message.transform.translation.y = poses[i].translation[1];
+            message.transform.translation.z = poses[i].translation[2];
+
+            message.transform.rotation.x = poses[i].rotation[0];
+            message.transform.rotation.y = poses[i].rotation[1];
+            message.transform.rotation.z = poses[i].rotation[2];
+            message.transform.rotation.w = poses[i].rotation[3];
+        }
+        broadcaster_.sendTransform(messages_);
+    }
+
+private:
+    tf2_ros::TransformBroadcaster broadcaster_;
+    std::vector<geometry_msgs::msg::TransformStamped> messages_;
+};
 
 } // namespace rcl
 

@@ -20,7 +20,7 @@
 
 #include "hcs_executor/component.hpp"
 #include "hcs_executor/graph.hpp"
-#include "hcs_utility/doorbell.hpp"
+#include "hcs_base/thread/doorbell.hpp"
 
 namespace hcs_executor {
 

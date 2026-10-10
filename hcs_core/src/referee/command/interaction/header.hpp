@@ -1,10 +1,14 @@
 #pragma once
 
+#include <bit>
 #include <cstdint>
 
-#include <rmcs_msgs/full_robot_id.hpp>
+#include <hcs_msgs/full_robot_id.hpp>
 
-namespace rmcs_core::referee::command::interaction {
+// 原生 u16 packed 依赖小端主机。
+static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
+
+namespace hcs_core::referee::command::interaction {
 
 struct __attribute__((packed)) Header {
     uint16_t command_id;
@@ -12,4 +16,4 @@ struct __attribute__((packed)) Header {
     uint16_t receiver_id;
 };
 
-} // namespace rmcs_core::referee::command::interaction
+} // namespace hcs_core::referee::command::interaction

@@ -10,7 +10,10 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace rmcs_core::hardware::device {
+namespace hcs_core::hardware::device {
+
+// 经字节视图序列化的多字节字段按主机序上线，此处为所有使用方的总闸。
+static_assert(std::endian::native == std::endian::little, "byte view assumes a LE host");
 
 template <typename T, size_t align = alignof(T)>
 requires(std::is_trivial_v<T>) struct ByteConvertible {
@@ -64,4 +67,4 @@ struct CanPacket8 : ByteConvertible<std::array<uint16_t, 4>, alignof(uint64_t)> 
 static_assert(std::atomic<CanPacket8>::is_always_lock_free);
 static_assert(std::atomic<CanPacket8::Quarter>::is_always_lock_free);
 
-} // namespace rmcs_core::hardware::device
+} // namespace hcs_core::hardware::device

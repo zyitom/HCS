@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -19,24 +21,25 @@
 
 #include <rclcpp/executors.hpp>
 #include <rclcpp/logger.hpp>
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rclcpp/timer.hpp>
 
-#include <hcs_sync/tick.hpp>
-#include <hcs_sync/time_base.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/channel/time_base.hpp>
+#include <hcs_base/logging/logger.hpp>
 
 #include "predefined_msg_provider.hpp"
 #include "hcs_executor/component.hpp"
 #include "hcs_executor/graph.hpp"
 #include "hcs_executor/wiring.hpp"
 #include "rt_reporter.hpp"
-#include "hcs_utility/doorbell.hpp"
-#include "hcs_utility/precise_sleep.hpp"
-#include "hcs_utility/realtime_arm.hpp"
-#include "hcs_utility/realtime_scope.hpp"
-#include "hcs_utility/rt_sampler.hpp"
-#include "hcs_utility/thread_config.hpp"
+#include "hcs_base/thread/doorbell.hpp"
+#include "hcs_base/check/machine_guard.hpp"
+#include "hcs_base/thread/precise_sleep.hpp"
+#include "hcs_base/thread/realtime_arm.hpp"
+#include "hcs_base/thread/realtime_scope.hpp"
+#include "rt_sampler.hpp"
+#include "hcs_base/thread/thread_config.hpp"
 
 // 逐组件计时默认关：开着的话每个组件每拍多两次 clock_gettime，
 // 在 1 kHz × 几十个组件的量级上这本身就是被测量的东西的一大部分。
@@ -53,6 +56,7 @@ public:
         : Node{
               node_name,
               rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true)}
+        , log_(process_log_backend(), node_name)
         , rcl_executor_(rcl_executor) {
         predefined_msg_provider_ = std::make_shared<PredefinedMsgProvider>();
         add_component(predefined_msg_provider_);
@@ -81,11 +85,24 @@ public:
             add_component(partner_component);
     }
 
+    /// 哪些日志口的名字背后本身就是一个节点：自己，加上每一个继承了 rclcpp::Node 的组件。
+    /// 交给日志的输出端，它据此决定一个名字是原样用还是挂到本节点下面（见 RclcppSink）。
+    /// 键取日志口自己报的名字——过长的组件名在那里是截断过的，输出端看到的也是截断后的。
+    [[nodiscard]] std::map<std::string, rclcpp::Logger, std::less<>> node_loggers() const {
+        auto loggers = std::map<std::string, rclcpp::Logger, std::less<>>{};
+        loggers.emplace(std::string{log_.name()}, get_logger());
+        for (const auto& component : component_list_)
+            if (const auto* node = dynamic_cast<const rclcpp::Node*>(component.get()))
+                loggers.emplace(std::string{component->logger().name()}, node->get_logger());
+        return loggers;
+    }
+
     /// 启动控制线程与报告线程。
     ///
     /// 控制线程的实时武装失败会被原样 rethrow 到这里的调用方 —— 改造前那条路径只打一条
     /// WARN 就继续跑，结果是"以为自己是 RT，其实不是"，比直接起不来危险得多。
     void start() {
+        run_machine_guard();
         init();
 
         for (auto& component : component_list_)
@@ -142,7 +159,7 @@ public:
             component_names.emplace_back(component->get_component_name());
 
         reporter_ = std::make_unique<RtReporter>(
-            get_logger(), sampler_, std::move(component_names), report_period,
+            log_, sampler_, std::move(component_names), report_period,
             std::move(reporter_thread_config));
 
         // 武装结果经 promise/future 回到主线程：控制线程在 set_value 前写 arm_summary_，
@@ -167,7 +184,7 @@ public:
         }
 
         // 武装摘要只在主线程打：RT 线程从进入主循环起就不许碰日志。
-        RCLCPP_INFO(get_logger(), "Realtime arm: %s", arm_summary_.c_str());
+        log_.info("Realtime arm: {}", arm_summary_);
 
         // 失效组件的名字由尽力域打：RT 线程只留下下标。
         failed_report_timer_ = create_wall_timer(
@@ -177,6 +194,44 @@ public:
     }
 
 private:
+    /// 机器护栏：只读检查 USB 实时路径依赖的内核状态（RT 限流、xHCI 中断线程优先级与落核、
+    /// 中断核 C1、板卡枚举速度、bootloader 滞留……），判据来自 libhcs HOST_TUNING.md 的实测。
+    /// 放在调度器里而不是各个硬件组件里：每进程只该跑一次，而且新写的硬件组件不该有机会忘掉它。
+    ///
+    /// 参数 `machine_guard`：
+    ///   enforce（默认）有 kCritical 就拒绝启动 —— 与武装失败同一个道理：带着已知会掐死
+    ///                   RT 线程的内核状态跑起来，比直接起不来危险；
+    ///   warn            只打日志，照常启动（开发机、没调优的台架）；
+    ///   off             不检查。
+    void run_machine_guard() {
+        std::string mode;
+        get_parameter_or<std::string>("machine_guard", mode, "enforce");
+        if (mode == "off")
+            return;
+        if (mode != "enforce" && mode != "warn")
+            throw std::runtime_error{
+                "Parameter machine_guard must be one of enforce / warn / off, got '" + mode + "'"};
+
+        using Level = hcs_utility::MachineGuard::Level;
+        std::size_t critical_count = 0;
+        for (const auto& finding : hcs_utility::MachineGuard::run()) {
+            switch (finding.level) {
+            case Level::kCritical:
+                ++critical_count;
+                log_.error("[machine] {}", finding.text);
+                break;
+            case Level::kWarn: log_.warn("[machine] {}", finding.text); break;
+            default: log_.info("[machine] {}", finding.text); break;
+            }
+        }
+
+        if (critical_count != 0 && mode == "enforce")
+            throw std::runtime_error{
+                std::to_string(critical_count)
+                + " critical machine finding(s) above; fix them (hcs_rt_tune.sh) or set "
+                  "machine_guard: warn to start anyway"};
+    }
+
     void thread_main(
         std::promise<void> armed, hcs_utility::ThreadConfig thread_config,
         hcs_utility::RealtimeArmOptions arm_options, std::chrono::nanoseconds period) {
@@ -311,12 +366,11 @@ private:
         const auto published = newly_failed_size_.load(std::memory_order_acquire);
         while (reported_failed_count_ < published) {
             const auto index = newly_failed_[reported_failed_count_++];
-            RCLCPP_ERROR(
-                get_logger(),
-                "Component [%s] threw from update() and has been isolated: its outputs were reset "
+            log_.error(
+                "Component [{}] threw from update() and has been isolated: its outputs were reset "
                 "to the registered defaults and it will no longer be scheduled. System is in safe "
                 "mode.",
-                updating_order_[index]->get_component_name().c_str());
+                updating_order_[index]->get_component_name());
         }
     }
 
@@ -337,18 +391,16 @@ private:
     void init() {
         auto wiring = Linker::link(component_list_);
         if (!wiring) {
-            RCLCPP_FATAL(get_logger(), "%s", wiring.error().message.c_str());
+            log_.write(hcs_log::Level::kFatal, wiring.error().message);
             throw std::runtime_error{wiring.error().message};
         }
 
-        RCLCPP_INFO(get_logger(), "Calculating component dependencies");
+        log_.info("Calculating component dependencies");
         for (std::size_t position = 0; position < wiring->updating_order.size(); ++position) {
             std::string indent = "- ";
             for (std::uint32_t level = wiring->depth[position]; level-- > 0;)
                 indent.append("    ");
-            RCLCPP_INFO(
-                get_logger(), "%s%s", indent.c_str(),
-                wiring->updating_order[position]->get_component_name().c_str());
+            log_.info("{}{}", indent, wiring->updating_order[position]->get_component_name());
         }
 
         updating_order_ = std::move(wiring->updating_order);
@@ -361,6 +413,9 @@ private:
     // 1 kHz 下 reporter 每 100 ms drain 一次，4096 条留了 4 秒余量；写满只丢样本，不影响控制。
     static constexpr std::size_t tick_sample_capacity_ = 4096;
     static constexpr std::size_t component_sample_capacity_ = 8192;
+
+    /// Executor 自己不是 Component，所以自己带一个日志口（名字是节点名）。
+    hcs_log::Logger log_;
 
     rclcpp::executors::SingleThreadedExecutor& rcl_executor_;
 

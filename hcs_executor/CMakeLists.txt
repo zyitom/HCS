@@ -14,8 +14,10 @@ set(HCS_MARCH "x86-64-v3" CACHE STRING "-march value; empty disables")
 option(HCS_ENABLE_RTSAN "Build with -fsanitize=realtime (clang 20+ only)" OFF)
 option(HCS_EXECUTOR_COMPONENT_TIMING "Per-component timing in the RT loop" OFF)
 
+# -g 而不是 -g1：非停机调试（hcs_bringup/tools/hcs_gdbstub.py）要完整的类型信息才能展开对象；
+# -g 不改变生成的代码，只增大文件。
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-g1 -rdynamic -O3 -Wall -Wextra -Wpedantic)
+  add_compile_options(-g -rdynamic -O3 -Wall -Wextra -Wpedantic)
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # HCS_NONBLOCKING 只有配上这个告警组才真的是抓手 —— 不开它，
@@ -93,7 +95,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_wiring test/test_wiring.cpp)
   target_include_directories(test_wiring PRIVATE ${PROJECT_SOURCE_DIR}/include)
   target_link_libraries(test_wiring ${PROJECT_NAME}_lib)
-  ament_target_dependencies(test_wiring hcs_sync hcs_utility)
+  ament_target_dependencies(test_wiring hcs_base)
+
+  # 日志的 rclcpp 输出端：哪些名字上得了 /rosout（本进程内一发一收，要 rclcpp::init）。
+  find_package(rcl_interfaces REQUIRED)
+  ament_add_gtest(test_rclcpp_log_sink test/test_rclcpp_log_sink.cpp TIMEOUT 120)
+  ament_target_dependencies(test_rclcpp_log_sink hcs_base rclcpp rcl_interfaces)
 endif()
 
 set_property(TARGET ${PROJECT_NAME}_lib PROPERTY OUTPUT_NAME ${PROJECT_NAME})

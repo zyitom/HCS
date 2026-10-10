@@ -7,11 +7,11 @@
 
 #include <fmt/format.h>
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/chassis_mode.hpp>
-#include <rmcs_msgs/game_stage.hpp>
-#include <rmcs_msgs/keyboard.hpp>
-#include <rmcs_msgs/mouse.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/chassis_mode.hpp>
+#include <hcs_msgs/game_stage.hpp>
+#include <hcs_msgs/keyboard.hpp>
+#include <hcs_msgs/mouse.hpp>
 
 #include "referee/app/ui/shape/shape.hpp"
 #include "referee/app/ui/widget/animated_toggle.hpp"
@@ -19,11 +19,11 @@
 #include "referee/app/ui/widget/deformable_chassis_top_view.hpp"
 #include "referee/app/ui/widget/status_ring.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 using namespace std::chrono_literals;
 
 class DeformableInfantry
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     DeformableInfantry()
@@ -90,7 +90,7 @@ public:
         ctrl_transition_.reset(false);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         update_chassis_direction_indicator();
         update_deformable_chassis_leg_arcs();
         update_ctrl_ui();
@@ -140,11 +140,11 @@ private:
         chassis_direction_indicator_.set_angle(0, 30);
     }
 
-    static Shape::Color chassis_direction_indicator_color(rmcs_msgs::ChassisMode mode) {
+    static Shape::Color chassis_direction_indicator_color(hcs_msgs::ChassisMode mode) {
         switch (mode) {
-        case rmcs_msgs::ChassisMode::SPIN_FAST: return Shape::Color::GREEN;
-        case rmcs_msgs::ChassisMode::AUTO: return Shape::Color::CYAN;
-        case rmcs_msgs::ChassisMode::STEP_DOWN: return Shape::Color::PINK;
+        case hcs_msgs::ChassisMode::SPIN_FAST: return Shape::Color::GREEN;
+        case hcs_msgs::ChassisMode::AUTO: return Shape::Color::CYAN;
+        case hcs_msgs::ChassisMode::STEP_DOWN: return Shape::Color::PINK;
         default: return Shape::Color::WHITE;
         }
     }
@@ -190,7 +190,7 @@ private:
     }
 
     InputInterface<std::chrono::steady_clock::time_point> timestamp_;
-    InputInterface<rmcs_msgs::ChassisMode> chassis_mode_;
+    InputInterface<hcs_msgs::ChassisMode> chassis_mode_;
     InputInterface<bool> active_suspension_active_;
     InputInterface<double> chassis_angle_;
 
@@ -216,10 +216,10 @@ private:
     InputInterface<double> left_friction_velocity_;
     InputInterface<double> right_friction_velocity_;
 
-    InputInterface<rmcs_msgs::Mouse> mouse_;
-    InputInterface<rmcs_msgs::Keyboard> keyboard_;
+    InputInterface<hcs_msgs::Mouse> mouse_;
+    InputInterface<hcs_msgs::Keyboard> keyboard_;
 
-    InputInterface<rmcs_msgs::GameStage> game_stage_;
+    InputInterface<hcs_msgs::GameStage> game_stage_;
 
     CrossHairCircle crosshair_circle_;
     StatusRing status_ring_;
@@ -238,8 +238,8 @@ private:
     Integer time_reminder_;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::app::ui::DeformableInfantry, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::app::ui::DeformableInfantry, hcs_executor::Component)

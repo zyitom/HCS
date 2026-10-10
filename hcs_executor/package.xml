@@ -11,10 +11,10 @@
 
   <depend>rclcpp</depend>
   <depend>pluginlib</depend>
-  <depend>hcs_utility</depend>
-  <depend>hcs_sync</depend>
+  <depend>hcs_base</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>rcl_interfaces</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

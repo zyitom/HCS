@@ -9,7 +9,10 @@
 #include "referee/app/ui/shape/remote_shape.hpp"
 #include "referee/command/field.hpp"
 
-namespace rmcs_core::referee {
+// Part1/2/3 跨字节位域依赖小端主机 + GCC/Clang LSB-first 分配。
+static_assert(std::endian::native == std::endian::little, "wire structs assume a LE host");
+
+namespace hcs_core::referee {
 
 namespace command::interaction {
 class Ui;
@@ -786,4 +789,4 @@ protected:
 };
 
 } // namespace app::ui
-} // namespace rmcs_core::referee
+} // namespace hcs_core::referee

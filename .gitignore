@@ -1,6 +1,9 @@
 *build
 *install
 *log
+# 另起的构建目录（如 clang 构建：build-clang / install-clang）
+build-*/
+install-*/
 .cache/
 
 # 内核 trace 原始数据（trace-cmd record，单个 50-100 MB）

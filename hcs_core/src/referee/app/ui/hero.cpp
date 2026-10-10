@@ -4,24 +4,24 @@
 #include <numbers>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/chassis_mode.hpp>
-#include <rmcs_msgs/game_stage.hpp>
-#include <rmcs_msgs/gimbal_mode.hpp>
-#include <rmcs_msgs/keyboard.hpp>
-#include <rmcs_msgs/mouse.hpp>
-#include <rmcs_msgs/shoot_condiction.hpp>
-#include <rmcs_msgs/shoot_mode.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/chassis_mode.hpp>
+#include <hcs_msgs/game_stage.hpp>
+#include <hcs_msgs/gimbal_mode.hpp>
+#include <hcs_msgs/keyboard.hpp>
+#include <hcs_msgs/mouse.hpp>
+#include <hcs_msgs/shoot_condiction.hpp>
+#include <hcs_msgs/shoot_mode.hpp>
 
 #include "referee/app/ui/shape/shape.hpp"
 #include "referee/app/ui/widget/rangefinder.hpp"
 #include "referee/app/ui/widget/status_ring.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 using namespace std::chrono_literals;
 
 class Hero
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     Hero()
@@ -102,7 +102,7 @@ public:
         register_input("/referee/game/stage", game_stage_);
     }
 
-    void update() override {
+    void update(const hcs_sync::Tick&) HCS_NONBLOCKING override {
         update_normal_ui();
         // update_sniper_ui();
 
@@ -230,11 +230,11 @@ private:
             return;
         }
 
-        const bool is_encoder = *gimbal_mode_ == rmcs_msgs::GimbalMode::ENCODER;
+        const bool is_encoder = *gimbal_mode_ == hcs_msgs::GimbalMode::ENCODER;
         const bool entering_encoder =
-            last_gimbal_mode_ != rmcs_msgs::GimbalMode::ENCODER && is_encoder;
+            last_gimbal_mode_ != hcs_msgs::GimbalMode::ENCODER && is_encoder;
         const bool leaving_encoder =
-            last_gimbal_mode_ == rmcs_msgs::GimbalMode::ENCODER && !is_encoder;
+            last_gimbal_mode_ == hcs_msgs::GimbalMode::ENCODER && !is_encoder;
 
         if (entering_encoder) {
             pitch_encoder_by_ctrl_e_ = last_e_triggered_with_ctrl_;
@@ -318,7 +318,7 @@ private:
             return static_cast<uint16_t>(degrees);
         };
         // chassis_direction_indicator_.set_color(
-        //     chassis_mode == rmcs_msgs::ChassisMode::SPIN_FAST ? Shape::Color::GREEN
+        //     chassis_mode == hcs_msgs::ChassisMode::SPIN_FAST ? Shape::Color::GREEN
         //                                                  : Shape::Color::PINK);
         // chassis_direction_indicator_.set_angle(to_referee_angle(*chassis_angle_), 30);
         const bool left_track_active =
@@ -342,14 +342,14 @@ private:
 
         bool chassis_control_direction_indicator_visible = false;
         if (!std::isnan(*chassis_control_angle_)) {
-            if (chassis_mode == rmcs_msgs::ChassisMode::STEP_DOWN) {
+            if (chassis_mode == hcs_msgs::ChassisMode::STEP_DOWN) {
                 chassis_control_direction_indicator_visible = true;
                 chassis_control_direction_indicator_.set_color(Shape::Color::CYAN);
                 chassis_control_direction_indicator_.set_width(8);
                 chassis_control_direction_indicator_.set_r(92);
                 chassis_control_direction_indicator_.set_angle(
                     to_referee_angle(*chassis_control_angle_), 30);
-            } else if (chassis_mode == rmcs_msgs::ChassisMode::LAUNCH_RAMP) {
+            } else if (chassis_mode == hcs_msgs::ChassisMode::LAUNCH_RAMP) {
                 chassis_control_direction_indicator_visible = true;
                 chassis_control_direction_indicator_.set_color(Shape::Color::CYAN);
                 chassis_control_direction_indicator_.set_width(28);
@@ -396,15 +396,15 @@ private:
 
     static constexpr double pink_line_pixels_per_radian = 400.0;
 
-    InputInterface<rmcs_msgs::GimbalMode> gimbal_mode_;
-    InputInterface<rmcs_msgs::Keyboard> keyboard_;
+    InputInterface<hcs_msgs::GimbalMode> gimbal_mode_;
+    InputInterface<hcs_msgs::Keyboard> keyboard_;
 
-    rmcs_msgs::Keyboard last_keyboard_ = rmcs_msgs::Keyboard::zero();
-    rmcs_msgs::GimbalMode last_gimbal_mode_ = rmcs_msgs::GimbalMode::IMU;
+    hcs_msgs::Keyboard last_keyboard_ = hcs_msgs::Keyboard::zero();
+    hcs_msgs::GimbalMode last_gimbal_mode_ = hcs_msgs::GimbalMode::IMU;
 
     bool last_e_triggered_with_ctrl_ = false;
     bool pitch_encoder_by_ctrl_e_ = false;
-    InputInterface<rmcs_msgs::ChassisMode> chassis_mode_;
+    InputInterface<hcs_msgs::ChassisMode> chassis_mode_;
     InputInterface<double> chassis_angle_, chassis_control_angle_;
     InputInterface<double> left_track_velocity_, right_track_velocity_;
 
@@ -423,9 +423,9 @@ private:
     InputInterface<double> front_friction_velocity_;
     InputInterface<bool> friction_profile_1_active_;
 
-    InputInterface<rmcs_msgs::Mouse> mouse_;
+    InputInterface<hcs_msgs::Mouse> mouse_;
 
-    InputInterface<rmcs_msgs::GameStage> game_stage_;
+    InputInterface<hcs_msgs::GameStage> game_stage_;
 
     InputInterface<double> gimbal_yaw_angle_;
     InputInterface<double> gimbal_pitch_angle_;
@@ -463,8 +463,8 @@ private:
     double bottom_yaw_anchor_angle_rad_ = 0.0;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::referee::app::ui::Hero, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::referee::app::ui::Hero, hcs_executor::Component)

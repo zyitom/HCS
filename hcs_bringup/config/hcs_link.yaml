@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # 链路探针：按真实硬件形态（两块 HPM5321 DualCan + 一块低速 mc02），在真实
 # hcs_executor 里量主机侧每一段耗时。量什么、怎么读，见
-# hcs_demo/src/hardware/hcs_link_probe.cpp 开头的注释。
+# hcs_core/src/hardware/hcs_link_probe.cpp 开头的注释。
 #
 #   ros2 launch hcs_bringup hcs.launch.py robot:=hcs_link
 #
@@ -47,16 +47,13 @@
 hcs_executor:
   ros__parameters:
     update_rate: 1000.0
-    thread_config: "name=hcs-ctrl;policy=fifo;priority=90;cpus=3"
-    realtime_config: "mlock=on;malloc=on;timer_slack=1us;prefault_stack=512K;prefault_heap=4M"
-    reporter_thread_config: "name=hcs-report;policy=other;nice=5;cpus=0-2,4-6"
-    spin_thread_config: "name=hcs-spin;policy=other;nice=5;cpus=0-2,4-6"
+    # 控制线程 / 实时武装 / 尽力域线程的核号与优先级在 config/machine/tl101.yaml（launch 默认加载）。
 
     components:
-      - hcs_demo::hardware::HcsLinkProbe -> link_5321_a
+      - hcs_core::hardware::HcsLinkProbe -> link_5321_a
       # 第二块 5321 已刷好应用固件（AF-958F，2026-09-12），接好回环之后打开
-      # - hcs_demo::hardware::HcsLinkProbe -> link_5321_b  # 临时：板上只剩一块 5321
-      - hcs_demo::hardware::HcsLinkProbe -> link_mc02
+      # - hcs_core::hardware::HcsLinkProbe -> link_5321_b  # 临时：板上只剩一块 5321
+      - hcs_core::hardware::HcsLinkProbe -> link_mc02
 
 link_5321_a:
   ros__parameters:

@@ -6,7 +6,7 @@
 
 #include "referee/app/ui/shape/red_black_tree.hpp"
 
-namespace rmcs_core::referee::app::ui {
+namespace hcs_core::referee::app::ui {
 
 template <typename T>
 class CfsScheduler {
@@ -105,4 +105,4 @@ private:
     static inline uint64_t min_vruntime_ = 0;
 };
 
-} // namespace rmcs_core::referee::app::ui
+} // namespace hcs_core::referee::app::ui

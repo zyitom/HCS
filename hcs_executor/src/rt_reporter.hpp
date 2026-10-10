@@ -13,12 +13,12 @@
 #include <utility>
 #include <vector>
 
-#include <rclcpp/logger.hpp>
-#include <rclcpp/logging.hpp>
+#include <hcs_base/logging/logger.hpp>
 
-#include "hcs_utility/rt_sampler.hpp"
-#include "hcs_utility/tdigest.hpp"
-#include "hcs_utility/thread_config.hpp"
+#include "rt_sampler.hpp"
+#include "hcs_base/thread/thread_config.hpp"
+
+#include "tdigest.hpp"
 
 // 与 executor.hpp 同一个开关，取值而不是取"是否定义"：CMake 关掉时也可能定义成 0。
 #ifndef HCS_EXECUTOR_COMPONENT_TIMING
@@ -40,10 +40,10 @@ namespace hcs_executor {
 class RtReporter {
 public:
     RtReporter(
-        rclcpp::Logger logger, hcs_utility::RtSampler& sampler,
+        hcs_log::Logger logger, hcs_utility::RtSampler& sampler,
         std::vector<std::string> component_names, std::chrono::seconds report_period,
         hcs_utility::ThreadConfig thread_config)
-        : logger_(std::move(logger))
+        : logger_(logger)
         , sampler_(sampler)
         , component_names_(std::move(component_names))
         // 非正周期会让"跳到下一个报告点"的补齐循环空转，钳一下
@@ -87,8 +87,8 @@ private:
     static constexpr auto drain_period_ = std::chrono::milliseconds{100};
 
     struct CumulativeStats {
-        hcs_utility::TDigest<double> start_lateness_ms{digest_size_};
-        hcs_utility::TDigest<double> update_duration_ms{digest_size_};
+        TDigest<double> start_lateness_ms{digest_size_};
+        TDigest<double> update_duration_ms{digest_size_};
         uint64_t update_count = 0;
         uint64_t skipped_count = 0;
         uint64_t start_lateness_sample_count = 0;
@@ -117,7 +117,7 @@ private:
     void main() {
         // 尽力域：绑核 / nice 设不上不该拉整机，警告一句继续跑
         if (const auto result = thread_config_.apply_to_current_thread(); !result)
-            RCLCPP_WARN(logger_, "%s", result.error().c_str());
+            logger_.write(hcs_log::Level::kWarn, result.error());
 
         auto next_report_time = SteadyClock::now() + report_period_;
 
@@ -215,35 +215,26 @@ private:
                                        : static_cast<double>(stats.skipped_count)
                                              / static_cast<double>(stats.update_count) * 100.0;
 
-        RCLCPP_INFO(
-            logger_,
-            "Update/Skipped: %llu/%llu (%s%%), "
-            "Stat ms p50/p99/max: start_late %s/%s/%s, update %s/%s/%s",
-            static_cast<unsigned long long>(stats.update_count),
-            static_cast<unsigned long long>(stats.skipped_count),
-            format_percent(skipped_ratio).c_str(),
+        logger_.info(
+            "Update/Skipped: {}/{} ({}%), "
+            "Stat ms p50/p99/max: start_late {}/{}/{}, update {}/{}/{}",
+            stats.update_count, stats.skipped_count, format_percent(skipped_ratio),
             format_stat(
-                maybe_quantile(stats.start_lateness_ms, stats.start_lateness_sample_count, 50.0))
-                .c_str(),
+                maybe_quantile(stats.start_lateness_ms, stats.start_lateness_sample_count, 50.0)),
             format_stat(
-                maybe_quantile(stats.start_lateness_ms, stats.start_lateness_sample_count, 99.0))
-                .c_str(),
+                maybe_quantile(stats.start_lateness_ms, stats.start_lateness_sample_count, 99.0)),
             format_stat(
                 stats.start_lateness_sample_count == 0
                     ? std::nullopt
-                    : std::optional<double>{stats.start_lateness_max_ms})
-                .c_str(),
+                    : std::optional<double>{stats.start_lateness_max_ms}),
             format_stat(
-                maybe_quantile(stats.update_duration_ms, stats.update_duration_sample_count, 50.0))
-                .c_str(),
+                maybe_quantile(stats.update_duration_ms, stats.update_duration_sample_count, 50.0)),
             format_stat(
-                maybe_quantile(stats.update_duration_ms, stats.update_duration_sample_count, 99.0))
-                .c_str(),
+                maybe_quantile(stats.update_duration_ms, stats.update_duration_sample_count, 99.0)),
             format_stat(
                 stats.update_duration_sample_count == 0
                     ? std::nullopt
-                    : std::optional<double>{stats.update_duration_max_ms})
-                .c_str());
+                    : std::optional<double>{stats.update_duration_max_ms}));
     }
 
     void log_window_stats(const WindowStats& stats) {
@@ -257,10 +248,9 @@ private:
         if (top_component_stats.empty())
             return;
 
-        RCLCPP_INFO(
-            logger_, "Component %llds: %s",
-            static_cast<long long>(report_period_.count()),
-            format_top_component_stats(top_component_stats, stats).c_str());
+        logger_.info(
+            "Component {}s: {}", report_period_.count(),
+            format_top_component_stats(top_component_stats, stats));
     }
 
     /// 丢样本 / 早醒 / 失效组件都是异常态，没有内容就不打这一行。
@@ -272,13 +262,9 @@ private:
             && failed_component_count_ == 0)
             return;
 
-        RCLCPP_WARN(
-            logger_,
-            "RT drops: ticks %llu, components %llu; woke early %llu; failed components: %u",
-            static_cast<unsigned long long>(dropped_ticks),
-            static_cast<unsigned long long>(dropped_components),
-            static_cast<unsigned long long>(woke_early_count_),
-            static_cast<unsigned>(failed_component_count_));
+        logger_.warn(
+            "RT drops: ticks {}, components {}; woke early {}; failed components: {}",
+            dropped_ticks, dropped_components, woke_early_count_, failed_component_count_);
     }
 
     static std::vector<ComponentWindowStat> collect_top_component_stats(const WindowStats& stats) {
@@ -349,13 +335,13 @@ private:
     static std::string format_percent(double value) { return std::format("{:.1f}", value); }
 
     static std::optional<double> maybe_quantile(
-        const hcs_utility::TDigest<double>& digest, uint64_t sample_count, double quantile) {
+        const TDigest<double>& digest, uint64_t sample_count, double quantile) {
         if (sample_count == 0)
             return std::nullopt;
         return digest.quantile(quantile);
     }
 
-    rclcpp::Logger logger_;
+    hcs_log::Logger logger_;
     hcs_utility::RtSampler& sampler_;
     std::vector<std::string> component_names_;
     std::chrono::seconds report_period_;

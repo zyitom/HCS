@@ -12,11 +12,11 @@
 
 #include <gtest/gtest.h>
 
-#include <hcs_sync/tick.hpp>
+#include <hcs_base/channel/tick.hpp>
 
 #include "hcs_executor/component.hpp"
 #include "hcs_executor/wiring.hpp"
-#include <hcs_utility/doorbell.hpp>
+#include <hcs_base/thread/doorbell.hpp>
 
 using hcs_executor::Component;
 using hcs_executor::Linker;

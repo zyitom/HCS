@@ -17,8 +17,10 @@
 #include <utility>
 #include <vector>
 
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/rt_attributes.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/logging/logger.hpp>
+#include <hcs_base/raw_storage.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
 
 #include "hcs_executor/graph.hpp"
 
@@ -33,6 +35,13 @@ namespace detail {
 /// 见 Component::NameScope。定义在 component.cpp 里。
 std::string& pending_component_name();
 } // namespace detail
+
+/// 进程里唯一的日志后端（队列 + 日志线程 + 输出端）。
+///
+/// 定义在 component.cpp 里，也就是在 libhcs_executor.so 里只有一份：executor 自己、
+/// 以及每一个被 pluginlib dlopen 进来的组件库，拿到的都是同一个对象。
+/// 输出端默认是 stderr；hcs_executor 的 main 在 rclcpp 起来之后把它换成 rclcpp 的。
+[[nodiscard]] hcs_log::Backend& process_log_backend();
 
 class Component {
 public:
@@ -265,24 +274,32 @@ public:
     private:
         template <typename... Args>
         void* activate(Args&&... args) {
-            std::construct_at(raw_storage_pointer(), std::forward<Args>(args)...);
+            // placement new 走 raw():对象此刻还不存在于这块存储里,launder 是
+            // 给"已构造之后"的访问用的。这一对区别由 RawStorage 的两个访问器承载。
+            std::construct_at(storage_.raw(), std::forward<Args>(args)...);
             activated = true;
-            return data_;
+            return storage_.raw();
         }
 
-        [[nodiscard]] T* raw_storage_pointer() { return reinterpret_cast<T*>(data_); }
+        [[nodiscard]] T* storage_pointer() { return storage_.ptr(); }
+        [[nodiscard]] const T* storage_pointer() const { return storage_.ptr(); }
 
-        [[nodiscard]] T* storage_pointer() { return std::launder(raw_storage_pointer()); }
-
-        [[nodiscard]] const T* storage_pointer() const {
-            return std::launder(reinterpret_cast<const T*>(data_));
-        }
-
-        alignas(T) std::byte data_[sizeof(T)];
+        hcs_utility::RawStorage<T> storage_;
         bool activated = false;
     };
 
     [[nodiscard]] const std::string& get_component_name() const { return component_name_; }
+
+    /// 这个组件的日志口，名字就是组件名。不需要继承 rclcpp::Node 也能打日志。
+    ///
+    ///     logger().warn("accept: {}", error.message());      // 尽力域（构造、定时器、工作线程）
+    ///     logger().rt().warn("crc invalid, {} so far", n);   // update() 和 IO 回调里
+    ///
+    /// 两种都只是把一条记录放进无锁队列，真正的输出在日志线程上；区别在 rt() 那一套
+    /// 不格式化、不分配，标了 nonblocking。见 hcs_base/logging/logger.hpp。
+    [[nodiscard]] const hcs_log::Logger& logger() const noexcept HCS_NONBLOCKING {
+        return logger_;
+    }
 
     /// 由 create_partner_component 创建的伙伴组件。调度器要递归把它们也纳入管理，
     /// 失效隔离要按整组停。公开出来是为了让"收集组件"这件事不必是 friend。
@@ -401,8 +418,8 @@ public:
 
         auto component = std::make_shared<T>(std::forward<Args>(args)...);
         // 伙伴组共用一个根。失效隔离要靠它把整组一起停掉：
-        // DemoBoard::Command::update() 里就是直接回调 board_.command_update()，
-        // 只隔离 DemoBoard 而放着它的 command partner 继续跑，等于没隔离。
+        // 板组件的 BoardCore::Command::update() 里就是直接回调 owner_.command_update()，
+        // 只隔离板组件而放着它的 command partner 继续跑，等于没隔离。
         component->partner_root_ = partner_root_ != nullptr ? partner_root_ : this;
         partner_component_list_.emplace_back(component);
 
@@ -519,6 +536,7 @@ private:
     }
 
     std::string component_name_;
+    hcs_log::Logger logger_{process_log_backend(), component_name_};
 
     struct InputDeclaration {
         const std::type_info& type;

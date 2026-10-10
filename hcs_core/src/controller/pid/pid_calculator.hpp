@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <limits>
 
-namespace hcs_demo::controller::pid {
+namespace hcs_core::controller::pid {
 
 // 与 hcs_core::controller::pid::PidCalculator 行为一致
 class PidCalculator {
@@ -57,4 +57,4 @@ private:
     double last_err_, err_integral_;
 };
 
-} // namespace hcs_demo::controller::pid
+} // namespace hcs_core::controller::pid

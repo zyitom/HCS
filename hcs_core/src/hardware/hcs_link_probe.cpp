@@ -8,32 +8,30 @@
 #include <format>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <libhcs/board/common.hpp>
-#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/hpm5321.hpp>
 #include <libhcs/board/mc02.hpp>
 #include <libhcs/data/datas.hpp>
+#include <libhcs/spec/hpm5321/ports.hpp>
+#include <libhcs/spec/mc02/ports.hpp>
 
-#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rclcpp/node_options.hpp>
 #include <rclcpp/timer.hpp>
 #include <hcs_executor/component.hpp>
-#include <hcs_sync/event_queue.hpp>
-#include <hcs_sync/snapshot.hpp>
-#include <hcs_sync/tick.hpp>
-#include <hcs_utility/doorbell.hpp>
-#include <hcs_utility/doorbell_worker.hpp>
-#include <hcs_utility/machine_guard.hpp>
-#include <hcs_utility/rt_attributes.hpp>
-#include <hcs_utility/thread_config.hpp>
+#include <hcs_base/channel/event_queue.hpp>
+#include <hcs_base/channel/snapshot.hpp>
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/doorbell.hpp>
+#include <hcs_base/thread/doorbell_worker.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
+#include <hcs_base/thread/thread_config.hpp>
 
-namespace hcs_demo::hardware {
+namespace hcs_core::hardware {
 
 // ============================================================================
 // 链路探针：一个实例 = 一块 libhcs 板卡，在真实执行器里量主机侧每一段花了多久。
@@ -187,20 +185,18 @@ public:
         slow_rtt_threshold_ns_ = int_parameter("slow_rtt_threshold_us", 500) * 1000;
 
         if (!sender_.thread_config_error().empty())
-            RCLCPP_WARN(
-                get_logger(), "[%s] tx thread config: %s", get_component_name().c_str(),
-                sender_.thread_config_error().c_str());
+            logger().warn(
+                "[{}] tx thread config: {}", get_component_name(), sender_.thread_config_error());
 
         // 配置漂移防护：IO 线程留在普通核上就是 SCHED_OTHER，桌面负载下尾部实测到过
         // 毫秒级（绑隔离核 + FIFO 后 giveback -> 回调 < 15 us）。这板子是辅助低速件
         // 也要先知道代价再决定，而不是从日志里猜。
         if (io_thread_cpu < 0)
-            RCLCPP_WARN(
-                get_logger(),
-                "[%s] io_thread_cpu=-1: the USB event thread runs unpinned under SCHED_OTHER; "
+            logger().warn(
+                "[{}] io_thread_cpu=-1: the USB event thread runs unpinned under SCHED_OTHER; "
                 "its rtt tail is then at the mercy of CFS load (measured up to tens of ms). "
                 "Pin it to an isolated core with an RT priority for deterministic tails.",
-                get_component_name().c_str());
+                get_component_name());
 
         // 板卡在构造期就可能开始回调，所以放在所有它会碰的数据都就位之后。
         // io_thread_cpu 设了之后，libhcs 的保活线程会跟到同一组核、低一级实时优先级。
@@ -211,11 +207,21 @@ public:
             options.set_io_thread_affinity(
                 static_cast<int>(io_thread_cpu), static_cast<int>(io_thread_rt_priority));
 
+        // 用到的总线要声明：libhcs 里配置即声明，没声明的口板子不启动。回环是 CAN1 发、CAN2 收。
+        libhcs::board::hcs::Configuration configuration;
+        configuration.declare_can(
+            libhcs::data::DataId::kCan1,
+            fdcan_ ? libhcs::board::hcs::kFd1M5M : libhcs::board::hcs::kClassic1M);
+        configuration.declare_can(
+            libhcs::data::DataId::kCan2,
+            fdcan_ ? libhcs::board::hcs::kFd1M5M : libhcs::board::hcs::kClassic1M);
+
         if (board_type_ == "hpm5321")
             hpm5321_ = std::make_unique<libhcs::board::Hpm5321>(
-                hpm5321_callback_, serial_filter_, options);
+                hpm5321_callback_, serial_filter_, options, configuration);
         else if (is_mc02)
-            mc02_ = std::make_unique<libhcs::board::Mc02>(mc02_callback_, serial_filter_, options);
+            mc02_ = std::make_unique<libhcs::board::Mc02>(
+                mc02_callback_, serial_filter_, options, configuration);
         else
             throw std::invalid_argument{
                 std::format("board must be hpm5321 or mc02, got '{}'", board_type_)};
@@ -224,50 +230,30 @@ public:
         // 总线的属性，由固件在初始化时定、经 EP0 上报。yaml 里的 fdcan 参数退化成
         // 交叉校验：和板子自报的不一致只警告不改行为——发什么帧型由板子说了算。
         const bool board_can1_is_fd =
-            hpm5321_ ? hpm5321_->can1_is_fd() : (mc02_ ? mc02_->can1_is_fd() : fdcan_);
+            hpm5321_
+                ? hpm5321_->handle(libhcs::spec::hpm5321::Spec::Cans::kCan1).is_fd()
+                : (mc02_ ? mc02_->handle(libhcs::spec::mc02::Spec::Cans::kCan1).is_fd() : fdcan_);
         if (board_can1_is_fd != fdcan_)
-            RCLCPP_WARN(
-                get_logger(),
-                "[%s] yaml fdcan=%s but the board reports CAN1 %s (EP0); the board wins",
-                get_component_name().c_str(), fdcan_ ? "true" : "false",
+            logger().warn(
+                "[{}] yaml fdcan={} but the board reports CAN1 {} (EP0); the board wins",
+                get_component_name(), fdcan_ ? "true" : "false",
                 board_can1_is_fd ? "FD" : "classic");
 
         last_report_ = hcs_sync::Clock::now();
         report_timer_ = create_wall_timer(
             std::chrono::milliseconds{report_period_ms}, [this] { report(); });
 
-        RCLCPP_INFO(
-            get_logger(),
-            "[%s] link probe: board=%s serial_filter='%s' can_id=0x%03X %s send_every=%llu "
-            "burst=%u burst_on_ms=%lld burst_off_ms=%lld "
-            "io_thread_cpu=%lld io_thread_rt_priority=%lld slow_rtt_threshold_us=%lld "
-            "inline_submit=%d",
-            get_component_name().c_str(), board_type_.c_str(), serial_filter_.c_str(), can_id_,
+        logger().info(
+            "[{}] link probe: board={} serial_filter='{}' can_id=0x{:03X} {} send_every={} "
+            "burst={} burst_on_ms={} burst_off_ms={} "
+            "io_thread_cpu={} io_thread_rt_priority={} slow_rtt_threshold_us={} "
+            "inline_submit={}",
+            get_component_name(), board_type_, serial_filter_, can_id_,
             fdcan_ ? "fd" : "classic", static_cast<unsigned long long>(send_every_), burst_,
             static_cast<long long>(burst_on_ns_ / 1'000'000),
             static_cast<long long>(burst_off_ns_ / 1'000'000),
             static_cast<long long>(io_thread_cpu), static_cast<long long>(io_thread_rt_priority),
             static_cast<long long>(slow_rtt_threshold_ns_ / 1000), inline_submit_ ? 1 : 0);
-
-        // 机器护栏：只读检查 USB 实时路径依赖的内核状态（IRQ 线程优先级/落核、中断核
-        // C1、板卡枚举速度、bootloader 滞留……），判据来自 HOST_TUNING.md 的实测。
-        // 需要修改的项归 hcs_rt_tune.sh（开机服务）管，这里只负责发现"它没生效"。
-        // 每进程只跑一次：构造函数按板各跑一遍，护栏结果与板无关。
-        static std::once_flag machine_guard_once;
-        std::call_once(machine_guard_once, [this]() {
-            for (const auto& finding : hcs_utility::MachineGuard::run()) {
-                const char* text = finding.text.c_str();
-                switch (finding.level) {
-                case hcs_utility::MachineGuard::Level::kCritical:
-                    RCLCPP_ERROR(get_logger(), "[machine] %s", text);
-                    break;
-                case hcs_utility::MachineGuard::Level::kWarn:
-                    RCLCPP_WARN(get_logger(), "[machine] %s", text);
-                    break;
-                default: RCLCPP_INFO(get_logger(), "[machine] %s", text); break;
-                }
-            }
-        });
     }
 
     ~HcsLinkProbe() override = default;
@@ -304,9 +290,10 @@ private:
         explicit Hpm5321Callback(HcsLinkProbe& probe)
             : probe_(probe) {}
 
-        void can_receive(
-            libhcs::board::hcs::CanPort port, const libhcs::data::CanDataView& data) override {
-            if (port == libhcs::board::hcs::CanPort::kCan2)
+        void can_receive_callback(
+            libhcs::spec::hpm5321::Spec::Can port, const libhcs::data::CanDataView& data,
+            const libhcs::time::SampleTime&) override {
+            if (port == libhcs::spec::hpm5321::Spec::Cans::kCan2)
                 probe_.on_echo(data);
         }
 
@@ -319,7 +306,10 @@ private:
         explicit Mc02Callback(HcsLinkProbe& probe)
             : probe_(probe) {}
 
-        void can2_receive_callback(const libhcs::data::CanDataView& data) override {
+        void can_receive_callback(
+            libhcs::spec::mc02::Spec::Can port, const libhcs::data::CanDataView& data,
+            const libhcs::time::SampleTime&) override {
+            if (port == libhcs::spec::mc02::Spec::Cans::kCan2)
             probe_.on_echo(data);
         }
 
@@ -420,11 +410,12 @@ private:
             auto builder = hpm5321_->start_transmit();
             for (std::uint32_t i = 0; i < frames; ++i)
                 builder.can_transmit(
-                    libhcs::board::hcs::CanPort::kCan1, next_frame(payloads[i], start_ns));
+                    libhcs::spec::hpm5321::Spec::Cans::kCan1, next_frame(payloads[i], start_ns));
         } else if (mc02_) {
             auto builder = mc02_->start_transmit();
             for (std::uint32_t i = 0; i < frames; ++i)
-                builder.can1_transmit(next_frame(payloads[i], start_ns));
+                builder.can_transmit(
+                    libhcs::spec::mc02::Spec::Cans::kCan1, next_frame(payloads[i], start_ns));
         }
 
         const auto done_ns = to_ns(hcs_sync::Clock::now());
@@ -516,14 +507,14 @@ private:
         // 同一条时间轴。满了丢新并计数（EventQueue 的显式策略），这里只报累计丢弃数。
         link_probe::SlowRtt slow;
         while (slow_rtts_.try_pop(slow))
-            RCLCPP_INFO(
-                get_logger(), "[%s] slow rtt: arrival=%lld ns rtt=%.1f us seq=%u",
-                get_component_name().c_str(), static_cast<long long>(slow.arrival_ns),
-                static_cast<double>(slow.rtt_ns) / 1e3, slow.sequence);
+            logger().info(
+                "[{}] slow rtt: arrival={} ns rtt={:.1f} us seq={}", get_component_name(),
+                static_cast<long long>(slow.arrival_ns), static_cast<double>(slow.rtt_ns) / 1e3,
+                slow.sequence);
         if (const auto dropped = slow_rtts_.dropped(); dropped != slow_dropped_reported_) {
-            RCLCPP_WARN(
-                get_logger(), "[%s] slow rtt ring overflow: dropped=%llu total",
-                get_component_name().c_str(), static_cast<unsigned long long>(dropped));
+            logger().warn(
+                "[{}] slow rtt ring overflow: dropped={} total", get_component_name(),
+                static_cast<unsigned long long>(dropped));
             slow_dropped_reported_ = dropped;
         }
 
@@ -544,7 +535,7 @@ private:
                                const std::vector<std::uint64_t>& tx,
                                const std::vector<std::uint64_t>& cmd, bool cumulative) {
             const auto rtt_summary = link_probe::summarize(rtt);
-            const auto line = std::format(
+            logger().info(
                 "[{}] {} ticks={} sent={} recv={} lost={} miss={} stray={} tx_exc={} | "
                 "rtt p50/p99/p99.9/max={} >=1ms={} | tx={} | cmd={}",
                 get_component_name(), label, c.ticks, c.sent, c.received,
@@ -553,7 +544,6 @@ private:
                 format_latency(rtt_summary, rtt_.max_ns(), cumulative), rtt_summary.over_1ms,
                 format_latency(link_probe::summarize(tx), tx_.max_ns(), cumulative),
                 format_latency(link_probe::summarize(cmd), cmd_.max_ns(), cumulative));
-            RCLCPP_INFO(get_logger(), "%s", line.c_str());
         };
 
         const Counters window_counters{
@@ -633,8 +623,8 @@ private:
     rclcpp::TimerBase::SharedPtr report_timer_;
 };
 
-} // namespace hcs_demo::hardware
+} // namespace hcs_core::hardware
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(hcs_demo::hardware::HcsLinkProbe, hcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::hardware::HcsLinkProbe, hcs_executor::Component)

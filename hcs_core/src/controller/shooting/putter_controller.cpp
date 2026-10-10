@@ -1,40 +1,63 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 
 #include <rclcpp/node.hpp>
-#include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/keyboard.hpp>
-#include <rmcs_msgs/mouse.hpp>
-#include <rmcs_msgs/shoot_condiction.hpp>
-#include <rmcs_msgs/shoot_mode.hpp>
-#include <rmcs_msgs/switch.hpp>
+#include <rclcpp/node_options.hpp>
+
+#include <hcs_base/channel/tick.hpp>
+#include <hcs_base/thread/rt_attributes.hpp>
+#include <hcs_executor/component.hpp>
+#include <hcs_msgs/keyboard.hpp>
+#include <hcs_msgs/mouse.hpp>
+#include <hcs_msgs/shoot_condiction.hpp>
+#include <hcs_msgs/shoot_mode.hpp>
+#include <hcs_msgs/switch.hpp>
 
 #include "controller/pid/pid_calculator.hpp"
-#include <rmcs_msgs/gimbal_mode.hpp>
 
-namespace rmcs_core::controller::shooting {
+namespace hcs_core::controller::shooting {
 
-/**
- * @class PutterController
- * @brief Putter mechanism controller
- *
- * Firing mechanism notes:
- * Since the photoelectric sensor is placed at the chamber opening, testing showed that
- * the double-middle action first triggers the putter to retract, and then stall detection
- * confirms that the reset is complete.
- * By default, a small holding force is applied so the putter does not slide down. The entire
- * process uses angle-loop advancement, and grayscale detection determines whether to feed.
- * Bullet firing is detected from two sources: the friction wheels and the putter stroke.
- * The full scheme completed stress testing before the summer break.
- */
+// 推杆式发射机构（英雄）：拨弹盘把弹丸送到膛口，推杆把它推进摩擦轮。
+// 移植自 RMCS 的 putter_controller.cpp。
+//
+// 机构上的事实：光电传感器装在膛口。实测双中位会先让推杆退回，再靠堵转判定复位完成。
+// 平时给推杆一个很小的回拉力，免得它滑下来。
+//
+// 过程：
+//
+//   上电 / 离开安全态     推杆以 -80 的速度退到底，堵转 50 ms 判定到位（记下起点）
+//   PRELOADING           拨弹盘以恒定速度转；转不动了（堵转 150 ms）：
+//                          光电被挡住 → 弹丸到位，进 PRELOADED
+//                          不管到没到位，都反转一小段再继续（没到位的话就是单纯卡了一下）
+//   PRELOADED            等开火
+//   SHOOTING             推杆以 120 的速度前推，堵转 50 ms 当作弹丸已经打出去；
+//                        然后以 -50 的速度退回，退 400 ms 后回到 PRELOADING
+//
+// 什么时候打（都要摩擦轮就绪、热量够、弹丸已到位）：
+//   手动   鼠标左键按下（没按右键时），或左拨杆 中 → 下
+//   自瞄   右拨杆 上 或鼠标右键按着，且 /auto_aim/should_shoot 为真；两发之间至少隔 1 s
+//   强制   按着鼠标右键时 500 ms 内连点两下左键
+//
+// 安全态（任一拨杆 UNKNOWN，或双下）：两个力矩给定都是 NaN，推杆回到"未初始化"。
+//
+// 参数：bullet_feeder_velocity_{kp,ki,kd}、putter_return_velocity_{kp,ki,kd}，
+//       以及各自可选的 _integral_min / _integral_max / _output_min / _output_max。
+//
+// 所有计时都按 Tick 的时间累计，不数拍，也不另外读时钟。
 class PutterController
-    : public rmcs_executor::Component
+    : public hcs_executor::Component
     , public rclcpp::Node {
 public:
     PutterController()
-        : Node(
+        : Node{
               get_component_name(),
-              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {
-        auto set_pid_parameter = [this](pid::PidCalculator& pid, const std::string& name) {
+              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)} {
+        const auto set_pid_parameter = [this](pid::PidCalculator& pid, const std::string& name) {
             pid.kp = get_parameter(name + "_kp").as_double();
             pid.ki = get_parameter(name + "_ki").as_double();
             pid.kd = get_parameter(name + "_kd").as_double();
@@ -69,156 +92,90 @@ public:
         set_pid_parameter(putter_return_velocity_pid_, "putter_return_velocity");
 
         register_output(
-            "/gimbal/bullet_feeder/control_torque", bullet_feeder_control_torque_, nan_);
-        register_output("/gimbal/putter/control_torque", putter_control_torque_, nan_);
+            "/gimbal/bullet_feeder/control_torque", bullet_feeder_control_torque_, kNan);
+        register_output("/gimbal/putter/control_torque", putter_control_torque_, kNan);
 
-        register_output("/gimbal/shoot/delay_ms", shoot_delay_ms_, nan_);
+        register_output("/gimbal/shoot/delay_ms", shoot_delay_ms_, kNan);
 
-        // auto_aim
+        // 自瞄没接的时候这个输入没有上游，读出来是静止的 false。
         register_input("/auto_aim/should_shoot", should_shoot_, false);
 
-        register_output("/gimbal/shooter/mode", shoot_mode_, rmcs_msgs::ShootMode::SINGLE);
+        register_output("/gimbal/shooter/mode", shoot_mode_, hcs_msgs::ShootMode::SINGLE);
         register_output("/gimbal/shooter/condiction", shoot_condiction_);
         register_output("/gimbal/shooter/preloaded_ready", preloaded_ready_, false);
     }
 
-    void before_updating() override {
-        if (!should_shoot_.ready())
-            should_shoot_.bind_directly(false);
-    }
-
-    void update() override {
+    void update(const hcs_sync::Tick& tick) HCS_NONBLOCKING override {
         const auto switch_right = *switch_right_;
         const auto switch_left = *switch_left_;
         const auto mouse = *mouse_;
         const auto keyboard = *keyboard_;
 
-        using namespace rmcs_msgs;
-
+        using hcs_msgs::Switch;
         if ((switch_left == Switch::UNKNOWN || switch_right == Switch::UNKNOWN)
             || (switch_left == Switch::DOWN && switch_right == Switch::DOWN)) {
             reset_all_controls();
             return;
         }
 
-        // Normal control flow after the putter has been initialized.
-        if (putter_initialized) {
-            // Handling during bullet-feeder jam-protection cooldown.
-            if (bullet_feeder_reverse_end_ > 0) {
-                bullet_feeder_reverse_end_--;
+        const auto zero = hcs_sync::Duration::zero();
+        if (putter_initialized_) {
+            if (bullet_feeder_reverse_remaining_ > zero) {
+                // 拨弹盘卡弹保护：前一段反转，后一段松开。
+                bullet_feeder_reverse_remaining_ =
+                    std::max(zero, bullet_feeder_reverse_remaining_ - tick.dt);
 
-                // Early cooldown stage: reverse the feeder to clear the jam.
-                if (bullet_feeder_reverse_end_ > 300)
+                if (bullet_feeder_reverse_remaining_ > kReverseReleaseTime)
                     *bullet_feeder_control_torque_ = bullet_feeder_velocity_pid_.update(
-                        -low_latency_velocity_ / 2 - *bullet_feeder_velocity_);
+                        -kPreloadVelocity / 2 - *bullet_feeder_velocity_);
                 else {
-                    // Late cooldown stage: stop control.
                     bullet_feeder_velocity_pid_.reset();
                     *bullet_feeder_control_torque_ = 0.0;
                 }
 
-                if (!bullet_feeder_reverse_end_ && shoot_stage_ == ShootStage::PRELOADED)
-                // RCLCPP_INFO(get_logger(), "Reverse finished");
-                {
-                    *preloaded_ready_ = true;
-                } else {
-                    *preloaded_ready_ = false;
-                }
-
+                // 反转结束的那一拍，如果弹丸已经到位，就报"上膛完成"。
+                *preloaded_ready_ = bullet_feeder_reverse_remaining_ == zero
+                                 && shoot_stage_ == ShootStage::kPreloaded;
             } else {
-                // Normal operating mode: only fire when the friction wheels are ready.
                 if (*friction_ready_) {
-                    // Detect fire triggers.
-                    if (switch_right != Switch::DOWN) {
+                    if (switch_right != Switch::DOWN)
+                        update_trigger(tick, switch_right, switch_left, mouse);
 
-                        const auto now = std::chrono::steady_clock::now();
-                        const bool left_click_edge = (!last_mouse_.left && mouse.left);
-                        if (left_click_edge) {
-                            if (now - last_click_time_ < std::chrono::milliseconds(500)) {
-                                click_count_++;
-                            } else {
-                                click_count_ = 1;
-                            }
-                            last_click_time_ = now;
-                        }
-
-                        const bool manual_trigger =
-                            (!last_mouse_.left && mouse.left && !mouse.right)
-                            || (last_switch_left_ == rmcs_msgs::Switch::MIDDLE
-                                && switch_left == rmcs_msgs::Switch::DOWN);
-
-                        const bool auto_fire_now =
-                            (switch_right == Switch::UP || mouse.right) && *should_shoot_;
-
-                        const bool auto_trigger_emergence = mouse.right && (click_count_ >= 2);
-
-                        const bool auto_trigger =
-                            auto_fire_now
-                            && (now - last_fire_time_ > std::chrono::milliseconds(1000));
-
-                        if (manual_trigger || auto_trigger || auto_trigger_emergence) {
-                            if (*control_bullet_allowance_limited_by_heat_ > 0
-                                && (shoot_stage_ == ShootStage::PRELOADED || shoot_first)) {
-                                set_shooting();
-                                last_fire_time_ = now;
-                                shoot_first = false;
-                            }
-                        }
-                        if (auto_trigger_emergence) {
-                            click_count_ = 0;
-                        }
-                    }
-
-                    if (shoot_stage_ == ShootStage::PRELOADING) {
-
+                    if (shoot_stage_ == ShootStage::kPreloading) {
                         *bullet_feeder_control_torque_ = bullet_feeder_velocity_pid_.update(
-                            low_latency_velocity_ - *bullet_feeder_velocity_); // Velocity loop.
+                            kPreloadVelocity - *bullet_feeder_velocity_);
 
-                        update_locked_detection();
-                        // This includes the photoelectric-sensor logic: if triggered, switch to
-                        // preloaded; otherwise reverse briefly and continue rotating.
+                        update_locked_detection(tick);
                     }
 
-                    if (shoot_stage_ == ShootStage::SHOOTING) {
-                        // Firing state: detect whether the bullet has been fired.
-                        // if (*bullet_fired_ && !shooted) {
-                        //     RCLCPP_INFO(get_logger(), "DETECT: Bullet fired!");
-                        //     shooted = true;
-                        // }
-
-                        // if (*putter_angle_ - putter_startpoint >= putter_stroke_ && !shooted) {
-                        //     RCLCPP_INFO(get_logger(), "DETECT: Putter stroke completed!");
-                        //     shooted = true;
-                        // }
-
-                        if (shooted) {
-                            // Bullet fired: return the putter.
+                    if (shoot_stage_ == ShootStage::kShooting) {
+                        if (shot_) {
+                            // 打出去了：推杆退回。
                             *putter_control_torque_ =
                                 putter_return_velocity_pid_.update(-50. - *putter_velocity_);
-                            putter_timeout_detection();
+                            putter_timeout_detection(tick);
                         } else {
-                            // Bullet not fired yet: continue advancing.
+                            // 还没打出去：继续往前推。
                             *putter_control_torque_ =
                                 putter_return_velocity_pid_.update(120. - *putter_velocity_);
-                            update_putter_jam_detection();
+                            update_putter_jam_detection(tick);
                         }
                     }
                 } else {
-                    // Friction wheels not ready: stop the bullet feeder.
+                    // 摩擦轮没就绪：拨弹盘停住。
                     *bullet_feeder_control_torque_ = 0.;
                 }
 
-                // Non-firing state: apply a small holding force to the putter.
-                if (shoot_stage_ != ShootStage::SHOOTING)
+                // 不在发射中：给推杆一个很小的回拉力。
+                if (shoot_stage_ != ShootStage::kShooting)
                     *putter_control_torque_ = -0.02;
             }
         } else {
-            // Putter not initialized: perform the reset procedure.
+            // 推杆还没初始化：先退到底。
             *putter_control_torque_ = putter_return_velocity_pid_.update(-80. - *putter_velocity_);
-            update_putter_jam_detection();
+            update_putter_jam_detection(tick);
         }
 
-        // Save the current state for the next comparison.
         last_switch_right_ = switch_right;
         last_switch_left_ = switch_left;
         last_mouse_ = mouse;
@@ -226,151 +183,179 @@ public:
     }
 
 private:
+    /// 看这一拍要不要开火。时间用 tick.scheduled：周期域里唯一允许的时间来源。
+    void update_trigger(
+        const hcs_sync::Tick& tick, hcs_msgs::Switch switch_right, hcs_msgs::Switch switch_left,
+        hcs_msgs::Mouse mouse) {
+        using hcs_msgs::Switch;
+        const auto now = tick.scheduled;
+
+        const bool left_click_edge = !last_mouse_.left && mouse.left;
+        if (left_click_edge) {
+            if (last_click_time_ && now - *last_click_time_ < kDoubleClickWindow)
+                click_count_++;
+            else
+                click_count_ = 1;
+            last_click_time_ = now;
+        }
+
+        const bool manual_trigger =
+            (left_click_edge && !mouse.right)
+            || (last_switch_left_ == Switch::MIDDLE && switch_left == Switch::DOWN);
+
+        const bool auto_fire_now = (switch_right == Switch::UP || mouse.right) && *should_shoot_;
+        const bool auto_trigger_emergence = mouse.right && (click_count_ >= 2);
+        const bool auto_trigger =
+            auto_fire_now && (!last_fire_time_ || now - *last_fire_time_ > kAutoFireInterval);
+
+        if (manual_trigger || auto_trigger || auto_trigger_emergence) {
+            if (*control_bullet_allowance_limited_by_heat_ > 0
+                && (shoot_stage_ == ShootStage::kPreloaded || shoot_first_)) {
+                set_shooting();
+                last_fire_time_ = now;
+                shoot_first_ = false;
+            }
+        }
+        if (auto_trigger_emergence)
+            click_count_ = 0;
+    }
+
     void reset_all_controls() {
-        last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;
-        last_switch_left_ = rmcs_msgs::Switch::UNKNOWN;
-        last_mouse_ = rmcs_msgs::Mouse::zero();
-        last_keyboard_ = rmcs_msgs::Keyboard::zero();
+        last_switch_right_ = hcs_msgs::Switch::UNKNOWN;
+        last_switch_left_ = hcs_msgs::Switch::UNKNOWN;
+        last_mouse_ = hcs_msgs::Mouse::zero();
+        last_keyboard_ = hcs_msgs::Keyboard::zero();
 
         bullet_feeder_velocity_pid_.reset();
-        *bullet_feeder_control_torque_ = nan_;
+        *bullet_feeder_control_torque_ = kNan;
 
-        shoot_stage_ = ShootStage::PRELOADED;
+        shoot_stage_ = ShootStage::kPreloaded;
 
-        putter_initialized = false;
-        putter_startpoint = nan_;
+        putter_initialized_ = false;
+        putter_startpoint_ = kNan;
         putter_return_velocity_pid_.reset();
-        *putter_control_torque_ = nan_;
+        *putter_control_torque_ = kNan;
 
-        bullet_feeder_faulty_count_ = 0;
-
-        *shoot_delay_ms_ = nan_;
+        *shoot_delay_ms_ = kNan;
     }
 
     void set_preloading() {
-        RCLCPP_INFO(get_logger(), "PRELOADING");
-        shoot_stage_ = ShootStage::PRELOADING;
+        logger().rt().info("PRELOADING");
+        shoot_stage_ = ShootStage::kPreloading;
     }
 
     void set_preloaded() {
-        RCLCPP_INFO(get_logger(), "PRELOADED");
-        shoot_stage_ = ShootStage::PRELOADED;
+        logger().rt().info("PRELOADED");
+        shoot_stage_ = ShootStage::kPreloaded;
     }
 
     void set_shooting() {
-        RCLCPP_INFO(get_logger(), "SHOOTING");
-        shoot_stage_ = ShootStage::SHOOTING;
+        logger().rt().info("SHOOTING");
+        shoot_stage_ = ShootStage::kShooting;
     }
 
-    void update_locked_detection() {
-        // If feeder speed is near zero and the photoelectric sensor is triggered,
-        // treat it as locked and start reversing.
-        if (*bullet_feeder_velocity_ < 0.5 && *bullet_feeder_control_torque_ > 0.1) {
-            locked_detect_count_++;
-        } else {
-            locked_detect_count_ = 0;
-        }
+    /// 拨弹盘在出力却几乎不转，持续够久就是顶住了：光电被挡住说明弹丸到位；
+    /// 不管哪种情况都反转一小段。
+    void update_locked_detection(const hcs_sync::Tick& tick) {
+        if (*bullet_feeder_velocity_ < 0.5 && *bullet_feeder_control_torque_ > 0.1)
+            locked_time_ += tick.dt;
+        else
+            locked_time_ = hcs_sync::Duration::zero();
 
-        if (locked_detect_count_ > 150) {
-            if (*photoelectric_sensor_status_) {
+        if (locked_time_ > kLockedTimeout) {
+            if (*photoelectric_sensor_status_)
                 set_preloaded();
-            }
-            // If the photoelectric sensor was not triggered, treat it as a simple jam,
-            // reverse briefly, then continue until stall.
-            locked_detect_count_ = 0;
             enter_reverse_protection();
         }
     }
 
-    void update_putter_jam_detection() {
-        if (std::abs(*putter_velocity_) > 0.1 || std::isnan(*putter_control_torque_)) {
-            putter_faulty_count_ = 0;
-        } else {
-            putter_faulty_count_++;
-        }
+    /// 推杆几乎不动，持续够久就是堵转了。不在发射中：推杆退到底了，初始化完成。
+    /// 发射中：推到头了，当作弹丸已经打出去。
+    void update_putter_jam_detection(const hcs_sync::Tick& tick) {
+        if (std::abs(*putter_velocity_) > 0.1 || std::isnan(*putter_control_torque_))
+            putter_faulty_time_ = hcs_sync::Duration::zero();
+        else
+            putter_faulty_time_ += tick.dt;
 
-        // Accumulate a fault count when the torque is abnormal.
-        if (putter_faulty_count_ >= 50) {
-            putter_faulty_count_ = 0;
-            if (shoot_stage_ != ShootStage::SHOOTING) {
-                // Stall detected outside the firing state: the putter is in position,
-                // so mark it initialized.
-                putter_initialized = true;
-                putter_startpoint = *putter_angle_;
+        if (putter_faulty_time_ >= kPutterStallTimeout) {
+            putter_faulty_time_ = hcs_sync::Duration::zero();
+            if (shoot_stage_ != ShootStage::kShooting) {
+                putter_initialized_ = true;
+                putter_startpoint_ = *putter_angle_;
             } else {
-                // Stall detected during firing: treat the bullet as fired.
-                RCLCPP_INFO(get_logger(), "DETECT: Putter freezed");
-                shooted = true;
+                logger().rt().info("DETECT: Putter freezed");
+                shot_ = true;
             }
         }
     }
 
-    void putter_timeout_detection() {
-        // If the putter stays in the firing state too long without extending,
-        // treat it as finished and move to the next state.
-        if (shoot_stage_ == ShootStage::SHOOTING) {
-            if (shooted) {
-                if (putter_timeout_count_ < 400)
-                    ++putter_timeout_count_;
-                else {
-                    putter_timeout_count_ = 0;
-                    RCLCPP_INFO(get_logger(), "PUTTER TIMEOUT");
-                    set_preloading();
-                    shooted = false;
-                }
-            }
+    /// 推杆退回的时间到了：当作已经退到位，开始下一发的上膛。
+    void putter_timeout_detection(const hcs_sync::Tick& tick) {
+        if (shoot_stage_ != ShootStage::kShooting || !shot_)
+            return;
+
+        if (putter_return_time_ < kPutterReturnTime)
+            putter_return_time_ += tick.dt;
+        else {
+            putter_return_time_ = hcs_sync::Duration::zero();
+            logger().rt().info("PUTTER TIMEOUT");
+            set_preloading();
+            shot_ = false;
         }
     }
 
     void enter_reverse_protection() {
-        locked_detect_count_ = 0;
-        bullet_feeder_faulty_count_ = 0;
-        bullet_feeder_reverse_end_ = 400;
+        locked_time_ = hcs_sync::Duration::zero();
+        bullet_feeder_reverse_remaining_ = kReverseTime;
         bullet_feeder_velocity_pid_.reset();
     }
 
-    static constexpr double nan_ =
-        std::numeric_limits<double>::quiet_NaN(); ///< Not-a-number constant.
-    static constexpr double inf_ = std::numeric_limits<double>::infinity(); ///< Infinity constant.
+    static constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
 
-    static constexpr double putter_stroke_ = 12.0; ///< Putter stroke length.
+    /// 上膛时拨弹盘的转速。
+    static constexpr double kPreloadVelocity = 5.0;
 
-    static constexpr double max_bullet_feeder_control_torque_ = 0.1;
-    static constexpr double bullet_feeder_angle_per_bullet_ = 2 * std::numbers::pi / 6;
-    static constexpr double low_latency_velocity_ = 5.0;
+    static constexpr hcs_sync::Duration kDoubleClickWindow = std::chrono::milliseconds{500};
+    static constexpr hcs_sync::Duration kAutoFireInterval = std::chrono::milliseconds{1000};
+    static constexpr hcs_sync::Duration kLockedTimeout = std::chrono::milliseconds{150};
+    static constexpr hcs_sync::Duration kPutterStallTimeout = std::chrono::milliseconds{50};
+    static constexpr hcs_sync::Duration kPutterReturnTime = std::chrono::milliseconds{400};
+    static constexpr hcs_sync::Duration kReverseTime = std::chrono::milliseconds{400};
+    /// 反转保护还剩这么多的时候不再反转，松开。
+    static constexpr hcs_sync::Duration kReverseReleaseTime = std::chrono::milliseconds{300};
 
     InputInterface<bool> photoelectric_sensor_status_;
     InputInterface<bool> grayscale_sensor_status_;
     InputInterface<bool> bullet_fired_;
-    bool shooted{false};
-    bool shoot_first{true};
+    bool shot_ = false;        ///< 这一发已经打出去了（推杆推到头）
+    bool shoot_first_ = true;  ///< 开机后的第一发不要求弹丸已到位
 
     InputInterface<bool> friction_ready_;
 
-    InputInterface<rmcs_msgs::Switch> switch_right_;
-    InputInterface<rmcs_msgs::Switch> switch_left_;
-    InputInterface<rmcs_msgs::Mouse> mouse_;
-    InputInterface<rmcs_msgs::Keyboard> keyboard_;
+    InputInterface<hcs_msgs::Switch> switch_right_;
+    InputInterface<hcs_msgs::Switch> switch_left_;
+    InputInterface<hcs_msgs::Mouse> mouse_;
+    InputInterface<hcs_msgs::Keyboard> keyboard_;
 
-    rmcs_msgs::Switch last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;
-    rmcs_msgs::Switch last_switch_left_ = rmcs_msgs::Switch::UNKNOWN;
-    rmcs_msgs::Mouse last_mouse_ = rmcs_msgs::Mouse::zero();
-    rmcs_msgs::Keyboard last_keyboard_ = rmcs_msgs::Keyboard::zero();
+    hcs_msgs::Switch last_switch_right_ = hcs_msgs::Switch::UNKNOWN;
+    hcs_msgs::Switch last_switch_left_ = hcs_msgs::Switch::UNKNOWN;
+    hcs_msgs::Mouse last_mouse_ = hcs_msgs::Mouse::zero();
+    hcs_msgs::Keyboard last_keyboard_ = hcs_msgs::Keyboard::zero();
 
     InputInterface<double> bullet_feeder_angle_;
     InputInterface<double> bullet_feeder_velocity_;
 
-    InputInterface<int64_t> control_bullet_allowance_limited_by_heat_;
+    InputInterface<std::int64_t> control_bullet_allowance_limited_by_heat_;
 
-    bool putter_initialized = false;
-    int putter_faulty_count_ = 0;
-    int putter_timeout_count_ = 0;
-    double putter_startpoint = nan_;
+    bool putter_initialized_ = false;
+    hcs_sync::Duration putter_faulty_time_{};
+    hcs_sync::Duration putter_return_time_{};
+    double putter_startpoint_ = kNan; ///< 推杆退到底时的角度
     pid::PidCalculator putter_return_velocity_pid_;
     InputInterface<double> putter_velocity_;
 
-    enum class ShootStage { PRELOADING, PRELOADED, SHOOTING };
-    ShootStage shoot_stage_ = ShootStage::PRELOADING;
+    enum class ShootStage { kPreloading, kPreloaded, kShooting };
+    ShootStage shoot_stage_ = ShootStage::kPreloading;
 
     pid::PidCalculator bullet_feeder_velocity_pid_;
 
@@ -379,28 +364,23 @@ private:
     InputInterface<double> putter_angle_;
     OutputInterface<double> putter_control_torque_;
 
-    int bullet_feeder_faulty_count_ = 0;
-
     OutputInterface<double> shoot_delay_ms_;
 
     InputInterface<bool> should_shoot_;
-    std::chrono::steady_clock::time_point last_fire_time_{};
-    std::chrono::steady_clock::time_point last_click_time_{};
+    std::optional<hcs_sync::Timestamp> last_fire_time_;  ///< 空：还没打过
+    std::optional<hcs_sync::Timestamp> last_click_time_; ///< 空：还没点过
     int click_count_ = 0;
 
-    int locked_detect_count_ = 0;
-    int bullet_feeder_reverse_end_ = 0;
+    hcs_sync::Duration locked_time_{};
+    hcs_sync::Duration bullet_feeder_reverse_remaining_{};
 
-    InputInterface<double> bullet_feeder_torque;
-    InputInterface<double> putter_torque;
-
-    OutputInterface<rmcs_msgs::ShootMode> shoot_mode_;
-    OutputInterface<rmcs_msgs::ShootCondiction> shoot_condiction_;
+    OutputInterface<hcs_msgs::ShootMode> shoot_mode_;
+    OutputInterface<hcs_msgs::ShootCondiction> shoot_condiction_;
     OutputInterface<bool> preloaded_ready_;
 };
 
-} // namespace rmcs_core::controller::shooting
+} // namespace hcs_core::controller::shooting
 
 #include <pluginlib/class_list_macros.hpp>
 
-PLUGINLIB_EXPORT_CLASS(rmcs_core::controller::shooting::PutterController, rmcs_executor::Component)
+PLUGINLIB_EXPORT_CLASS(hcs_core::controller::shooting::PutterController, hcs_executor::Component)

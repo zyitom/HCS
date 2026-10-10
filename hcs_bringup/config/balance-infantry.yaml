@@ -1,0 +1,294 @@
+# ---------------------------------------------------------------------------
+# 平衡步兵整车（阶段 1：只挂硬件组件；底盘/云台控制组件随后接入）。
+#
+#   ros2 launch hcs_bringup hcs.launch.py robot:=balance-infantry
+#
+# 线程布局照 hcs_link.yaml（TL101，cmdline 带 isolcpus=3,7；3 和 7 是同一物理核
+# 的两个超线程），换机器必须重配核号：hcs-ctrl 那一行在 config/machine/tl101.yaml，
+# 其余（发送线程、各板 IO 线程）在本文件：
+#
+#   CPU 3（隔离核，控制输出侧）
+#     hcs-ctrl     FIFO 90   拍循环
+#     tx-balance   FIFO 85   三块板共用的发送线程（tx_balance 组件，拍尾门铃叫醒）
+#   CPU 7（隔离核，USB 事件侧）
+#     IO-gimbal    FIFO 80   xHCI 中断（CPU 4）给回包后经 IPI 唤醒
+#     IO-chassis   FIFO 79
+#     IO-mc02      FIFO 78   遥控接收机、裁判系统这路最不重要，排最后
+#     keepalive x3          libhcs 会话保活，自动跟各自事件线程同核、低一级
+#
+# 台架形态：三块板全部 enabled:false，设备保持离线（驱动状态机照常跑，
+# 只是板卡不打开、帧不出门）——缺板也能验证整条组件链路。
+#
+# 硬件是几个组件：每块板一个（两块 HPM5321：gimbal_board / chassis_board，一块 mc02：mc02_board，各自收发），
+# 三块板共用的发送线程（tx_balance），跨板的安全锁存（safety_latch）。
+#
+# 接线表（哪块板、哪条总线及其帧型速率、什么型号、CAN id、零点、方向、DM 寄存器镜像、
+# 串口设备及其波特率）全在 hcs_core/src/hardware/balance_infantry.cpp，本文件
+# 只放部署项。serial_filter 是 USB 序列号子串：同 PID 多块板时必须填，否则 SDK
+# 拒绝打开。上车前要由用户核对：serial_filter、接线表的全部 id 与零点、
+# DM 电机里实际存的 PMAX/VMAX/TMAX、CH040 模块 flash 里的波特率。
+# ---------------------------------------------------------------------------
+hcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    # 控制线程 / 实时武装 / 尽力域线程的核号与优先级在 config/machine/tl101.yaml（launch 默认加载）。
+
+    components:
+      - hcs_core::hardware::TransmitThread -> tx_balance
+      - hcs_core::hardware::BalanceGimbalBoard -> gimbal_board
+      - hcs_core::hardware::BalanceChassisBoard -> chassis_board
+      - hcs_core::hardware::BalanceMc02Board -> mc02_board
+      - hcs_core::hardware::SafetyLatch -> safety_latch
+      - hcs_core::controller::chassis::balance::BalanceChassisController -> balance_chassis_controller
+      - hcs_core::controller::chassis::balance::BalanceStateEstimator -> balance_state_estimator
+      - hcs_core::controller::chassis::balance::BalanceModeManager -> balance_mode_manager
+      - hcs_core::controller::chassis::balance::BalanceLqrController -> balance_lqr_controller
+      - hcs_core::controller::chassis::balance::LegForceController -> leg_force_controller
+      - hcs_core::controller::chassis::balance::LegJointController -> left_leg_joint_controller
+      - hcs_core::controller::chassis::balance::LegJointController -> right_leg_joint_controller
+      - hcs_core::controller::gimbal::GimbalTf -> gimbal_tf
+      - hcs_core::controller::gimbal::SimpleGimbalController -> gimbal_controller
+      - hcs_core::controller::pid::ErrorPidController -> yaw_angle_pid_controller
+      - hcs_core::controller::pid::PidController -> yaw_velocity_pid_controller
+      - hcs_core::controller::pid::ErrorPidController -> pitch_angle_pid_controller
+      - hcs_core::controller::pid::PidController -> pitch_velocity_pid_controller
+
+# ── 硬件（构造期一次性）──────────────────────────────────────────────────
+tx_balance:
+  ros__parameters:
+    thread_config: "name=tx-balance;policy=fifo;priority=85;cpus=3"
+    stale_after_ms: 10             # 批次陈旧阈值：某块板被隔离后超过它，给那块板补发一次全失能
+
+gimbal_board:
+  ros__parameters:
+    enabled: false
+    serial_filter: ""
+    io_thread_cpu: 7
+    io_thread_rt_priority: 80
+    dangerously_skip_version_checks: true
+    exit_on_board_fault: true      # link_state == kFaulted 时整体退出
+
+chassis_board:
+  ros__parameters:
+    enabled: false
+    serial_filter: ""
+    io_thread_cpu: 7
+    io_thread_rt_priority: 79
+    dangerously_skip_version_checks: true
+    exit_on_board_fault: true
+
+mc02_board:
+  ros__parameters:
+    enabled: false
+    serial_filter: ""
+    io_thread_cpu: 7
+    io_thread_rt_priority: 78
+    dangerously_skip_version_checks: true
+    exit_on_board_fault: true
+
+# 这些设备上过线之后掉线或报故障，整车锁存全失能（腿、轮、底盘 IMU：少了它们车站不住）；
+# 遥控左拨杆先拨到 DOWN 再拨离 DOWN 复位。
+safety_latch:
+  ros__parameters:
+    critical_devices:
+      - /chassis/left_front_joint
+      - /chassis/left_back_joint
+      - /chassis/right_front_joint
+      - /chassis/right_back_joint
+      - /chassis/left_wheel
+      - /chassis/right_wheel
+      - /chassis/imu
+    rearm_switch: /remote/switch/left
+
+# ── 平衡底盘控制链（阶段 2）──────────────────────────────────────────────
+balance_chassis_controller:
+  ros__parameters:
+    max_velocity: 2.0
+    spin_rate: 8.0
+    velocity_td_r: 25.0
+    velocity_td_h0: 0.01
+    spin_td_r: 22.5
+    spin_td_h0: 0.01
+
+balance_state_estimator:
+  ros__parameters:
+    leg_link1: 0.21
+    leg_link2: 0.25
+    leg_link5: 0.0
+    leg_angle_offset: 1.163
+    wheel_radius: 0.06
+    wheel_half_track: 0.2296
+    left_angle_sign: -1.0
+    right_angle_sign: 1.0
+    velocity_sign: -1.0
+    # ROS 标准（REP-103）FLU 正装 = 恒等映射；Helios 的 CH100 是软件重映射轴
+    # （swap + 镜像 + 0.0112/0.0065 偏置），只在其安装被复刻时才启用。
+    imu_euler_swap: false
+    imu_pitch_sign: 1.0
+    imu_roll_sign: 1.0
+    imu_pitch_offset: 0.0    # 水平校准偏置，上车实测后填
+    imu_roll_offset: 0.0
+    imu_acceleration_swap: false
+    imu_acceleration_x_sign: 1.0
+    imu_acceleration_y_sign: 1.0
+    imu_acceleration_z_sign: 1.0
+    velocity_kf_q: 1.3
+    velocity_kf_r_base: 400.0
+    velocity_kf_r_max: 1500.0
+    ground_detection_enabled: false
+    ground_pressure_air_threshold: 80.0
+    ground_pressure_recover_threshold: 60.0
+    ground_length_threshold: 0.20
+    ddphi0_filter_alpha: 0.1
+
+balance_mode_manager:
+  ros__parameters:
+    disaster_pitch_roll_threshold: 1.2
+    fatal_roll_threshold: 0.90
+    fatal_pitch_threshold: 0.82
+    fatal_error_duration: 0.05
+    fallen_self_heal_delay: 2.0
+    crash_pitch_threshold: 0.45
+    crash_pitch_threshold_up_stair: 0.65
+    crash_phi0_difference_threshold: 0.69
+    crash_duration: 0.10
+    normal_init_lock: 3.0
+    leg_change_lock: 0.5
+    slow_start_stable_duration: 0.2
+    slow_start_timeout: 0.5
+    jump_pressure_confirm: 0.08
+    jump_pressure_timeout: 0.45
+    jump_takeoff_confirm: 0.012
+    jump_takeoff_min_push: 0.018
+    jump_takeoff_timeout: 0.18
+    jump_touchdown_confirm: 0.01
+    jump_flying_timeout: 1.2
+    jump_landing_confirm: 0.05
+    jump_landing_timeout: 0.7
+    take_off_length_high: 0.35
+    fly_enter_confirm: 0.003
+    fly_touchdown_confirm: 0.01
+    fly_minimum_duration: 0.1
+    fly_timeout: 1.0
+    impact_acceleration_threshold: 6.3
+    impact_lock_time: 0.1
+    up_stair_fold_angle: 1.23
+    up_stair_unfold_angle: 1.32
+    up_stair_count_gain: 3.0
+    up_stair_count_threshold: 0.08
+    up_stair_timer_threshold: 0.1
+    heal_stall_flip_duration: 0.8
+    heal_flip_cooldown: 1.5
+    heal_stall_motion_threshold: 0.003
+    heal_flip_allow_pitch: 1.05
+    leg_length_low: 0.17
+    leg_length_mid: 0.25
+    leg_length_high: 0.36
+
+balance_lqr_controller:
+  ros__parameters:
+    max_wheel_torque: 5.0
+    max_leg_torque: 40.0
+    lqr_fallback_improve: 0.1
+    gimbal_yaw_angle_sign: -1.0
+    swing_kp: 250.0
+    swing_ki: 0.0
+    swing_kd: 7.0
+    swing_output_max: 30.0
+
+leg_force_controller:
+  ros__parameters:
+    length_kp: 2800.0
+    length_ki: 0.0
+    length_kd: 60.0
+    length_output_max: 600.0
+    body_mass: 18.0
+    leg_mass: 2.6
+    wheel_mass: 0.25867
+    takeoff_acceleration: 20.0
+    takeoff_kp: 5.6
+    takeoff_kd: 0.4
+    roll_inertia: 0.35
+    roll_force_arm: 0.20
+    roll_force_limit: 80.0
+
+left_leg_joint_controller:
+  ros__parameters:
+    leg_prefix: /chassis/left_leg
+    front_joint_prefix: /chassis/left_front_joint
+    back_joint_prefix: /chassis/left_back_joint
+    leg_link1: 0.21
+    side_sign: 1.0
+    max_torque: 40.0
+
+right_leg_joint_controller:
+  ros__parameters:
+    leg_prefix: /chassis/right_leg
+    front_joint_prefix: /chassis/right_front_joint
+    back_joint_prefix: /chassis/right_back_joint
+    leg_link1: 0.21
+    side_sign: -1.0
+    max_torque: 40.0
+
+# ── 云台（RMCS 通用链；PID 从 Helios gimbal.cpp 起步，§4.5）─────────────────
+# 链路：/remote/* → SimpleGimbalController → control_angle_error
+#       → ErrorPidController（角度环）→ control_velocity
+#       → PidController（速度环，测量 /gimbal/imu/angular_velocity/{y,z}）→ control_torque
+# yaw 是 LK MG5010（力矩命令），pitch 是 DM（MIT 纯力矩）。
+# Helios 的 yaw 速度环输出是 LK 电流计数值（MaxOut 2048 ↔ 33 A），按
+# 33/2048·kt(0.1)·减速比(10) ≈ 0.0161 N·m/计数 折算成 N·m；pitch 直接是
+# DM 力矩（T_MAX = 40 N·m）。FFC/DOB/yaw 堵转保护这次不做。
+gimbal_controller:
+  ros__parameters:
+    upper_limit: 0.45    # Helios PITCH_UP
+    lower_limit: -0.32   # Helios PITCH_DN
+
+yaw_angle_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/yaw/control_angle_error
+    control: /gimbal/yaw/control_velocity
+    kp: 25.0
+    ki: 11.0
+    kd: 0.002
+    integral_min: -10.0
+    integral_max: 10.0
+    output_min: -20.0
+    output_max: 20.0
+
+yaw_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/imu/angular_velocity/z
+    setpoint: /gimbal/yaw/control_velocity
+    control: /gimbal/yaw/control_torque
+    kp: 3.9     # Helios 240 计数 × 0.0161 N·m/计数
+    ki: 1.3     # Helios 80 计数
+    kd: 0.0
+    integral_min: -7.0
+    integral_max: 7.0
+    output_min: -7.0
+    output_max: 7.0
+
+pitch_angle_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/pitch/control_angle_error
+    control: /gimbal/pitch/control_velocity
+    kp: 2.2
+    ki: 0.7
+    kd: 0.10
+    integral_min: -14.0
+    integral_max: 14.0
+    output_min: -20.0
+    output_max: 20.0
+
+pitch_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/imu/angular_velocity/y
+    setpoint: /gimbal/pitch/control_velocity
+    control: /gimbal/pitch/control_torque
+    kp: 38.0
+    ki: 24.0
+    kd: 0.7
+    integral_min: -2.8
+    integral_max: 2.8
+    output_min: -7.0
+    output_max: 7.0

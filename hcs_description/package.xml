@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hcs_description</name>
+  <version>1.0.0</version>
+  <description>tf 坐标系描述（从 rmcs_description 移植），供云台解算等组件使用的 fast_tf 链接与关节定义。</description>
+  <maintainer email="hcs@example.com">hcs</maintainer>
+  <license>GPL-3.0-only</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>fast_tf</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
